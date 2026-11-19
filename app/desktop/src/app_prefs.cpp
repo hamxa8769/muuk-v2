@@ -1,0 +1,101 @@
+#include "app_prefs.hpp"
+
+#include <cstdlib>
+#include <fstream>
+
+#include <nlohmann/json.hpp>
+
+#include "muuk/ctrader_fix/instance.hpp"
+
+namespace muuk::desktop {
+
+std::filesystem::path prefsFile() {
+#ifdef _WIN32
+    wchar_t* appData = nullptr;
+    std::size_t len = 0;
+    if (_wdupenv_s(&appData, &len, L"APPDATA") == 0 && appData != nullptr) {
+        const std::filesystem::path dir = std::filesystem::path(appData) / muuk::ctrader_fix::instance::kPrefsFolder;
+        std::free(appData);
+        return dir / "desktop.json";
+    }
+#endif
+    std::error_code ec;
+    return std::filesystem::current_path(ec) / "muuk_desktop.json";
+}
+
+AppPrefs loadPrefs() {
+    AppPrefs prefs;
+    try {
+        std::ifstream in(prefsFile());
+        if (!in) return prefs;
+        const nlohmann::json j = nlohmann::json::parse(in);
+        prefs.configPath = j.value("configPath", std::string());
+        prefs.darkMode = j.value("darkMode", true);
+        prefs.autoConnect = j.value("autoConnect", false);
+        prefs.autoReconnect = j.value("autoReconnect", true);
+        prefs.liteMode = j.value("liteMode", false);
+        prefs.userName = j.value("userName", std::string());
+        prefs.role = j.value("role", std::string("admin"));
+        prefs.mt5AutoSwitch = j.value("mt5AutoSwitch", true);
+        prefs.historySymbols = j.value("historySymbols", prefs.historySymbols);
+        prefs.historyExportedOn = j.value("historyExportedOn", std::string());
+        for (const auto& a : j.value("mt5Accounts", nlohmann::json::array())) {
+            if (!a.is_object()) continue;
+            Mt5KnownAccount k;
+            k.login = a.value("login", std::string());
+            k.server = a.value("server", std::string());
+            k.company = a.value("company", std::string());
+            k.currency = a.value("currency", std::string());
+            k.mode = a.value("mode", std::string());
+            k.lastSeen = a.value("lastSeen", std::string());
+            if (!k.login.empty()) prefs.mt5Accounts.push_back(k);
+        }
+    } catch (const std::exception&) {
+        return AppPrefs{};
+    }
+    return prefs;
+}
+
+void savePrefs(const AppPrefs& prefs) {
+    try {
+        const std::filesystem::path file = prefsFile();
+        std::error_code ec;
+        std::filesystem::create_directories(file.parent_path(), ec);
+        std::ofstream out(file, std::ios::trunc);
+        nlohmann::json accounts = nlohmann::json::array();
+        for (const auto& a : prefs.mt5Accounts) {
+            accounts.push_back({{"login", a.login},       {"server", a.server}, {"company", a.company},
+                                {"currency", a.currency}, {"mode", a.mode},     {"lastSeen", a.lastSeen}});
+        }
+        out << nlohmann::json{{"configPath", prefs.configPath},
+                              {"mt5Accounts", accounts},
+                              {"mt5AutoSwitch", prefs.mt5AutoSwitch},
+                              {"historySymbols", prefs.historySymbols},
+                              {"historyExportedOn", prefs.historyExportedOn},
+                              {"darkMode", prefs.darkMode},
+                              {"autoConnect", prefs.autoConnect},
+                              {"autoReconnect", prefs.autoReconnect},
+                              {"liteMode", prefs.liteMode},
+                              {"userName", prefs.userName},
+                              {"role", prefs.role}}
+                   .dump(2);
+    } catch (const std::exception&) {
+        // Preferences are a convenience -- never worth interrupting the app for.
+    }
+}
+
+std::string displayUserName(const AppPrefs& prefs) {
+    if (!prefs.userName.empty()) return prefs.userName;
+#ifdef _WIN32
+    char* name = nullptr;
+    std::size_t len = 0;
+    if (_dupenv_s(&name, &len, "USERNAME") == 0 && name != nullptr) {
+        std::string out(name);
+        std::free(name);
+        if (!out.empty()) return out;
+    }
+#endif
+    return "Owner";
+}
+
+}  // namespace muuk::desktop

@@ -1,0 +1,633 @@
+#include "glass_ui.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <unordered_map>
+
+namespace muuk::desktop::glass {
+
+namespace {
+
+bool g_dark = true;
+bool g_lowPower = false;
+
+Palette g_palette;
+
+const Palette kDarkPalette{
+    ImVec4(0.035f, 0.043f, 0.080f, 1.0f),  // bgTop
+    ImVec4(0.018f, 0.022f, 0.045f, 1.0f),  // bgBottom
+    ImVec4(0.42f, 0.30f, 0.98f, 0.17f),    // glowA (violet)
+    ImVec4(0.05f, 0.72f, 0.78f, 0.12f),    // glowB (teal)
+    ImVec4(0.90f, 0.26f, 0.66f, 0.10f),    // glowC (magenta)
+    ImVec4(1.0f, 1.0f, 1.0f, 0.045f),      // cardFill
+    ImVec4(1.0f, 1.0f, 1.0f, 0.10f),       // cardBorder
+    ImVec4(1.0f, 1.0f, 1.0f, 0.24f),       // cardHighlight
+    ImVec4(0.0f, 0.0f, 0.0f, 0.12f),       // shadow
+    ImVec4(0.95f, 0.96f, 0.99f, 1.0f),     // text
+    ImVec4(0.72f, 0.76f, 0.84f, 1.0f),     // textDim
+    ImVec4(0.75f, 0.80f, 0.95f, 1.0f),     // neutral
+};
+
+const Palette kLightPalette{
+    ImVec4(0.86f, 0.89f, 0.98f, 1.0f),
+    ImVec4(0.95f, 0.93f, 0.99f, 1.0f),
+    ImVec4(0.52f, 0.56f, 1.00f, 0.30f),
+    ImVec4(0.32f, 0.84f, 0.90f, 0.26f),
+    ImVec4(1.00f, 0.60f, 0.82f, 0.22f),
+    ImVec4(1.0f, 1.0f, 1.0f, 0.52f),
+    ImVec4(0.25f, 0.30f, 0.55f, 0.13f),
+    ImVec4(1.0f, 1.0f, 1.0f, 0.95f),
+    ImVec4(0.25f, 0.30f, 0.55f, 0.06f),
+    ImVec4(0.04f, 0.05f, 0.10f, 1.0f),
+    ImVec4(0.24f, 0.27f, 0.36f, 1.0f),
+    ImVec4(0.26f, 0.31f, 0.52f, 1.0f),
+};
+
+constexpr float kCardRounding = 14.0f;
+constexpr float kButtonRounding = 9.0f;
+
+ImVec4 alpha(ImVec4 c, float a) {
+    c.w = a;
+    return c;
+}
+
+ImU32 col(ImVec4 c) { return ImGui::GetColorU32(c); }  // honours style alpha (BeginDisabled)
+
+std::unordered_map<ImGuiID, float>& animState() {
+    static std::unordered_map<ImGuiID, float> state;
+    return state;
+}
+
+float animate(ImGuiID id, float target, float speed) {
+    if (g_lowPower) return target;  // lite: no easing -- nothing keeps redrawing
+    auto& state = animState();
+    const auto it = state.find(id);
+    if (it == state.end()) {
+        state.emplace(id, target);
+        return target;
+    }
+    const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
+    it->second += (target - it->second) * (1.0f - std::exp(-speed * dt));
+    return it->second;
+}
+
+const char* visibleEnd(const char* label) {
+    const char* hash = std::strstr(label, "##");
+    return hash ? hash : label + std::strlen(label);
+}
+
+void softGlow(ImDrawList* dl, ImVec2 center, float radius, ImVec4 color) {
+    const int kLayers = g_lowPower ? 6 : 28;
+    ImVec4 layer = color;
+    layer.w = color.w * 2.0f / kLayers;
+    const ImU32 c = ImGui::ColorConvertFloat4ToU32(layer);
+    for (int i = 0; i < kLayers; ++i) {
+        const float f = 1.0f - static_cast<float>(i) / kLayers;
+        dl->AddCircleFilled(center, radius * f, c, g_lowPower ? 40 : 64);
+    }
+}
+
+void drawCardBackdrop(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    const Palette& p = g_palette;
+    const float r = kCardRounding;
+    if (g_lowPower) {  // lite: flat card
+        dl->AddRectFilled(a, b, col(p.cardFill), r);
+        dl->AddRect(a, b, col(p.cardBorder), r, 0, 1.0f);
+        return;
+    }
+
+    // Soft shadow as fading outlines, so the translucent interior isn't darkened.
+    for (int i = 1; i <= 6; ++i) {
+        const float g = static_cast<float>(i) * 2.0f;
+        ImVec4 s = p.shadow;
+        s.w *= 1.0f - static_cast<float>(i) / 7.0f;
+        dl->AddRect(ImVec2(a.x - g, a.y - g + 3.0f), ImVec2(b.x + g, b.y + g + 3.0f), col(s), r + g, 0, 2.0f);
+    }
+
+    dl->AddRectFilled(a, b, col(p.cardFill), r);
+
+    // Frosted sheen: stacked translucent top bands give a vertical fade.
+    const float height = b.y - a.y;
+    const ImVec4 sheen = g_dark ? ImVec4(1, 1, 1, 0.007f) : ImVec4(1, 1, 1, 0.035f);
+    const int bands = g_lowPower ? 2 : 8;
+    for (int k = 1; k <= bands; ++k) {
+        const float h = height * (g_lowPower ? 0.28f : 0.07f) * static_cast<float>(k);
+        dl->AddRectFilled(a, ImVec2(b.x, a.y + h), col(sheen), r, ImDrawFlags_RoundCornersTop);
+    }
+
+    dl->AddRect(a, b, col(p.cardBorder), r, 0, 1.0f);
+    dl->AddLine(ImVec2(a.x + r, a.y + 0.5f), ImVec2(b.x - r, a.y + 0.5f), col(p.cardHighlight), 1.0f);
+}
+
+void setStyleColors(bool dark) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    ImVec4* c = st.Colors;
+    const Palette& p = g_palette;
+
+    c[ImGuiCol_Text] = p.text;
+    c[ImGuiCol_TextDisabled] = p.textDim;
+    c[ImGuiCol_WindowBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_CheckMark] = kBlue;
+    c[ImGuiCol_SliderGrab] = kBlue;
+    c[ImGuiCol_SliderGrabActive] = kBlue;
+    c[ImGuiCol_PlotHistogram] = kGreen;
+    c[ImGuiCol_TextSelectedBg] = alpha(kBlue, 0.35f);
+    c[ImGuiCol_Header] = alpha(kBlue, 0.18f);
+    c[ImGuiCol_HeaderHovered] = alpha(kBlue, 0.28f);
+    c[ImGuiCol_HeaderActive] = alpha(kBlue, 0.36f);
+    c[ImGuiCol_TabHovered] = alpha(kBlue, 0.30f);
+    c[ImGuiCol_TabSelectedOverline] = kBlue;
+    c[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ResizeGrip] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ResizeGripHovered] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ResizeGripActive] = ImVec4(0, 0, 0, 0);
+
+    if (dark) {
+        c[ImGuiCol_PopupBg] = ImVec4(0.075f, 0.085f, 0.135f, 0.96f);
+        c[ImGuiCol_Border] = ImVec4(1, 1, 1, 0.09f);
+        c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+        c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, 0.055f);
+        c[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, 0.085f);
+        c[ImGuiCol_FrameBgActive] = ImVec4(1, 1, 1, 0.11f);
+        c[ImGuiCol_Button] = ImVec4(1, 1, 1, 0.06f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(1, 1, 1, 0.10f);
+        c[ImGuiCol_ButtonActive] = ImVec4(1, 1, 1, 0.14f);
+        c[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.12f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(1, 1, 1, 0.20f);
+        c[ImGuiCol_ScrollbarGrabActive] = ImVec4(1, 1, 1, 0.28f);
+        c[ImGuiCol_Separator] = ImVec4(1, 1, 1, 0.08f);
+        c[ImGuiCol_Tab] = ImVec4(1, 1, 1, 0.035f);
+        c[ImGuiCol_TabSelected] = alpha(kBlue, 0.22f);
+        c[ImGuiCol_TableHeaderBg] = ImVec4(1, 1, 1, 0.045f);
+        c[ImGuiCol_TableBorderStrong] = ImVec4(1, 1, 1, 0.08f);
+        c[ImGuiCol_TableBorderLight] = ImVec4(1, 1, 1, 0.05f);
+        c[ImGuiCol_TableRowBgAlt] = ImVec4(1, 1, 1, 0.022f);
+        c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.02f, 0.03f, 0.06f, 0.55f);
+    } else {
+        c[ImGuiCol_PopupBg] = ImVec4(0.97f, 0.97f, 1.0f, 0.97f);
+        c[ImGuiCol_Border] = ImVec4(0.10f, 0.12f, 0.25f, 0.12f);
+        c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+        c[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, 0.60f);
+        c[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, 0.78f);
+        c[ImGuiCol_FrameBgActive] = ImVec4(1, 1, 1, 0.92f);
+        c[ImGuiCol_Button] = ImVec4(1, 1, 1, 0.55f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(1, 1, 1, 0.75f);
+        c[ImGuiCol_ButtonActive] = ImVec4(1, 1, 1, 0.90f);
+        c[ImGuiCol_ScrollbarGrab] = ImVec4(0, 0, 0, 0.14f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0, 0, 0, 0.22f);
+        c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0, 0, 0, 0.30f);
+        c[ImGuiCol_Separator] = ImVec4(0, 0, 0, 0.08f);
+        c[ImGuiCol_Tab] = ImVec4(1, 1, 1, 0.35f);
+        c[ImGuiCol_TabSelected] = ImVec4(1, 1, 1, 0.85f);
+        c[ImGuiCol_TableHeaderBg] = ImVec4(1, 1, 1, 0.45f);
+        c[ImGuiCol_TableBorderStrong] = ImVec4(0, 0, 0, 0.08f);
+        c[ImGuiCol_TableBorderLight] = ImVec4(0, 0, 0, 0.06f);
+        c[ImGuiCol_TableRowBgAlt] = ImVec4(0, 0, 0, 0.025f);
+        c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.30f, 0.35f, 0.50f, 0.35f);
+    }
+}
+
+}  // namespace
+
+void applyTheme(bool dark) {
+    g_dark = dark;
+    g_palette = dark ? kDarkPalette : kLightPalette;
+    if (dark) {
+        kGreen = ImVec4(0.20f, 0.84f, 0.56f, 1.0f);
+        kRed = ImVec4(1.00f, 0.39f, 0.43f, 1.0f);
+        kBlue = ImVec4(0.45f, 0.66f, 1.00f, 1.0f);
+        kAmber = ImVec4(1.00f, 0.73f, 0.30f, 1.0f);
+        kViolet = ImVec4(0.68f, 0.57f, 1.00f, 1.0f);
+        kGrey = ImVec4(0.66f, 0.70f, 0.78f, 1.0f);
+        kOrange = ImVec4(1.00f, 0.56f, 0.18f, 1.0f);
+    } else {
+        kGreen = ImVec4(0.02f, 0.52f, 0.31f, 1.0f);
+        kRed = ImVec4(0.80f, 0.12f, 0.19f, 1.0f);
+        kBlue = ImVec4(0.12f, 0.34f, 0.82f, 1.0f);
+        kAmber = ImVec4(0.70f, 0.40f, 0.00f, 1.0f);
+        kViolet = ImVec4(0.40f, 0.24f, 0.86f, 1.0f);
+        kGrey = ImVec4(0.33f, 0.37f, 0.45f, 1.0f);
+        kOrange = ImVec4(0.85f, 0.38f, 0.00f, 1.0f);
+    }
+
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding = 0.0f;
+    st.ChildRounding = kCardRounding;
+    st.FrameRounding = 8.0f;
+    st.PopupRounding = 12.0f;
+    st.GrabRounding = 8.0f;
+    st.TabRounding = 8.0f;
+    st.ScrollbarRounding = 8.0f;
+    st.WindowBorderSize = 0.0f;
+    st.ChildBorderSize = 0.0f;
+    st.PopupBorderSize = 1.0f;
+    st.FrameBorderSize = 1.0f;
+    st.TabBorderSize = 0.0f;
+    st.TabBarBorderSize = 0.0f;
+    st.WindowPadding = ImVec2(16, 14);
+    st.FramePadding = ImVec2(10, 6);
+    st.ItemSpacing = ImVec2(10, 9);
+    st.ItemInnerSpacing = ImVec2(8, 6);
+    st.CellPadding = ImVec2(8, 6);
+    st.ScrollbarSize = 10.0f;
+    st.DisabledAlpha = 0.42f;
+    setStyleColors(dark);
+}
+
+const Palette& palette() { return g_palette; }
+bool isDark() { return g_dark; }
+
+void drawBackground() {
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    const Palette& p = g_palette;
+    const ImU32 top = ImGui::ColorConvertFloat4ToU32(p.bgTop);
+    const ImU32 bottom = ImGui::ColorConvertFloat4ToU32(p.bgBottom);
+    dl->AddRectFilledMultiColor(ImVec2(0, 0), size, top, top, bottom, bottom);
+    // Without a GPU, the big translucent glows cost more than the whole rest
+    // of the window -- the plain gradient has to do.
+    if (g_lowPower) return;
+
+    // Slow drift -- barely perceptible, just enough to feel alive.
+    const float t = g_lowPower ? 0.0f : static_cast<float>(ImGui::GetTime());
+    softGlow(dl, ImVec2(size.x * (0.16f + 0.04f * std::sin(t * 0.13f)), size.y * (0.18f + 0.05f * std::cos(t * 0.11f))),
+             size.x * 0.40f, p.glowA);
+    softGlow(dl, ImVec2(size.x * (0.86f + 0.03f * std::cos(t * 0.09f)), size.y * (0.32f + 0.06f * std::sin(t * 0.12f))),
+             size.x * 0.34f, p.glowB);
+    softGlow(dl, ImVec2(size.x * (0.52f + 0.05f * std::sin(t * 0.07f)), size.y * (0.98f + 0.04f * std::cos(t * 0.10f))),
+             size.x * 0.44f, p.glowC);
+}
+
+void setLowPower(bool on) { g_lowPower = on; }
+bool lowPower() { return g_lowPower; }
+
+void beginCard(const char* id, ImVec2 size, bool autoHeight, ImGuiWindowFlags extraFlags) {
+    ImGuiChildFlags childFlags = ImGuiChildFlags_AlwaysUseWindowPadding;
+    if (autoHeight) childFlags |= ImGuiChildFlags_AutoResizeY;
+    ImGui::BeginChild(id, size, childFlags, extraFlags | ImGuiWindowFlags_NoBackground);
+}
+
+void endCard() {
+    ImGui::EndChild();
+    // Drawn on the parent's draw list *after* the child: child windows are
+    // always rendered after their parent, so this still lands behind the
+    // card's contents -- and by now the card's final size is known.
+    drawCardBackdrop(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+}
+
+bool button(const char* label, ImVec4 tint, ImVec2 size, ButtonKind kind) {
+    const char* end = visibleEnd(label);
+    const ImVec2 textSize = ImGui::CalcTextSize(label, end);
+    const ImGuiStyle& st = ImGui::GetStyle();
+
+    ImVec2 sz = size;
+    if (sz.x == 0.0f) {
+        sz.x = textSize.x + st.FramePadding.x * 2.0f + 10.0f;
+    } else if (sz.x < 0.0f) {
+        sz.x = std::max(4.0f, ImGui::GetContentRegionAvail().x);
+    }
+    if (sz.y == 0.0f) sz.y = ImGui::GetFrameHeight();
+
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + sz.x, a.y + sz.y);
+    const bool pressed = ImGui::InvisibleButton(label, sz);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    const float h = animate(ImGui::GetItemID(), hovered ? 1.0f : 0.0f, 14.0f);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r = kButtonRounding;
+
+    if (h > 0.01f && !g_lowPower) {
+        for (int i = 1; i <= 4; ++i) {
+            const float g = static_cast<float>(i) * 1.6f;
+            dl->AddRect(ImVec2(a.x - g, a.y - g), ImVec2(b.x + g, b.y + g),
+                        col(alpha(tint, 0.13f * h * (1.0f - static_cast<float>(i) / 5.0f))), r + g, 0, 1.6f);
+        }
+    }
+
+    const bool primary = kind == ButtonKind::Primary;
+    ImVec4 fill = alpha(tint, primary ? 0.60f + 0.22f * h : 0.10f + 0.12f * h);
+    if (held) fill = ImVec4(fill.x * 0.82f, fill.y * 0.82f, fill.z * 0.82f, fill.w + 0.08f);
+    dl->AddRectFilled(a, b, col(fill), r);
+    if (!g_lowPower) {
+        dl->AddRectFilled(a, ImVec2(b.x, a.y + sz.y * 0.5f), col(ImVec4(1, 1, 1, primary ? 0.14f : 0.05f)), r,
+                          ImDrawFlags_RoundCornersTop);
+    }
+    dl->AddRect(a, b, col(alpha(tint, primary ? 0.95f : 0.30f + 0.40f * h)), r, 0, 1.0f);
+
+    const ImVec4 textColor = primary ? ImVec4(1, 1, 1, 1) : g_palette.text;
+    const ImVec2 textPos(a.x + (sz.x - textSize.x) * 0.5f, a.y + (sz.y - textSize.y) * 0.5f + (held ? 1.0f : 0.0f));
+    dl->AddText(textPos, col(textColor), label, end);
+    return pressed;
+}
+
+bool railItem(const char* label, const char* badge, ImVec4 badgeColor, bool selected, ImVec4 accent, float height) {
+    const char* end = visibleEnd(label);
+    const ImVec2 textSize = ImGui::CalcTextSize(label, end);
+    const ImVec2 sz(std::max(4.0f, ImGui::GetContentRegionAvail().x),
+                    height > 0.0f ? height : ImGui::GetFrameHeight() + 10.0f);
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + sz.x, a.y + sz.y);
+    const bool pressed = ImGui::InvisibleButton(label, sz);
+    const bool hovered = ImGui::IsItemHovered();
+    const float h = animate(ImGui::GetItemID(), hovered ? 1.0f : 0.0f, 16.0f);
+    const float s = animate(ImGui::GetItemID() + 1, selected ? 1.0f : 0.0f, 12.0f);
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r = kButtonRounding;
+    const float fill = 0.05f * h + 0.16f * s;
+    if (fill > 0.005f) dl->AddRectFilled(a, b, col(alpha(accent, fill)), r);
+    if (s > 0.01f) {
+        dl->AddRect(a, b, col(alpha(accent, 0.35f * s)), r, 0, 1.0f);
+        // Accent bar on the left edge.
+        const float inset = sz.y * 0.22f;
+        dl->AddRectFilled(ImVec2(a.x + 3.0f, a.y + inset), ImVec2(a.x + 6.0f, b.y - inset),
+                          col(alpha(accent, s)), 2.0f);
+    }
+    const ImVec4 textColor = selected ? g_palette.text : ImVec4(g_palette.text.x * 0.5f + g_palette.textDim.x * 0.5f,
+                                                                g_palette.text.y * 0.5f + g_palette.textDim.y * 0.5f,
+                                                                g_palette.text.z * 0.5f + g_palette.textDim.z * 0.5f, 1.0f);
+    dl->AddText(ImVec2(a.x + 14.0f, a.y + (sz.y - textSize.y) * 0.5f), col(textColor), label, end);
+    if (badge && badge[0] != '\0') {
+        const ImVec2 bs = ImGui::CalcTextSize(badge);
+        const float padX = 7.0f;
+        const float bh = bs.y + 4.0f;
+        const ImVec2 ba(b.x - 8.0f - bs.x - padX * 2.0f, a.y + (sz.y - bh) * 0.5f);
+        const ImVec2 bb(b.x - 8.0f, ba.y + bh);
+        dl->AddRectFilled(ba, bb, col(alpha(badgeColor, 0.16f)), bh * 0.5f);
+        dl->AddRect(ba, bb, col(alpha(badgeColor, 0.45f)), bh * 0.5f, 0, 1.0f);
+        dl->AddText(ImVec2(ba.x + padX, ba.y + 2.0f), col(badgeColor), badge);
+    }
+    return pressed;
+}
+
+bool menuIcon(const char* id, float size, float open, bool alert) {
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + size, a.y + size);
+    ImGui::InvisibleButton(id, ImVec2(size, size));
+    const bool hovered = ImGui::IsItemHovered();
+    const float h = std::max(animate(ImGui::GetItemID(), hovered ? 1.0f : 0.0f, 16.0f), open);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r = size * 0.28f;
+    if (h > 0.01f && !g_lowPower) {
+        for (int i = 1; i <= 3; ++i) {
+            const float g = static_cast<float>(i) * 1.5f;
+            dl->AddRect(ImVec2(a.x - g, a.y - g), ImVec2(b.x + g, b.y + g),
+                        col(alpha(kBlue, 0.12f * h * (1.0f - static_cast<float>(i) / 4.0f))), r + g, 0, 1.5f);
+        }
+    }
+    dl->AddRectFilled(a, b, col(alpha(kBlue, 0.10f + 0.16f * h)), r);
+    if (!g_lowPower) {
+        dl->AddRectFilled(a, ImVec2(b.x, a.y + size * 0.5f), col(ImVec4(1, 1, 1, 0.06f)), r, ImDrawFlags_RoundCornersTop);
+    }
+    dl->AddRect(a, b, col(alpha(kBlue, 0.30f + 0.45f * h)), r, 0, 1.0f);
+    // Three bars; the middle one shortens and the others tilt towards an arrow as it opens.
+    const float cx = (a.x + b.x) * 0.5f;
+    const float cy = (a.y + b.y) * 0.5f;
+    const float half = size * 0.24f;
+    const float gap = size * 0.16f;
+    const float thick = std::max(2.0f, size * 0.07f);
+    const ImU32 barColor = col(g_palette.text);
+    const float tilt = gap * 0.55f * open;
+    dl->AddLine(ImVec2(cx - half, cy - gap), ImVec2(cx + half, cy - gap + tilt), barColor, thick);
+    dl->AddLine(ImVec2(cx - half, cy), ImVec2(cx + half - size * 0.12f * open, cy), barColor, thick);
+    dl->AddLine(ImVec2(cx - half, cy + gap), ImVec2(cx + half, cy + gap - tilt), barColor, thick);
+    if (alert) {
+        const float pulse = g_lowPower ? 1.0f : 0.75f + 0.25f * std::sin(static_cast<float>(ImGui::GetTime()) * 5.0f);
+        dl->AddCircleFilled(ImVec2(b.x - size * 0.14f, a.y + size * 0.14f), size * 0.10f, col(alpha(kRed, pulse)));
+    }
+    return hovered;
+}
+
+void pill(const char* text, ImVec4 color, bool pulse) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 textSize = ImGui::CalcTextSize(text);
+    const float height = ImGui::GetFrameHeight();
+    const float dotR = 4.0f;
+    const float padX = 11.0f;
+    const float gap = 8.0f;
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + padX + dotR * 2 + gap + textSize.x + padX, a.y + height);
+
+    dl->AddRectFilled(a, b, col(alpha(color, 0.14f)), height * 0.5f);
+    dl->AddRect(a, b, col(alpha(color, 0.45f)), height * 0.5f, 0, 1.0f);
+
+    const ImVec2 dot(a.x + padX + dotR, a.y + height * 0.5f);
+    if (pulse && !g_lowPower) {
+        const float phase = std::fmod(static_cast<float>(ImGui::GetTime()) * 1.1f, 1.0f);
+        dl->AddCircleFilled(dot, dotR + 7.0f * phase, col(alpha(color, 0.45f * (1.0f - phase))), 24);
+    }
+    dl->AddCircleFilled(dot, dotR, col(color), 16);
+    dl->AddText(ImVec2(dot.x + dotR + gap, a.y + (height - textSize.y) * 0.5f), col(g_palette.text), text);
+    ImGui::Dummy(ImVec2(b.x - a.x, height));
+}
+
+void progress(const char* id, float fraction, ImVec4 color, const char* overlay, float height) {
+    const float shown = animate(ImGui::GetID(id), std::clamp(fraction, 0.0f, 1.0f), 8.0f);
+    const float h = height > 0.0f ? height : ImGui::GetFrameHeight() * 0.95f;
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + w, a.y + h);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float r = h * 0.5f;
+
+    dl->AddRectFilled(a, b, col(g_dark ? ImVec4(1, 1, 1, 0.06f) : ImVec4(0, 0, 0, 0.06f)), r);
+    if (shown > 0.002f) {
+        const ImVec2 fillEnd(a.x + std::max(h, w * shown), b.y);
+        dl->AddRectFilled(a, fillEnd, col(alpha(color, 0.80f)), r);
+        dl->AddRectFilled(a, ImVec2(fillEnd.x, a.y + h * 0.5f), col(ImVec4(1, 1, 1, 0.16f)), r,
+                          ImDrawFlags_RoundCornersTop);
+    }
+    dl->AddRect(a, b, col(g_palette.cardBorder), r, 0, 1.0f);
+    if (overlay) {
+        const ImVec2 ts = ImGui::CalcTextSize(overlay);
+        dl->AddText(ImVec2(a.x + (w - ts.x) * 0.5f, a.y + (h - ts.y) * 0.5f), col(g_palette.text), overlay);
+    }
+    ImGui::Dummy(ImVec2(w, h));
+}
+
+void balanceBar(const char* id, float value, float negScale, float posScale, const char* overlay, float height) {
+    const float neg = std::max(negScale, 0.01f);
+    const float pos = std::max(posScale, 0.01f);
+    // Normalised to [-1, 1]: -1 = full loss side, +1 = target reached.
+    const float target = value >= 0.0f ? std::min(value / pos, 1.0f) : std::max(value / neg, -1.0f);
+    const float shown = animate(ImGui::GetID(id), target, 10.0f);
+    const float strength = std::min(1.0f, std::fabs(shown));
+
+    const float h = height > 0.0f ? height : ImGui::GetFrameHeight();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + w, a.y + h);
+    const float mid = a.x + w * 0.5f;
+    const float r = h * 0.5f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Track, faintly tinted red on the loss half and green on the profit half.
+    dl->AddRectFilled(a, b, col(g_dark ? ImVec4(1, 1, 1, 0.05f) : ImVec4(0, 0, 0, 0.05f)), r);
+    // The side the basket is on glows more the further it has gone.
+    const float redTint = 0.05f + (shown < 0.0f ? 0.12f * strength : 0.0f);
+    const float greenTint = 0.05f + (shown > 0.0f ? 0.12f * strength : 0.0f);
+    dl->AddRectFilled(a, ImVec2(mid, b.y), col(alpha(kRed, redTint)), r, ImDrawFlags_RoundCornersLeft);
+    dl->AddRectFilled(ImVec2(mid, a.y), b, col(alpha(kGreen, greenTint)), r, ImDrawFlags_RoundCornersRight);
+
+    if (std::fabs(shown) > 0.002f) {
+        const bool up = shown > 0.0f;
+        // Near zero the fill is a muted grey-green / grey-red; it turns fully
+        // green / red as the net moves towards the target / the loss limit.
+        const ImVec4 full = up ? kGreen : kRed;
+        const ImVec4 dim = g_palette.textDim;
+        const float k = 0.35f + 0.65f * strength;
+        const ImVec4 c(dim.x + (full.x - dim.x) * k, dim.y + (full.y - dim.y) * k, dim.z + (full.z - dim.z) * k, 1.0f);
+        const float edge = mid + shown * (w * 0.5f);
+        const ImVec2 fa(up ? mid : edge, a.y);
+        const ImVec2 fb(up ? edge : mid, b.y);
+        const ImDrawFlags corners = up ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersLeft;
+        dl->AddRectFilled(fa, fb, col(alpha(c, 0.85f)), r, corners);
+        dl->AddRectFilled(fa, ImVec2(fb.x, a.y + h * 0.5f), col(ImVec4(1, 1, 1, 0.16f)), r,
+                          up ? ImDrawFlags_RoundCornersTopRight : ImDrawFlags_RoundCornersTopLeft);
+        // Soft glow at the moving edge.
+        dl->AddCircleFilled(ImVec2(edge, a.y + h * 0.5f), h * 0.55f, col(alpha(c, 0.25f)), 24);
+    }
+    dl->AddLine(ImVec2(mid, a.y - 2.0f), ImVec2(mid, b.y + 2.0f), col(g_palette.textDim), 1.0f);
+    dl->AddRect(a, b, col(g_palette.cardBorder), r, 0, 1.0f);
+    if (overlay) {
+        const ImVec2 ts = ImGui::CalcTextSize(overlay);
+        const ImVec2 tp(a.x + (w - ts.x) * 0.5f, a.y + (h - ts.y) * 0.5f);
+        dl->AddText(ImVec2(tp.x + 1, tp.y + 1), col(ImVec4(0, 0, 0, g_dark ? 0.55f : 0.15f)), overlay);
+        dl->AddText(tp, col(g_palette.text), overlay);
+    }
+    ImGui::Dummy(ImVec2(w, h));
+}
+
+float ease(const char* id, float target, float speed) { return animate(ImGui::GetID(id), target, speed); }
+
+void pnlBar(const char* id, float value, float negScale, float posScale, float height) {
+    struct BarState {
+        float shown = 0.0f;
+        float last = 0.0f;
+        float pulse = 0.0f;  // 0..1, decays after each move
+        bool rising = true;
+        bool init = false;
+    };
+    static std::unordered_map<ImGuiID, BarState> states;
+    BarState& st = states[ImGui::GetID(id)];
+
+    const float neg = std::max(negScale, 0.01f);
+    const float pos = std::max(posScale, 0.01f);
+    // Normalised to [-1, 1]: -1 = loss limit, +1 = target.
+    const float target = value >= 0.0f ? std::min(value / pos, 1.0f) : std::max(value / neg, -1.0f);
+    const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.25f);
+    if (!st.init) {
+        st.shown = st.last = target;
+        st.init = true;
+    }
+    const float move = target - st.last;
+    if (std::fabs(move) > 0.0005f) {
+        st.pulse = std::min(1.0f, st.pulse * 0.5f + 0.45f + std::fabs(move) * 8.0f);
+        st.rising = move > 0.0f;
+        st.last = target;
+    }
+    st.pulse *= std::exp(-3.2f * dt);
+    st.shown = g_lowPower ? target : st.shown + (target - st.shown) * (1.0f - std::exp(-16.0f * dt));
+    const float shown = st.shown;
+    const float strength = std::min(1.0f, std::fabs(shown));
+
+    const float h = height > 0.0f ? height : ImGui::GetFrameHeight() * 0.85f;
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    const ImVec2 b(a.x + w, a.y + h);
+    const float mid = a.x + w * 0.5f;
+    const float r = h * 0.5f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Track: faint red / green halves; the side the basket is on glows more.
+    dl->AddRectFilled(a, b, col(g_dark ? ImVec4(1, 1, 1, 0.06f) : ImVec4(0, 0, 0, 0.06f)), r);
+    dl->AddRectFilled(a, ImVec2(mid, b.y), col(alpha(kRed, 0.07f + (shown < 0.0f ? 0.10f * strength : 0.0f))), r,
+                      ImDrawFlags_RoundCornersLeft);
+    dl->AddRectFilled(ImVec2(mid, a.y), b, col(alpha(kGreen, 0.07f + (shown > 0.0f ? 0.10f * strength : 0.0f))), r,
+                      ImDrawFlags_RoundCornersRight);
+    // Quarter marks for scale.
+    for (int q = 1; q <= 3; ++q) {
+        const float off = w * 0.5f * static_cast<float>(q) / 4.0f;
+        for (const float x : {mid - off, mid + off}) {
+            dl->AddLine(ImVec2(x, a.y + h * 0.3f), ImVec2(x, b.y - h * 0.3f),
+                        col(alpha(g_palette.textDim, 0.30f)), 1.0f);
+        }
+    }
+
+    if (std::fabs(shown) > 0.002f) {
+        const bool up = shown > 0.0f;
+        // Near zero a muted tone, deepening to full green / red towards the ends.
+        const ImVec4 full = up ? kGreen : kRed;
+        const ImVec4 dim = g_palette.textDim;
+        const float k = 0.40f + 0.60f * strength;
+        const ImVec4 c(dim.x + (full.x - dim.x) * k, dim.y + (full.y - dim.y) * k, dim.z + (full.z - dim.z) * k, 1.0f);
+        const float edge = mid + shown * (w * 0.5f);
+        const ImVec2 fa(up ? mid : edge, a.y);
+        const ImVec2 fb(up ? edge : mid, b.y);
+        const ImDrawFlags corners = up ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersLeft;
+        dl->AddRectFilled(fa, fb, col(c), r, corners);
+        // Gloss on the top half.
+        dl->AddRectFilled(fa, ImVec2(fb.x, a.y + h * 0.45f), col(ImVec4(1, 1, 1, g_dark ? 0.14f : 0.22f)), r,
+                          up ? ImDrawFlags_RoundCornersTopRight : ImDrawFlags_RoundCornersTopLeft);
+        // The moving edge: a bright head.
+        dl->AddRectFilled(ImVec2(edge - (up ? 3.0f : 0.0f), a.y + 1.0f), ImVec2(edge + (up ? 0.0f : 3.0f), b.y - 1.0f),
+                          col(ImVec4(1, 1, 1, 0.55f)), 1.5f);
+    }
+    // The beat: a glow at the edge on every move, coloured by its direction.
+    if (st.pulse > 0.02f) {
+        const float edge = mid + shown * (w * 0.5f);
+        const ImVec4 beat = st.rising ? kGreen : kRed;
+        const ImVec2 c(edge, a.y + r);
+        dl->AddCircleFilled(c, h * (0.55f + 0.75f * st.pulse), col(alpha(beat, 0.16f * st.pulse)), 24);
+        dl->AddCircleFilled(c, h * (0.35f + 0.35f * st.pulse), col(alpha(beat, 0.30f * st.pulse)), 20);
+        dl->AddRect(ImVec2(a.x - 1.0f, a.y - 1.0f), ImVec2(b.x + 1.0f, b.y + 1.0f), col(alpha(beat, 0.45f * st.pulse)),
+                    r + 1.0f, 0, 1.5f);
+    }
+    dl->AddLine(ImVec2(mid, a.y - 3.0f), ImVec2(mid, b.y + 3.0f), col(g_palette.text), 1.5f);
+    dl->AddRect(a, b, col(g_palette.cardBorder), r, 0, 1.0f);
+    ImGui::Dummy(ImVec2(w, h));
+}
+
+float userBadgeWidth(const char* name, const char* role) {
+    return ImGui::GetFrameHeight() + 8.0f + ImGui::CalcTextSize(name).x + 8.0f + ImGui::CalcTextSize(role).x + 16.0f;
+}
+
+bool userBadge(const char* name, const char* role, ImVec4 color) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float h = ImGui::GetFrameHeight();
+    const float w = userBadgeWidth(name, role);
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##user_badge", ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+
+    // Avatar: the name's first letter in a ring.
+    const float r = h * 0.5f;
+    const ImVec2 c(a.x + r, a.y + r);
+    dl->AddCircleFilled(c, r, col(alpha(color, hovered ? 0.32f : 0.20f)), 28);
+    dl->AddCircle(c, r - 0.75f, col(alpha(color, 0.90f)), 28, 1.5f);
+    const char initial[2] = {static_cast<char>(name[0] >= 'a' && name[0] <= 'z' ? name[0] - 32 : (name[0] ? name[0] : '?')),
+                             '\0'};
+    const ImVec2 ts = ImGui::CalcTextSize(initial);
+    dl->AddText(ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), col(color), initial);
+
+    // Name, then the role as a small tag.
+    const float ty = a.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+    float x = a.x + h + 8.0f;
+    dl->AddText(ImVec2(x, ty), col(g_palette.text), name);
+    x += ImGui::CalcTextSize(name).x + 8.0f;
+    const ImVec2 rs = ImGui::CalcTextSize(role);
+    const ImVec2 ra(x, a.y + 3.0f);
+    const ImVec2 rb(x + rs.x + 16.0f, a.y + h - 3.0f);
+    dl->AddRectFilled(ra, rb, col(alpha(color, 0.18f)), (rb.y - ra.y) * 0.5f);
+    dl->AddRect(ra, rb, col(alpha(color, 0.55f)), (rb.y - ra.y) * 0.5f, 0, 1.0f);
+    dl->AddText(ImVec2(x + 8.0f, ty), col(color), role);
+    return hovered;
+}
+
+}  // namespace muuk::desktop::glass

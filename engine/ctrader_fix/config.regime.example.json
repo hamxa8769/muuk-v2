@@ -1,0 +1,113 @@
+{
+  "connection": {
+    "platform": "mt5",
+    "mt5": {
+      "eaPort": 5300,
+      "fixPort": 5301,
+      "autoStart": true,
+      "terminal": "F:\\MT5Testing\\terminal64.exe",
+      "login": "YOUR_MT5_ACCOUNT_NUMBER",
+      "server": "YOUR_BROKER-Demo",
+      "chartSymbol": "auto",
+      "password": "YOUR_MT5_PASSWORD_OR_LEAVE_EMPTY_TO_USE_THE_ACCOUNT_MT5_LAST_USED"
+    },
+    "environment": "demo",
+    "traderLogin": "YOUR_MT5_ACCOUNT_NUMBER",
+    "symbolName": "XAUUSD",
+    "autoRangeWidthPoints": 2.0,
+    "accountKind": "cent",
+    "recovery": {
+      "guardLockMarginLevel": 300,
+      "guardStopMarginLevel": 200,
+      "hedgedMarginPercent": 100,
+      "closeAtBreakEven": true,
+      "escapeEnabled": false,
+      "escapeMove": 2.0,
+      "escapeBuffer": 0.3,
+      "escapeTrailAt": 1.0,
+      "escapeMaxTries": 2
+    },
+    "autoContinue": false,
+    "lockAtLevel": 9,
+    "lockAtLossPercent": 25.0,
+    "dailyLossLimitMoney": 0.0,
+    "regime": {
+      "enabled": true,
+      "minGap": 2.0,
+      "maxGap": 15.0,
+      "maxPositions": 8,
+      "shiftAfterFills": 3,
+      "maxLockRiskPercent": 25.0,
+      "requireFeed": false,
+      "brainFile": "muuk_brain/brain.json",
+      "brainRequired": true,
+      "stepAtr": 2.0
+    },
+    "entryTimeoutSeconds": 60,
+    "basketCooldownSeconds": 30
+  },
+  "strategy": {
+    "symbol": {
+      "name": "XAUUSD",
+      "digits": 2,
+      "tickSize": 0.01,
+      "tickValue": 1.0,
+      "contractSize": 100.0,
+      "volumeStep": 0.01,
+      "volumeMin": 0.01,
+      "volumeMax": 1000.0
+    },
+    "range": {
+      "lower": 4336.0,
+      "upper": 4338.0
+    },
+    "lotProgression": {
+      "initialLot": 0.01,
+      "lotIncrement": 0.01,
+      "lotMultiplier": 2.0
+    },
+    "riskLimits": {
+      "maxOrders": 20,
+      "maxLot": 50.0,
+      "maxBasketLossMoney": 0.0,
+      "maxDrawdownMoney": 0.0,
+      "maxMarginUsageFraction": 0.0,
+      "maxSpreadTicks": 60,
+      "maxSlippageTicks": 0
+    },
+    "costs": {
+      "commissionPerLotRoundTurn": 0.0,
+      "commissionPerMillionPerSide": 0.0
+    },
+    "basketProfitTargetMoney": 20.0,
+    "autoProfitTarget": {
+      "enabled": false,
+      "percent": 200
+    },
+    "breakEvenEscape": {
+      "fromLevel": 0,
+      "profit": 0.5
+    },
+    "reArmOnFill": true,
+    "startSide": "both",
+    "lastLotTarget": {
+      "enabled": true,
+      "move": 1.0
+    }
+  },
+  "market": {
+    "enabled": true,
+    "newsGuard": true,
+    "newsHigh": true,
+    "newsMedium": false,
+    "newsCurrencies": "USD",
+    "newsMinutesBefore": 30,
+    "newsMinutesAfter": 30,
+    "pauseAroundClose": true,
+    "pauseMinutesBefore": 60,
+    "pauseMinutesAfter": 60,
+    "cancelUnfilledAtPause": true,
+    "resumeCooldownSeconds": 30,
+    "closeRangeAt": "never"
+  }
+}

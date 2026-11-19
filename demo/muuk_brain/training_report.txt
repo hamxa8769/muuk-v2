@@ -1,0 +1,48 @@
+=== 2026-11-04 23:45:20
+bars 50482, learned from the first 35337, tested on the last 15145 (per 0.01 lot start)
+brain          cycles   260  wins   241  locks    2  total    -629.03  worst cycle   -994.24  max drawdown   1614.44
+fixed 3 x ATR  cycles   300  wins   277  locks    5  total   -3132.35  worst cycle  -1094.23  max drawdown   3317.17
+result: not better -- not adopted
+
+=== 2026-11-05 00:00:03
+bars 50731, learned from the first 35511, tested on the last 15220 (per 0.01 lot start)
+brain          cycles   259  wins   238  locks    3  total   -1424.34  worst cycle   -978.80  max drawdown   2352.85
+fixed 3 x ATR  cycles   297  wins   271  locks    6  total   -4634.54  worst cycle  -1142.50  max drawdown   4817.99
+result: not better -- not adopted
+
+=== 2026-11-05 00:01:47
+bars 50731, learned from the first 35511, tested on the last 15220 (per 0.01 lot start)
+brain          cycles   259  wins   238  locks    3  total   -1424.34  worst cycle   -978.80  max drawdown   2352.85
+fixed 3 x ATR  cycles   297  wins   271  locks    6  total   -4634.54  worst cycle  -1142.50  max drawdown   4817.99
+result: not better -- not adopted
+
+=== 2026-11-05 00:08:17
+bars 1500000, learned from the first 1050000, tested on the last 450000 (per 0.01 lot start)
+brain          cycles  5738  wins  5200  locks   29  total   -5336.80  worst cycle  -2652.00  max drawdown  15291.75
+fixed 3 x ATR  cycles  9346  wins  8795  locks   65  total  -21841.27  worst cycle  -2667.88  max drawdown  23009.03
+result: not better -- not adopted
+
+=== 2026-11-05 00:27:06
+bars 1500000, learned from the first 1050000, tested on the last 450000 (per 0.01 lot start)
+brain          cycles  5738  wins  5200  locks   29  total   -5336.80  worst cycle  -2652.00  max drawdown  15291.75
+fixed 3 x ATR  cycles  9346  wins  8795  locks   65  total  -21841.27  worst cycle  -2667.88  max drawdown  23009.03
+result: not better -- not adopted
+
+=== 2026-11-05 01:08:04
+bars 1500063, learned from the first 1050044, tested on the last 450019 (per 0.01 lot start)
+brain          cycles  5776  wins  5240  locks   29  total   -3161.88  worst cycle  -2652.00  max drawdown  13791.02
+fixed 3 x ATR  cycles  9341  wins  8790  locks   64  total  -21188.57  worst cycle  -2667.88  max drawdown  22545.34
+result: not better -- not adopted
+
+=== 2026-11-05 01:09:28
+bars 1500065, learned from the first 1050045, tested on the last 450020 (per 0.01 lot start)
+brain          cycles  5777  wins  5241  locks   29  total   -3158.55  worst cycle  -2652.00  max drawdown  13791.02
+fixed 3 x ATR  cycles  9341  wins  8790  locks   64  total  -21192.45  worst cycle  -2667.88  max drawdown  22545.34
+result: not better -- not adopted
+
+=== 2026-11-05 03:00:10
+bars 1500173, learned from the first 1050121, tested on the last 450052 (per 0.01 lot start)
+brain          cycles  5779  wins  5243  locks   30  total   -3810.39  worst cycle  -2652.00  max drawdown  13791.02
+fixed 3 x ATR  cycles  9347  wins  8796  locks   64  total  -21148.38  worst cycle  -2667.88  max drawdown  22545.34
+result: not better -- not adopted
+
