@@ -160,6 +160,29 @@ int main(int argc, char** argv) {
     });
 #endif
 
+    // MT5 only: the bridge holds the 240 one-minute bars the EA sends on
+    // every connect (Mt5Gateway::takeHistoryBars); the desktop feeds them to
+    // the runner from its tick(), but the CLI has no tick, so this thread
+    // does it. Without them the runner — and the brain, which needs 150
+    // bars to read the market — builds its bars from live ticks only, 150
+    // minutes to a full market read. takeHistoryBars is mutex-guarded and
+    // addHistoryBars takes the runner's lock, so this is safe while the
+    // runner runs; g_runner is the runner of the moment (see
+    // RunnerRegistration), or null between reconnects.
+    std::atomic<bool> historyFeederDone{false};
+    std::thread historyFeeder;
+    if (bridge) {
+        historyFeeder = std::thread([&] {
+            while (!historyFeederDone && !g_exitRequested) {
+                if (auto bars = bridge->takeHistoryBars(); !bars.empty()) {
+                    std::scoped_lock lock(g_runnerMutex);
+                    if (g_runner) g_runner->addHistoryBars(bars);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        });
+    }
+
     // The running basket is saved next to the config and picked up again on
     // every (re)connect (see LiveRunner::setStateFile).
     const auto stateFile = muuk::ctrader_fix::defaultStateFile(credentialsPath);
@@ -200,5 +223,7 @@ int main(int argc, char** argv) {
     done = true;
     watcher.join();
 #endif
+    historyFeederDone = true;
+    if (historyFeeder.joinable()) historyFeeder.join();
     return 0;
 }

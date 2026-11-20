@@ -109,9 +109,175 @@ only if it passes walk-forward.
 The v1 brain files (`market_brain.*`, `regime_range.*`) were merged into
 this tree from the worktree, so v1 stays available as the fallback and
 the comparison in every v2 report. The v1 `StrategyEngine::moveRange`
-test was omitted — `moveRange` does not exist in this tree — and the
-live regime wiring into `LiveRunner` is still a separate step:
-`BrainKeeperV2::decide()` is the wiring point.
+test was omitted — `moveRange` does not exist in this tree.
+
+### Live wiring (LiveRunner)
+
+`BrainKeeperV2` is wired into `LiveRunner` (`engine/ctrader_fix`):
+the runner owns a `unique_ptr<BrainKeeperV2>` and calls it on every new
+cycle, in `LiveRunner::prepareNextCycle` before the engine is
+reconfigured. `BrainKeeperV2::decideForCycle()` returns the decision
+plus the situation it was based on, so the runner can report it and
+feed the outcome back later.
+
+Per cycle the runner passes: the 1-minute bars, the outcome of the last
+completed basket (`-1` if it lost or locked, `+1` if it won, `0` if
+there is none yet), the live spread, and the median spread of the last
+120 quotes. The spread and its median must differ — the brain vetoes
+a cycle when the spread is more than twice its median — so the runner
+keeps a small deque of recent spreads and computes the median itself.
+The daily P/L and the account balance go in as `BrainAccountState`
+(balance comes from the broker when known, else the config's
+`accountBalance`).
+
+Policy -> strategy mapping (applied in `engineConfigLocked()`, after the
+configured values, only when the brain decides to trade):
+
+| Brain policy | Strategy config |
+|---|---|
+| `policy.gap` (gap in points) | range width: the range is re-centered on the live mid, `[mid - gap/2, mid + gap/2]` |
+| `policy.lotMultiplier` | `lotProgression.multiplier` (geometric progression) |
+| `policy.maxLevels` | `riskLimits.maxOrders` (deepest level the range may reach) |
+| `policy.exitFactor` | `lastLotTarget = true`, `lastLotTargetMove = max(0.01, gap/2 x exitFactor)` — the basket's money target is the last lot's size times half the gap times the exit factor |
+
+If the brain says no-trade, the cycle is blocked: `entryWait_` is set
+to `"brain: " + why`, the reason is logged once, and no range opens.
+The runner retries on the next quote, so a veto is a pause, not a
+stop. The veto also fires when the brain is untrained or the situation
+cannot be read.
+
+When a basket closes, `maybeFinalizeBasket` reports it to the keeper
+(`observeBasket` with the stored situation and policy, the basket net,
+and whether it locked). The keeper only ever vetoes a cell — it never
+invents a policy — and the call is guarded so learning can never break
+basket finalization.
+
+Closed 1-minute bars are fed to the keeper (`addBars`) as they arrive
+so its background re-training can run: after 1,440 new bars it
+re-trains and adopts the new brain only if the walk-forward test
+passes, writing `training_report_v2.txt` next to the brain file.
+
+#### Real-money guard (non-negotiable)
+
+Brain-driven cycles are refused on a real account — `connection.environment
+== "live"` or the broker reporting a real account — unless the config
+explicitly sets `brain.allowRealAccount: true`. The refusal is logged
+once and the cycle opens on the configured strategy instead. The
+default is `false`: the validated brain has NOT passed its strict
+gates (48 locks, held-out last 15% -$1,102), so it is demo-only until
+those gates pass.
+
+#### Configuration
+
+```json
+"brain": {
+  "enabled": true,
+  "brainFile": "brain_v2.txt",
+  "allowRealAccount": false
+}
+```
+
+- `enabled` (default `true`): turn the wiring off and the runner
+  behaves exactly as before.
+- `brainFile` (default `"brain_v2.txt"`): resolved as an absolute path
+  if given one, else next to the runner's state file, else the working
+  directory. If the file is missing or the brain inside it is
+  untrained, the runner logs once and falls back to the configured
+  strategy — it never crashes and never starts the keeper's background
+  learning over a brain that isn't there.
+- `allowRealAccount` (default `false`): see the guard above.
+
+`LiveSnapshot.brainStatus` reports the keeper's status line
+(`"off"` when the brain is disabled, otherwise the keeper's own
+status: trained/untrained, learned bars, online vetoes), so the UI or
+a log can show which strategy is actually driving the runner.
+
+#### Money scaling (cent accounts)
+
+The brain's money figures are replay units: standard-account dollars,
+where 1 lot earns $100 per $1.00 of price move, starting from a 0.01
+lot. The live account counts in its own currency, so the runner
+converts every money figure it shows the brain into replay units with
+one factor — `100 / moneyPerPointPerLot`, where `moneyPerPointPerLot`
+is the adopted symbol's `tickValue / tickSize` (see
+`LiveRunner::brainMoneyScaleLocked`):
+
+| Account | tick value | money per point per lot | 1 unit of account money = |
+|---|---|---|---|
+| Standard USD | 1.0 per 0.01 | 100 | $1.00 replay |
+| RoboForex-style ProCent | 100 USC per 0.01 | 10,000 | $0.01 replay (0.01 lot x $1 = 100 USC) |
+| 3-digit XAUUSDc | 0.1 per 0.001 | 100 | $1.00 replay (that symbol's lot is 1 oz) |
+
+The factor carries the currency and the contract size together, so it
+is right for both cent shapes above — it is the number the gateway
+test already pins (`moneyPerPointPerLot` 10,000 on ProCent, 0.01 lot x
+$1 = 100 USC gross). It is applied to the day's realized P/L, the
+account balance, and every basket net fed back to the keeper's online
+learning. Gap, spread, lots and levels are not money, so they are
+never scaled; the exit target is a price move, and the engine turns
+it into money with the same adopted symbol, so it comes out right in
+account money on its own.
+
+Two honest limits. First, the money-dependent caps (`maxDailyLoss`,
+`maxDrawdown`, `maxLockCostPctOfBalance`) are all off by default
+(0.0), so with the keeper's default config the scaling changes no
+decision today — it is there so the caps are correct when they are
+turned on. Second, the runner tracks the day's realized P/L but no
+equity peak, so `drawdown` is always 0.0 and the brain's `maxDrawdown`
+cap is inert live; the runner's own daily-loss limit is the live
+equivalent.
+
+#### MT5
+
+The wiring is platform-agnostic: the keeper only sees 1-minute bars
+and spreads, and its history format is MT5's export format. On the
+MT5 path the bars and the spread come from the bridge's FIX quotes
+exactly as on cTrader — `onQuoteMessage` feeds the keeper and records
+the spread — and the on-connect history seeds the keeper through
+`addHistoryBars`:
+
+- The bridge (`MuukBridge.mq5`, `QueueBars`) sends the last 240
+  finished one-minute bars on every connect; the gateway
+  (`Mt5Gateway`) asks for them when a QUOTE session subscribes and
+  holds them for `takeHistoryBars()`.
+- The desktop app feeds them from `LiveController::tick()` into
+  `runner_->addHistoryBars(bars)`.
+- The CLI (`muuk-live`, `engine/ctrader_fix/cli/main.cpp`) has no
+  tick, so a small feeder thread polls `takeHistoryBars()` once a
+  second and calls `addHistoryBars` on the runner of the moment.
+  Without this the CLI path would build its bars from live ticks
+  only — 150 minutes to the 150 bars the brain needs to read the
+  market, during which the brain vetoes and the configured strategy
+  runs.
+
+The real-money guard uses MT5's own word for the account:
+`BrokerAccountInfo.tradeMode` comes from the bridge
+(`MuukTradeMode`), and `brokerAccount_.real()` is true only when MT5
+says `"real"`. The runner already refuses to trade at all when a real
+MT5 account is paired with a demo config, so a real account with a
+demo config never reaches the brain. The user's only configured
+account is the MT5 demo, so the default behaviour is demo.
+
+`engine/ctrader_fix/config.mt5.example.json` carries a ready MT5
+setup: `platform` `"mt5"`, `environment` `"demo"`, `accountKind`
+`"cent"`, and the brain section enabled with `brainFile`
+`"brain_v2.txt"`. It keeps the `YOUR_MT5_*` placeholders — no real
+credentials.
+
+#### Entry points
+
+Both ways of starting the runner go through the same wiring, because
+it lives in `LiveRunner::run()` / `prepareNextCycle`, not in a
+platform branch:
+
+- CLI: `engine/ctrader_fix/cli/main.cpp` — `muuk-live --credentials
+  <config.json>` loads the config with `loadLiveConfig` (which parses
+  the `"brain"` section), starts an `Mt5Gateway` when `platform` is
+  `"mt5"`, constructs `LiveRunner` and calls `run()`.
+- Desktop app: `app/desktop/src/live_controller.cpp` —
+  `LiveController::startRunner` loads the same config, ensures the
+  bridge, constructs `LiveRunner`, sets the state file, and runs it
+  on a thread; `tick()` feeds the MT5 history bars.
 
 ### Brain file format
 

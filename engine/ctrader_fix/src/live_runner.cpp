@@ -231,6 +231,7 @@ LiveSnapshot LiveRunner::snapshot() const {
     snap.escapeHeld = escapeHeld_;
     snap.marketRead = marketRead_.why;
     snap.marketScore = marketRead_.score;
+    snap.brainStatus = !config_.brain.enabled ? "off" : (brain_ ? brain_->status() : "no trained brain");
     snap.platform = config_.connection.platform;
     snap.brokerAccount = brokerAccount_;
     snap.brokerAccountFresh = brokerAccountFreshLocked();
@@ -517,6 +518,7 @@ void LiveRunner::run() {
         {
             std::scoped_lock lock(engineMutex_);
             if (autoRange) centerRangeOnLatestQuote();
+            maybeInitBrainLocked();
             engine_ = std::make_unique<StrategyEngine>(engineConfigLocked());
             // Hand the engine the live quote before start(): it's Idle, so
             // this only records the tick -- but seed orders are placed off
@@ -553,10 +555,15 @@ void LiveRunner::run() {
                 if (spreadTooWideLocked() || marketBlocksLocked()) {
                     reopenAfterManualClose_ = true;  // starts as soon as the spread / market allows
                     reopenCooldownSeconds_ = 0;
-                } else {
+                } else if (prepareNextCycle(autoRange)) {
                     beginBasket();
                     for (const auto& cmd : engine_->start()) handleCommand(cmd);
                     started = true;
+                } else {
+                    // The brain vetoed the first cycle: ask it again on
+                    // later ticks (maybeRestartAfterBasketClose).
+                    reopenAfterManualClose_ = true;
+                    reopenCooldownSeconds_ = 0;
                 }
             }
         }
@@ -1087,7 +1094,15 @@ void LiveRunner::onQuoteMessage(const FixMessage& msg) {
             }
             haveFullQuote = latestBid_.has_value() && latestAsk_.has_value();
             lastQuoteAt_ = std::chrono::steady_clock::now();
-            if (haveFullQuote) bars_.addQuote(utcNowMs(), (*latestBid_ + *latestAsk_) / 2.0);
+            if (haveFullQuote) {
+                bars_.addQuote(utcNowMs(), (*latestBid_ + *latestAsk_) / 2.0);
+                // The brain's spread gate compares the current spread with
+                // its median, so keep the recent spreads (not just the
+                // latest one) and hand newly closed bars to the keeper.
+                recentSpreads_.push_back(*latestAsk_ - *latestBid_);
+                if (recentSpreads_.size() > 120) recentSpreads_.pop_front();
+                feedBrainBarsLocked();
+            }
             maybeEmitTick();
             // Clock check, now and then: how far this PC's clock is from the
             // broker's (a VPS with a drifting clock shows up here).
@@ -1758,6 +1773,7 @@ void LiveRunner::addHistoryBars(const std::vector<muuk::core::Bar>& bars) {
     for (const auto& b : bars) bars_.addClosed(b);
     marketReadBar_ = -1;
     readMarketLocked();
+    feedBrainBarsLocked();
 }
 
 void LiveRunner::manageEscapeLocked(double net) {
@@ -2177,17 +2193,21 @@ void LiveRunner::placeWaitingOrderNow(OrderId id) {
     markDirty();
 }
 
-void LiveRunner::prepareNextCycle(bool recenter) {
-    if (recenter && latestBid_ && latestAsk_) {
+bool LiveRunner::prepareNextCycle(bool recenter) {
+    if (!decideBrainCycleLocked()) return false;
+    if ((recenter || brainCycleActive_) && latestBid_ && latestAsk_) {
         const SymbolSpec& spec = config_.strategy.symbol;
         RangeConfig& range = config_.strategy.range;
-        const double width = rangeWidthNowLocked();
+        // A brain-driven cycle always re-centers on the live mid at the
+        // brain's gap, even when the configured range is fixed.
+        const double width = brainCycleActive_ ? brainDecision_.gap : rangeWidthNowLocked();
         const int64_t halfWidth = std::max<int64_t>(1, Price::fromDouble(width, spec).ticks / 2);
         const int64_t mid = Price::fromDouble((*latestBid_ + *latestAsk_) / 2.0, spec).ticks;
         range = RangeConfig{Price{mid - halfWidth}, Price{mid + halfWidth}};
     }
     pickRangeShapeLocked();
     engine_->reconfigure(engineConfigLocked());
+    return true;
 }
 
 double LiveRunner::rangeWidthNowLocked() {
@@ -2234,7 +2254,146 @@ muuk::core::StrategyConfig LiveRunner::engineConfigLocked() const {
     muuk::core::StrategyConfig sc = config_.strategy;
     if (rangeSideSet_) sc.startSide = rangeStartSide_;
     if (rangeTargetMove_ > 0.0) sc.lastLotTargetMove = rangeTargetMove_;
+    if (brainCycleActive_) {
+        // The brain's policy, mapped onto the engine's config (see
+        // docs/brain-v2.md "Live wiring"): the lot multiplier is the
+        // engine's own progression multiplier; max levels is the deepest
+        // level the cycle may reach (RiskLimits::maxOrders); the exit is
+        // the last-lot target at gap/2 x exitFactor, exactly the target
+        // the policy was learned with.
+        sc.lotProgression.multiplier = brainDecision_.policy.lotMultiplier;
+        sc.riskLimits.maxOrders = brainDecision_.policy.maxLevels;
+        sc.lastLotTarget = true;
+        sc.lastLotTargetMove = std::max(0.01, brainDecision_.gap / 2.0 * brainDecision_.policy.exitFactor);
+    }
     return sc;
+}
+
+std::filesystem::path LiveRunner::resolveBrainFileLocked() const {
+    const std::filesystem::path configured(config_.brain.brainFile);
+    if (configured.is_absolute()) return configured;
+    // The state file is the anchor the runner knows: a brain file next
+    // to it travels with the account. Without one, the working directory.
+    if (!stateFile_.empty() && stateFile_.has_parent_path()) return stateFile_.parent_path() / configured;
+    return configured;
+}
+
+void LiveRunner::maybeInitBrainLocked() {
+    if (brainInitTried_ || brain_) return;
+    brainInitTried_ = true;
+    if (!config_.brain.enabled) return;
+    const std::filesystem::path file = resolveBrainFileLocked();
+    try {
+        const auto loaded = loadBrainV2File(file);
+        if (!loaded || !loaded->trained) {
+            // Missing or untrained: fall back to the configured strategy
+            // and log once. Never crash the runner, and never start the
+            // keeper's background learning over a brain that isn't there.
+            if (!brainFallbackLogged_) {
+                log("[brain v2] no trained brain at " + file.string() + " -- using the configured strategy");
+                brainFallbackLogged_ = true;
+            }
+            return;
+        }
+        brain_ = std::make_unique<BrainKeeperV2>(file, muuk::core::BrainV2Config{},
+                                                 [this](const std::string& line) { log(line); });
+        log("[brain v2] " + brain_->status());
+    } catch (const std::exception& ex) {
+        if (!brainFallbackLogged_) {
+            log(std::string("[brain v2] could not load ") + file.string() + ": " + ex.what() +
+                " -- using the configured strategy");
+            brainFallbackLogged_ = true;
+        }
+    }
+}
+
+double LiveRunner::brainMoneyScaleLocked() const {
+    // The brain's money figures are replay units: standard-account
+    // dollars, where 1 lot earns $100 per $1.00 of price move. The live
+    // account counts in its own currency, at its own money per point per
+    // lot: the adopted symbol's tickValue / tickSize (MT5: from the
+    // bridge; cTrader: from the config / security list). One unit of
+    // account money is worth 100 / moneyPerPointPerLot replay dollars:
+    //   standard (1.0 per 0.01 tick -> 100): 1.0, a dollar is a dollar;
+    //   RoboForex-style ProCent (100 USC per 0.01 tick -> 10,000): 0.01,
+    //   so 100 USC of P/L is $1 replay (0.01 lot x $1 = 100 USC);
+    //   3-digit XAUUSDc (0.1 per 0.001 tick -> 100): 1.0, so 1 USC of
+    //   P/L is $1 replay (that symbol's lot is 1 oz, not 100 oz).
+    // The same number converts both ways because it carries the currency
+    // and the contract size together. Unknown symbol: assume standard.
+    const muuk::core::SymbolSpec& spec = config_.strategy.symbol;
+    const double moneyPerPoint = spec.tickSize > 0.0 ? spec.tickValue / spec.tickSize : 0.0;
+    return moneyPerPoint > 0.0 ? 100.0 / moneyPerPoint : 1.0;
+}
+
+double LiveRunner::medianSpreadLocked() const {
+    if (recentSpreads_.empty()) return 0.0;
+    std::vector<double> sorted(recentSpreads_.begin(), recentSpreads_.end());
+    std::sort(sorted.begin(), sorted.end());
+    const std::size_t n = sorted.size();
+    return n % 2 == 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+}
+
+void LiveRunner::feedBrainBarsLocked() {
+    if (!brain_) return;
+    try {
+        const std::deque<muuk::core::Bar> closed = bars_.closed();
+        if (closed.empty() || closed.back().startMs == brainFedUntilMs_) return;
+        brainFedUntilMs_ = closed.back().startMs;
+        const double spread = latestBid_ && latestAsk_ ? *latestAsk_ - *latestBid_ : 0.0;
+        brain_->addBars(closed, spread);
+    } catch (const std::exception& ex) {
+        log(std::string("[brain v2] could not record bars: ") + ex.what());
+    }
+}
+
+bool LiveRunner::decideBrainCycleLocked() {
+    brainCycleActive_ = false;
+    if (!config_.brain.enabled) return true;
+    maybeInitBrainLocked();
+    if (!brain_ || !brain_->trained()) return true;  // fallback, logged once by the init
+    // Real-money guard: a brain-driven cycle on a real account needs
+    // brain.allowRealAccount set explicitly in the config. Otherwise the
+    // cycle still opens — on the configured strategy, not the brain's.
+    if ((config_.connection.environment == "live" || brokerAccount_.real()) && !config_.brain.allowRealAccount) {
+        if (!brainRealRefusedLogged_) {
+            log("[brain v2] real account: brain-driven cycles are OFF (brain.allowRealAccount is false) "
+                "-- using the configured strategy");
+            brainRealRefusedLogged_ = true;
+        }
+        return true;
+    }
+    if (!latestBid_ || !latestAsk_) return true;  // no live price: can't judge the market
+    const double spread = *latestAsk_ - *latestBid_;
+    const int recentOutcome = !hasLastBasket_ ? 0 : (lastBasketNet_ < 0.0 || lastBasketLocked_ ? -1 : 1);
+    // Money the brain sees is in replay units, not account money
+    // (see brainMoneyScaleLocked). Spread stays in price; drawdown stays
+    // 0.0 — the runner tracks the day's realized P/L but no equity peak,
+    // so the brain's maxDrawdown cap is inert live (the runner's own
+    // daily-loss limit is the live equivalent).
+    const double toReplay = brainMoneyScaleLocked();
+    muuk::core::BrainAccountState account;
+    account.dailyPnl = dayRealized_ * toReplay;
+    account.spread = spread;
+    account.balance = (brokerAccount_.known && brokerAccount_.balance > 0.0 ? brokerAccount_.balance
+                                                                             : config_.connection.accountBalance) *
+                      toReplay;
+    const BrainV2Cycle cycle =
+        brain_->decideForCycle(bars_.closed(), recentOutcome, spread, medianSpreadLocked(), account);
+    if (!cycle.decision.trade) {
+        entryWait_ = "brain: " + cycle.decision.why;
+        if (!brainWaitLogged_) {
+            log("[brain v2] no new cycle: " + cycle.decision.why);
+            brainWaitLogged_ = true;
+        }
+        return false;
+    }
+    brainWaitLogged_ = false;
+    brainDecision_ = cycle.decision;
+    brainSituation_ = cycle.situation;
+    brainCycleActive_ = true;
+    log("[brain v2] cycle: " + cycle.decision.why);
+    return true;
 }
 
 bool LiveRunner::entryFilterBlocksLocked() {
@@ -2320,14 +2479,14 @@ void LiveRunner::maybeRestartAfterBasketClose() {
     if (afterManualClose) {
         if (!latestBid_ || !latestAsk_) return;  // no live price to center on
         reopenAfterManualClose_ = false;
-        prepareNextCycle(true);
+        if (!prepareNextCycle(true)) return;  // brain vetoed: asked again on the next tick
         log("[range] opening a new range around " + std::to_string((*latestBid_ + *latestAsk_) / 2.0));
         closeReason_.clear();
         beginBasket();
         for (const auto& cmd : engine_->start()) handleCommand(cmd);
         return;
     }
-    prepareNextCycle(config_.connection.autoRangeWidthPoints > 0.0);
+    if (!prepareNextCycle(config_.connection.autoRangeWidthPoints > 0.0)) return;  // brain vetoed
     log("basket closed; starting the next cycle");
     closeReason_.clear();
     beginBasket();
@@ -2355,7 +2514,13 @@ void LiveRunner::maybeRefreshStaleEntryLocked() {
     closeReason_.clear();
     cooldownActive_ = false;
     markDirty();
-    prepareNextCycle(true);
+    if (!prepareNextCycle(true)) {
+        // The brain vetoed the replacement range: the old one is already
+        // cancelled, so ask the brain again on later ticks.
+        reopenAfterManualClose_ = true;
+        reopenCooldownSeconds_ = 0;
+        return;
+    }
     beginBasket();
     for (const auto& cmd : engine_->start()) handleCommand(cmd);
 }
@@ -2798,7 +2963,13 @@ bool LiveRunner::openRange() {
     if (engine_->status() != EngineStatus::Idle) engine_->stopCycle();  // Completed / HaltedByRisk -> Idle
     cooldownActive_ = false;
     reopenAfterManualClose_ = false;
-    prepareNextCycle(true);
+    if (!prepareNextCycle(true)) {
+        // The brain vetoed it: no range opens now, but ask the brain
+        // again on later ticks (maybeRestartAfterBasketClose).
+        reopenAfterManualClose_ = true;
+        reopenCooldownSeconds_ = 0;
+        return false;
+    }
     log("[manual] opening a new range around " + std::to_string((*latestBid_ + *latestAsk_) / 2.0));
     closeReason_.clear();
     beginBasket();
@@ -2997,6 +3168,23 @@ void LiveRunner::maybeFinalizeBasket() {
             basketHandler_(b);
         } catch (const std::exception& ex) {
             log(std::string("[history] could not save basket: ") + ex.what());
+        }
+    }
+    // Brain v2 online learning: a cycle the brain chose reports back.
+    // Veto-only (see docs/brain-v2.md), and guarded so learning can
+    // never break basket finalization.
+    if (brain_ && brainCycleActive_) {
+        try {
+            const bool locked = b.locked || b.outcome == "locked";
+            // The keeper learns in replay units; the basket net is in
+            // account money (see brainMoneyScaleLocked).
+            brain_->observeBasket(brainSituation_, brainDecision_.policy, b.net * brainMoneyScaleLocked(), locked);
+            hasLastBasket_ = true;
+            lastBasketNet_ = b.net;
+            lastBasketLocked_ = locked;
+            brainCycleActive_ = false;
+        } catch (const std::exception& ex) {
+            log(std::string("[brain v2] could not learn from the basket: ") + ex.what());
         }
     }
 }

@@ -115,9 +115,16 @@ BrainKeeperV2::~BrainKeeperV2() {
 
 muuk::core::BrainV2Decision BrainKeeperV2::decide(const std::deque<Bar>& oneMinuteBars, int recentOutcome, double spread,
                                                   double medianSpread, const muuk::core::BrainAccountState& account) const {
+    return decideForCycle(oneMinuteBars, recentOutcome, spread, medianSpread, account).decision;
+}
+
+BrainV2Cycle BrainKeeperV2::decideForCycle(const std::deque<Bar>& oneMinuteBars, int recentOutcome, double spread,
+                                           double medianSpread, const muuk::core::BrainAccountState& account) const {
     std::scoped_lock lock(mutex_);
-    const muuk::core::SituationV2 situation = muuk::core::situationAtV2(oneMinuteBars, brain_, recentOutcome, spread, medianSpread);
-    return muuk::core::decideWithBrainV2(brain_, situation, config_, account);
+    BrainV2Cycle out;
+    out.situation = muuk::core::situationAtV2(oneMinuteBars, brain_, recentOutcome, spread, medianSpread);
+    out.decision = muuk::core::decideWithBrainV2(brain_, out.situation, config_, account);
+    return out;
 }
 
 bool BrainKeeperV2::trained() const {

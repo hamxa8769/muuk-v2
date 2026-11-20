@@ -170,6 +170,12 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
 
     cfg.strategy = muuk::config_json::parseStrategyConfig(j.at("strategy"));
     if (j.contains("market")) cfg.market = marketHoursFromJson(j.at("market"));
+    if (j.contains("brain") && j.at("brain").is_object()) {
+        const auto& b = j.at("brain");
+        cfg.brain.enabled = b.value("enabled", cfg.brain.enabled);
+        cfg.brain.brainFile = b.value("brainFile", cfg.brain.brainFile);
+        cfg.brain.allowRealAccount = b.value("allowRealAccount", cfg.brain.allowRealAccount);
+    }
     // Auto-target levels 20..100 are 200..360 % of the cost.
     cfg.strategy.autoTargetPercent = std::clamp(cfg.strategy.autoTargetPercent, 200.0, 360.0);
 

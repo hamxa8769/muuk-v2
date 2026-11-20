@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "muuk/ctrader_fix/live_runner.hpp"
+#include "muuk/core/market_brain_v2.hpp"
 #include "muuk/ctrader_fix/messages.hpp"
 #include "muuk/ctrader_fix/tags.hpp"
 #include "live_test_helpers.hpp"
@@ -1534,4 +1535,298 @@ TEST_CASE("LiveRunner auto-centers the range on the first live quote when autoRa
     runner.stop();
     runnerThread.join();
     if (runnerException) std::rethrow_exception(runnerException);
+}
+
+// --- Brain v2 live wiring (docs/brain-v2.md "Live wiring") ---
+
+namespace {
+
+// A trained v2 brain file: every cell tradable at gap choice 2 (4x ATR),
+// 1.5x lots, 4 levels, exit 0.5 — unless `tradable` is false, in which
+// case every cell is no-trade. Written under a fresh temp directory;
+// the caller removes it after the runner is gone.
+std::filesystem::path writeTestBrainV2(bool tradable) {
+    muuk::core::BrainV2 brain;
+    brain.trained = true;
+    brain.volLow = 0.5;
+    brain.volHigh = 1.5;
+    brain.gapAtrChoices = {2.0, 3.0, 4.0, 6.0, 8.0};
+    brain.trainedBars = 1500;
+    brain.cells.assign(81, muuk::core::BrainV2Cell{});
+    for (auto& c : brain.cells) {
+        c.samples = 100;
+        if (tradable) {
+            c.best.gapChoice = 2;
+            c.best.lotMultiplier = 1.5;
+            c.best.maxLevels = 4;
+            c.best.exitFactor = 0.5;
+            c.meanPnl = 5.0;
+            c.score = 5.0;
+        }
+    }
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-v2-wire-test";
+    std::filesystem::create_directories(dir);
+    const std::filesystem::path file = dir / (tradable ? "brain_trade.txt" : "brain_notrade.txt");
+    std::ofstream out(file, std::ios::trunc);
+    out << muuk::core::serializeBrainV2(brain);
+    return file;
+}
+
+// 240 flat one-minute bars (ATR 1.0, no trend): the v2 situation read
+// needs 150. Monday 2026-01-05 10:00 UTC, London session.
+std::vector<muuk::core::Bar> flatBars() {
+    std::vector<muuk::core::Bar> bars;
+    const int64_t base = 1767607200000LL;  // 2026-01-05 10:00 UTC
+    for (int i = 0; i < 240; ++i) {
+        bars.push_back(Bar{base + i * 60'000LL, 4336.50, 4337.00, 4336.00, 4336.50, 20.0});
+    }
+    return bars;
+}
+
+void sendTestQuote(MockFixServer& server, const char* bid, const char* ask) {
+    FixMessage snapshot = serverHeaderMessage(msgtype::MarketDataSnapshotFullRefresh, 2);
+    snapshot.set(tag::Symbol, std::string("1"));
+    snapshot.set(tag::NoMDEntries, int64_t{2});
+    snapshot.set(tag::MDEntryType, std::string("0"));
+    snapshot.set(tag::MDEntryPx, std::string(bid));
+    snapshot.set(tag::MDEntryType, std::string("1"));
+    snapshot.set(tag::MDEntryPx, std::string(ask));
+    server.sendToClient(kQuoteConn, snapshot);
+}
+
+FixMessage fillMessage(const std::string& clOrdId, const char* orderId, const char* avgPx, const char* qty,
+                       int seqNum) {
+    FixMessage fill = serverHeaderMessage(msgtype::ExecutionReport, seqNum);
+    fill.set(tag::OrderID, std::string(orderId));
+    fill.set(tag::ClOrdID, clOrdId);
+    fill.set(tag::PosMaintRptID, "P" + clOrdId);
+    fill.set(tag::ExecType, std::string("F"));
+    fill.set(tag::OrdStatus, std::string("2"));
+    fill.set(tag::AvgPx, std::string(avgPx));
+    fill.set(tag::LastQty, std::string(qty));
+    fill.set(tag::CumQty, std::string(qty));
+    fill.set(tag::LeavesQty, std::string("0"));
+    return fill;
+}
+
+// The logon / symbol / quote-subscription preamble every runner test
+// needs, up to the MarketDataRequest.
+void connectRunner(MockFixServer& server) {
+    (void)server.waitForMessage(msgtype::Logon, kTradeConn);
+    server.sendToClient(kTradeConn, serverHeaderMessage(msgtype::Logon, 1));
+    (void)server.waitForMessage(msgtype::Logon, kQuoteConn);
+    server.sendToClient(kQuoteConn, serverHeaderMessage(msgtype::Logon, 1));
+    (void)server.waitForMessage(msgtype::SecurityListRequest, kTradeConn);
+    server.sendToClient(kTradeConn, buildSecurityListResponse());
+    (void)server.waitForMessage(msgtype::MarketDataRequest, kQuoteConn);
+}
+
+}  // namespace
+
+TEST_CASE("LiveRunner with Brain v2 opens the first range at the brain's gap and lot multiplier") {
+    const std::filesystem::path brainFile = writeTestBrainV2(true);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;  // wait for a live quote to center on
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+
+    // Mid 4336.51; the brain's gap is 4.00 (4x ATR 1.00), so the range is
+    // [4334.51, 4338.51] — not the configured [4336.00, 4337.00].
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 1);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(order1.getDouble(tag::OrderQty) == Catch::Approx(1.0));
+    const std::string order1ClOrdId = order1.getString(tag::ClOrdID);
+
+    const FixMessage order2 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn);
+    REQUIRE(order2.getInt(tag::Side) == 2);
+    REQUIRE(order2.getDouble(tag::StopPx) == Catch::Approx(4334.51));
+    REQUIRE(order2.getDouble(tag::OrderQty) == Catch::Approx(2.0));
+    const std::string order2ClOrdId = order2.getString(tag::ClOrdID);
+
+    // The brain's lot multiplier (1.5x) shows in the re-arm: after both
+    // boundary orders fill, the next Buy is level 3 = 0.01 x 1.5^2 = 0.02
+    // lot (OrderQty 2.0); the configured add-one-lot progression would
+    // give 0.03 (OrderQty 3.0).
+    server.sendToClient(kTradeConn, fillMessage(order1ClOrdId, "9001", "4338.51", "0.01", 3));
+    for (int i = 0; i < 50; ++i) {
+        if (runner.snapshot().activeOrderCount == 1) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(runner.snapshot().activeOrderCount == 1);
+
+    server.sendToClient(kTradeConn, fillMessage(order2ClOrdId, "9002", "4334.51", "0.02", 4));
+    const FixMessage order3 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order3.getInt(tag::Side) == 1);
+    REQUIRE(order3.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(order3.getDouble(tag::OrderQty) == Catch::Approx(2.0));
+
+    REQUIRE(runner.snapshot().brainStatus.find("passed its test") != std::string::npos);
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+TEST_CASE("LiveRunner with Brain v2 opens no range when the brain says no-trade") {
+    const std::filesystem::path brainFile = writeTestBrainV2(false);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::mutex logMutex;
+    std::vector<std::string> logLines;
+    runner.setLogHandler([&](const std::string& line) {
+        std::scoped_lock lock(logMutex);
+        logLines.push_back(line);
+    });
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    // The brain vetoes the first cycle, and keeps vetoing it: no boundary
+    // order ever goes out (waitForMessage throws on timeout).
+    REQUIRE_THROWS(server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 2s));
+    REQUIRE(runner.snapshot().status == EngineStatus::Idle);
+    {
+        std::scoped_lock lock(logMutex);
+        const bool sawVeto = std::any_of(logLines.begin(), logLines.end(), [](const std::string& l) {
+            return l.find("[brain v2] no new cycle") != std::string::npos;
+        });
+        REQUIRE(sawVeto);
+    }
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+TEST_CASE("loadLiveConfig reads the brain section, with safe defaults when it is missing") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-v2-config-test";
+    std::filesystem::create_directories(dir);
+    const std::filesystem::path file = dir / "config.json";
+    const std::string strategy = R"JSON("strategy": {
+      "symbol": {"name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0,
+                 "contractSize": 100.0, "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0},
+      "range": {"lower": 4336.00, "upper": 4337.00},
+      "lotProgression": {"initialLot": 0.01, "lotIncrement": 0.01},
+      "riskLimits": {"maxOrders": 20, "maxLot": 1.0},
+      "costs": {}
+    })JSON";
+    {
+        std::ofstream out(file, std::ios::trunc);
+        out << "{\"connection\": {"
+               "\"quote\": {\"host\": \"127.0.0.1\", \"port\": \"5000\"},"
+               "\"trade\": {\"host\": \"127.0.0.1\", \"port\": \"5001\"},"
+               "\"environment\": \"demo\", \"brokerUid\": \"b\", \"traderLogin\": \"1\", \"password\": \"p\","
+               "\"symbolName\": \"XAUUSD\"},"
+            << strategy << ","
+            << "\"brain\": {\"enabled\": false, \"brainFile\": \"custom_brain.txt\", \"allowRealAccount\": true}}";
+    }
+    const LiveConfig withBrain = loadLiveConfig(file);
+    REQUIRE(withBrain.brain.enabled == false);
+    REQUIRE(withBrain.brain.brainFile == "custom_brain.txt");
+    REQUIRE(withBrain.brain.allowRealAccount == true);
+
+    {
+        std::ofstream out(file, std::ios::trunc);
+        out << "{\"connection\": {"
+               "\"quote\": {\"host\": \"127.0.0.1\", \"port\": \"5000\"},"
+               "\"trade\": {\"host\": \"127.0.0.1\", \"port\": \"5001\"},"
+               "\"environment\": \"demo\", \"brokerUid\": \"b\", \"traderLogin\": \"1\", \"password\": \"p\","
+               "\"symbolName\": \"XAUUSD\"},"
+            << strategy << "}";
+    }
+    const LiveConfig defaults = loadLiveConfig(file);
+    REQUIRE(defaults.brain.enabled == true);
+    REQUIRE(defaults.brain.brainFile == "brain_v2.txt");
+    REQUIRE(defaults.brain.allowRealAccount == false);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner with Brain v2 works on a cent-style symbol (money in cents)") {
+    // MT5 cent shape: tick value 100 USC per 0.01 tick, so 10,000 USC per
+    // lot per $1.00 move (see the ProCent gateway test). The brain's gap
+    // and lot multiplier drive the same range and orders as on a standard
+    // account; only the money the brain is shown is scaled (replay units),
+    // and that scaling is not observable through the public API while the
+    // money caps are off by default — this test pins the shape.
+    const std::filesystem::path brainFile = writeTestBrainV2(true);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.strategy.symbol.tickValue = 100.0;  // cent account: money in USC
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 1);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(order1.getDouble(tag::OrderQty) == Catch::Approx(1.0));
+
+    const FixMessage order2 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn);
+    REQUIRE(order2.getInt(tag::Side) == 2);
+    REQUIRE(order2.getDouble(tag::StopPx) == Catch::Approx(4334.51));
+    REQUIRE(order2.getDouble(tag::OrderQty) == Catch::Approx(2.0));
+
+    REQUIRE(runner.snapshot().brainStatus.find("passed its test") != std::string::npos);
+    REQUIRE(runner.snapshot().moneyPerPointPerLot == Catch::Approx(10000.0));
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
 }

@@ -72,5 +72,10 @@
     },
     "reArmOnFill": true,
     "startSide": "both"
+  },
+  "brain": {
+    "enabled": true,
+    "brainFile": "brain_v2.txt",
+    "allowRealAccount": false
   }
 }

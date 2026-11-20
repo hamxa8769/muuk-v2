@@ -58,5 +58,10 @@
     "basketProfitTargetMoney": 5.0,
     "maxRejectRetries": 3,
     "seedOffsetPoints": 0.05
+  },
+  "brain": {
+    "enabled": true,
+    "brainFile": "brain_v2.txt",
+    "allowRealAccount": false
   }
 }

@@ -18,6 +18,7 @@
 #include "muuk/core/risk_table.hpp"
 #include "muuk/core/strategy_engine.hpp"
 #include "muuk/ctrader_fix/basket_history.hpp"
+#include "muuk/ctrader_fix/brain_keeper_v2.hpp"
 #include "muuk/ctrader_fix/fix_session.hpp"
 #include "muuk/ctrader_fix/latency_stats.hpp"
 #include "muuk/ctrader_fix/live_config.hpp"
@@ -249,6 +250,7 @@ struct LiveSnapshot {
     bool escapeHeld = false;              // Keep locked was chosen
     std::string marketRead;               // the market read in one line (trend, structure, ATR)
     int marketScore = 0;                  // -4..+4
+    std::string brainStatus;              // Brain v2: keeper status line, "off" when disabled
     // MT5 through the bridge: the account as MT5 reports it (exact balance,
     // equity, margin and swap). brokerAccountFresh: heard from in the last 15 s.
     std::string platform = "ctrader";
@@ -557,7 +559,26 @@ private:
     // last cycle) to the engine, first re-centering its range on the
     // latest mid if `recenter` and a quote is available. Only valid while
     // no cycle is running. Caller must hold engineMutex_.
-    void prepareNextCycle(bool recenter);
+    // Returns false when the brain vetoed the cycle (entryWait_ set, logged
+    // once) -- the caller must not start a range then; the next tick asks
+    // the brain again.
+    bool prepareNextCycle(bool recenter);
+    // Brain v2 (see docs/brain-v2.md). maybeInitBrainLocked: loads the
+    // trained brain file once (resolved next to the state file); a missing
+    // or untrained brain leaves brain_ null and the runner uses the
+    // configured strategy. decideBrainCycleLocked: the brain's say on the
+    // cycle about to open -- true = open it (brainCycleActive_ set when
+    // the brain chose the policy), false = the brain vetoed it.
+    void maybeInitBrainLocked();
+    [[nodiscard]] bool decideBrainCycleLocked();
+    [[nodiscard]] std::filesystem::path resolveBrainFileLocked() const;
+    [[nodiscard]] double medianSpreadLocked() const;
+    // Replay dollars per one unit of account money (see live_runner.cpp).
+    [[nodiscard]] double brainMoneyScaleLocked() const;
+    // Hands newly closed 1-minute bars to the keeper so its background
+    // re-training can happen; best-effort, never throws into the quote
+    // path. Caller must hold engineMutex_.
+    void feedBrainBarsLocked();
     void resolveSymbol();
     void maybeEmitTick();  // caller must hold engineMutex_; no-op if engine_ isn't constructed yet
 
@@ -917,6 +938,22 @@ private:
     bool stopped_ = false;
 
     LogHandler logHandler_;
+
+    // Brain v2 — declared last so the keeper (whose background thread logs
+    // through logHandler_) is destroyed before the log handler is.
+    std::unique_ptr<BrainKeeperV2> brain_;
+    bool brainInitTried_ = false;     // the brain file was looked for once
+    bool brainFallbackLogged_ = false;  // "no trained brain, using the configured strategy"
+    bool brainRealRefusedLogged_ = false;  // the real-account refusal, logged once
+    bool brainWaitLogged_ = false;    // the current veto, logged once
+    bool brainCycleActive_ = false;   // the running cycle uses the brain's policy
+    muuk::core::BrainV2Decision brainDecision_;  // the policy this cycle runs on
+    muuk::core::SituationV2 brainSituation_;    // the situation it was decided in
+    bool hasLastBasket_ = false;      // a basket has closed since this runner started
+    double lastBasketNet_ = 0.0;      // its net, for the brain's recent-outcome gate
+    bool lastBasketLocked_ = false;   // it locked
+    std::deque<double> recentSpreads_;  // last 120 quote spreads, for the spread median
+    int64_t brainFedUntilMs_ = 0;     // newest closed bar already handed to the keeper
 };
 
 }  // namespace muuk::ctrader_fix

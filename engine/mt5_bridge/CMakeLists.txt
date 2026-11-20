@@ -19,7 +19,10 @@ target_include_directories(muuk_mt5_bridge PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/g
 target_link_libraries(muuk_mt5_bridge PUBLIC muuk_ctrader_fix nlohmann_json::nlohmann_json asio)
 target_compile_features(muuk_mt5_bridge PUBLIC cxx_std_20)
 
-if(MUUK_BUILD_TESTS)
+# The gateway test talks to the EA over Win32 named pipes (see
+# tests/test_mt5_gateway.cpp: <windows.h>, CreateFileW) - Windows-only.
+# The library itself is guarded and still builds on Linux.
+if(MUUK_BUILD_TESTS AND WIN32)
     add_executable(muuk_mt5_bridge_tests
         tests/test_mt5_gateway.cpp
     )

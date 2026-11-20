@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(muuk
-    VERSION 0.1.0
-    DESCRIPTION "Muuk XAUUSD pending-order strategy engine"
+    VERSION 0.2.0
+    DESCRIPTION "Muuk XAUUSD pending-order strategy engine (Brain v2)"
     LANGUAGES CXX
 )
 

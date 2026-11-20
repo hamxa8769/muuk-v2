@@ -14,18 +14,35 @@ MockFixServer::MockFixServer()
 MockFixServer::~MockFixServer() {
     running_ = false;
     asio::error_code ec;
+    // Wake the accept thread first: on Linux, closing the acceptor does
+    // not unblock a thread already inside a blocking accept() (on Windows
+    // it does), so the join below would hang forever. Connecting once to
+    // it makes accept() return; the loop then sees running_ == false and
+    // exits. The extra connection is torn down with the rest below.
+    {
+        asio::ip::tcp::socket wake(io_);
+        wake.connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"),
+                                             static_cast<unsigned short>(std::stoi(port_))),
+                     ec);
+    }
     acceptor_.close(ec);
     {
         std::scoped_lock lock(connectionsMutex_);
         for (auto& conn : connections_) conn->socket.close(ec);
     }
     if (acceptThread_.joinable()) acceptThread_.join();
+    // Move the readers out before joining them: readLoop() takes
+    // connectionsMutex_ first thing, so joining under that lock deadlocks
+    // whenever a reader hasn't started yet (the wake connection's reader
+    // usually hasn't) -- the join waits for a thread that waits for the lock.
+    std::vector<std::thread> readers;
     {
         std::scoped_lock lock(connectionsMutex_);
         for (auto& conn : connections_) {
-            if (conn->reader.joinable()) conn->reader.join();
+            if (conn->reader.joinable()) readers.push_back(std::move(conn->reader));
         }
     }
+    for (auto& reader : readers) reader.join();
 }
 
 void MockFixServer::acceptLoop() {

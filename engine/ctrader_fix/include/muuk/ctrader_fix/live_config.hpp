@@ -222,10 +222,32 @@ struct LiveConnectionConfig {
     }
 };
 
+// Brain v2 (see docs/brain-v2.md): the learned policy that may drive a
+// new cycle's gap, lot multiplier, max levels and exit — parsed from the
+// "brain" section of the config file, all optional. The brain file is the
+// plain-text format of serializeBrainV2() (brain_v2.txt), not the v1
+// brain.json format.
+struct BrainConfig {
+    // false: the brain is never consulted; every cycle uses the configured
+    // strategy exactly as before.
+    bool enabled = true;
+    // Where the trained brain lives. A relative path is resolved next to
+    // the state file (LiveRunner::setStateFile), or the working directory
+    // when there is none. Missing or untrained: the runner logs once and
+    // falls back to the configured strategy — it never blocks trading
+    // over a brain file that isn't there yet.
+    std::string brainFile = "brain_v2.txt";
+    // false (default): on a real-money account the brain never drives a
+    // cycle — the configured strategy is used instead, and the refusal is
+    // logged. Set true only deliberately, in a config file, never by code.
+    bool allowRealAccount = false;
+};
+
 struct LiveConfig {
     LiveConnectionConfig connection;
     muuk::core::StrategyConfig strategy;
     MarketHoursConfig market;  // "market" in the file: sessions, pauses, news
+    BrainConfig brain;         // "brain" in the file
 };
 
 // The operator-tunable subset of LiveConfig, in plain human units (lots,

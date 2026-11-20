@@ -10,9 +10,8 @@
 // the runner calls observeBasket() so the brain's online learning can veto
 // a cell that just lost badly; online learning can never invent a policy.
 //
-// NOT yet wired into LiveRunner: the regime mode (LiveConfig::regime) is
-// not in this tree, so decide() is the wiring point for that step — the
-// runner will call decide() for a new cycle and observeBasket() when one
+// Wired into LiveRunner (live_runner.cpp): the runner calls
+// decideForCycle() before a new cycle opens and observeBasket() when one
 // closes. The brain file is the plain-text format of serializeBrainV2()
 // (brain_v2.txt), not the v1 brain.json format.
 
@@ -42,6 +41,12 @@ struct HistoryBarsV2 {
 [[nodiscard]] std::optional<muuk::core::BrainV2> loadBrainV2File(const std::filesystem::path& file);
 void saveBrainV2File(const std::filesystem::path& file, const muuk::core::BrainV2& brain);
 
+// A v2 decision and the market situation it was taken in.
+struct BrainV2Cycle {
+    muuk::core::BrainV2Decision decision;
+    muuk::core::SituationV2 situation;
+};
+
 class BrainKeeperV2 {
 public:
     using Log = std::function<void(const std::string&)>;
@@ -54,6 +59,13 @@ public:
     [[nodiscard]] muuk::core::BrainV2Decision decide(const std::deque<muuk::core::Bar>& oneMinuteBars, int recentOutcome,
                                                      double spread, double medianSpread,
                                                      const muuk::core::BrainAccountState& account = {}) const;
+    // The decision together with the situation it was taken in, so the
+    // runner can hand the *same* situation back to observeBasket() when
+    // the cycle closes (the bars will have moved on by then). decide()
+    // above is this with the situation dropped.
+    [[nodiscard]] BrainV2Cycle decideForCycle(const std::deque<muuk::core::Bar>& oneMinuteBars, int recentOutcome,
+                                              double spread, double medianSpread,
+                                              const muuk::core::BrainAccountState& account = {}) const;
     [[nodiscard]] bool trained() const;
     // One line for the operator: what it learned from, how its last try went.
     [[nodiscard]] std::string status() const;
