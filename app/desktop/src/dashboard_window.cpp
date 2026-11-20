@@ -14,6 +14,8 @@
 #include "config_discovery.hpp"
 #include "glass_ui.hpp"
 #include "open_path.hpp"
+#include "updater.hpp"
+#include "version.hpp"
 #include "windows_startup.hpp"
 #include "muuk/core/risk_table.hpp"
 #include "muuk/ctrader_fix/basket_history.hpp"
@@ -735,6 +737,20 @@ void DashboardWindow::render(LiveController& controller) {
     }
     controller.setAutoReconnect(prefs_.autoReconnect);
     controller.tick();  // reconnects a dropped connection when it's time
+    // Self-update: one background GitHub check per app run, never blocking
+    // the UI; a failed check stays silent. When the update is downloaded,
+    // verified and ready, quit cleanly -- the updater's batch file copies
+    // the new release over this folder and restarts the app. Open positions
+    // stay at the broker and resume on restart, same as Disconnect + quit.
+    if (!updateCheckStarted_) {
+        updateCheckStarted_ = true;
+        updater_.startBackgroundCheck();
+    }
+    if (updater_.state() == updater::Updater::State::ReadyToInstall && !updateRestartDone_) {
+        updateRestartDone_ = true;
+        controller.stop();
+        exitApproved_ = true;
+    }
     const bool running = controller.isRunning();
     const std::optional<LiveSnapshot> snap = controller.snapshot();
     samplePerformance(snap);
@@ -851,11 +867,59 @@ void DashboardWindow::render(LiveController& controller) {
     ImGui::End();
 }
 
+void DashboardWindow::renderUpdateButton() {
+    using Updater = updater::Updater;
+    const Updater::State state = updater_.state();
+    const float updateWidth = 230.0f;
+    if (state == Updater::State::Available) {
+        ImGui::SameLine();
+        if (glass::button(("Update available " + updater_.latestTag()).c_str(), kGreen, ImVec2(updateWidth, 0),
+                          glass::ButtonKind::Primary)) {
+            updater_.beginInstall();
+        }
+        ImGui::SetItemTooltip("A newer Muuk (%s) is on GitHub. Downloads it, installs it over this copy and "
+                              "restarts the app. Your config files (*.local.json) are kept.",
+                              updater_.latestTag().c_str());
+        return;
+    }
+    if (state == Updater::State::Downloading) {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(true);
+        glass::button(("Downloading update... " +
+                       std::to_string(static_cast<int>(updater_.downloadProgress() * 100.0)) + "%")
+                          .c_str(),
+                      kAmber, ImVec2(updateWidth, 0));
+        ImGui::EndDisabled();
+        return;
+    }
+    if (state == Updater::State::Checking) {
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Checking for updates...");
+        return;
+    }
+    if (state == Updater::State::ReadyToInstall) {
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Update downloaded - restarting to install...");
+        return;
+    }
+    // Idle (up to date) or Failed (offline): a quiet manual check. A failed
+    // check shows no alarm -- the button is just there again.
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Check for updates")) updater_.checkNow();
+    if (!updater_.error().empty()) ImGui::SetItemTooltip("%s", updater_.error().c_str());
+}
+
 void DashboardWindow::renderHeader(LiveController& controller, bool running, bool connected) {
     glass::beginCard("header", ImVec2(0, 0), true);
 
     // Row 1: brand, connection pill, theme toggle.
     withFont(largeFont_, [] { ImGui::TextColored(kBlue, "MUUK"); });
+    ImGui::SameLine(0.0f, 6.0f);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("v%s", kMuukVersion);
+    ImGui::SetItemTooltip("Muuk %s -- the version goes up with every update (docs/updater.md).", kMuukVersion);
     ImGui::SameLine(0.0f, 14.0f);
     // Which broker and account: while connected, what the running bot is
     // really logged into; otherwise what the config file will connect to.
@@ -1023,7 +1087,11 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("Config file");
     ImGui::SameLine();
-    const float buttonsWidth = 2 * 120.0f + ImGui::GetStyle().ItemSpacing.x * 2;
+    // The update area is always reserved, so the row never jumps when the
+    // button appears: "Update available vX.Y.Z" / "Downloading... N%" /
+    // "Check for updates".
+    const float updateWidth = 230.0f;
+    const float buttonsWidth = 2 * 120.0f + updateWidth + ImGui::GetStyle().ItemSpacing.x * 3;
     ImGui::SetNextItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x - buttonsWidth));
     ImGui::BeginDisabled(running);
     if (ImGui::InputText("##configpath", configPathBuffer_.data(), configPathBuffer_.size())) {
@@ -1043,6 +1111,7 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
     if (glass::button("Disconnect", glass::palette().neutral, ImVec2(120, 0))) controller.stop();
     ImGui::EndDisabled();
     ImGui::SetItemTooltip("Disconnects from the broker. Open positions and pending orders stay at the broker as they are.");
+    renderUpdateButton();
 
     const std::string err = controller.lastError();
     if (!err.empty()) {

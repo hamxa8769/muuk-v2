@@ -12,6 +12,8 @@
 
 #include "app_prefs.hpp"
 #include "live_controller.hpp"
+#include "updater.hpp"
+#include "version.hpp"
 #include "system_monitor.hpp"
 #include "muuk/ctrader_fix/volume_stats.hpp"
 
@@ -88,6 +90,9 @@ private:
 
     void setTheme(bool dark);
     void renderHeader(LiveController& controller, bool running, bool connected);
+    // Self-update button (row 2, next to Connect/Disconnect): shown when a
+    // newer release exists; the download + install + restart start from it.
+    void renderUpdateButton();
     void renderKpiCards(const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap, bool connected);
     void renderRangePanel(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
                           bool connected);
@@ -186,6 +191,12 @@ private:
 
     bool exitApproved_ = false;
     bool openExitRequested_ = false;
+
+    // Self-update (docs/updater.md): one background GitHub check per app
+    // run; the button appears when a newer release exists.
+    updater::Updater updater_{kMuukVersion};
+    bool updateCheckStarted_ = false;
+    bool updateRestartDone_ = false;  // installed and waiting for us to quit
     bool exitClosing_ = false;      // "Close everything & exit" in progress
     double exitClosingSince_ = 0.0;
 

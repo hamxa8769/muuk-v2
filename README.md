@@ -41,6 +41,16 @@ build\engine\core\Release\muuk_core_tests.exe
 build\engine\backtester\Release\muuk_backtester_tests.exe
 ```
 
+## Updating the app
+
+The desktop app updates itself: it checks GitHub on startup, and when a
+newer release exists an **Update available** button appears in the header
+next to Connect. Pressing it downloads, installs and restarts the app;
+your config files (`*.local.json`) are kept. See `docs/updater.md`.
+Every update ships with a version bump (0.2.0 -> 0.2.1 -> ...), a new tag
+and a new release, so the version shown in the app always tells you
+which update you are on.
+
 ## Run the benchmarks
 
 ```

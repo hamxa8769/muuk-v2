@@ -37,6 +37,7 @@
 #include "dashboard_window.hpp"
 #include "glass_ui.hpp"
 #include "live_controller.hpp"
+#include "version.hpp"
 
 namespace {
 void glfwErrorCallback(int error, const char* description) {
@@ -347,7 +348,7 @@ int main(int argc, char** argv) {
     Renderer::windowHints();
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
 
-    GLFWwindow* window = glfwCreateWindow(1360, 860, "Muuk Upgrade \xe2\x80\x94 XAUUSD Range Bot", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1360, 860, "Muuk Upgrade \xe2\x80\x94 XAUUSD Range Bot v" MUUK_VERSION_STRING, nullptr, nullptr);
     if (!window) {
         fatal("Muuk couldn't open its window.");
         glfwTerminate();
