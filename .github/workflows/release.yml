@@ -1,0 +1,61 @@
+# Muuk v2 Release — builds the Windows app on a GitHub runner and attaches
+# it to the GitHub release for the tag.
+#
+# What it produces (see tools/package-vps.ps1): Muuk-<tag>-Windows.zip with
+#   muuk-upgrade-desktop.exe (the app) and muuk-upgrade-live.exe (the console
+#   bot), the Visual C++ runtime DLLs, the VPS starter scripts, the MT5
+#   bridge source + guide, and a config template (my_account.local.json).
+#   No real config or credential is ever in the zip.
+#
+# Triggers:
+# - Manually (Actions > Release > Run workflow) with a tag that already
+#   exists as a release, e.g. v2.0.0 — this is how v2.0.0 gets its .exe.
+# - Automatically on pushing a v* tag (v2.0.1, ...): the tag's release is
+#   created/updated with the zip.
+#
+# First run is the real proof the desktop app builds on Windows — it has
+# never been built end-to-end on a clean machine before (only the Linux
+# engine + tests were proven here). If the build or tests fail, no asset
+# is attached and the run's log says why.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the build to (must already exist as a release)"
+        required: true
+        default: "v2.0.0"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMUUK_BUILD_DESKTOP_APP=ON
+          -DMUUK_BUILD_BENCHMARKS=OFF
+          -DMUUK_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File tools/package-vps.ps1
+          $tag = "${{ inputs.tag }}"
+          if (-not $tag) { $tag = "${{ github.ref_name }}" }
+          Copy-Item dist/Muuk-VPS.zip "Muuk-$tag-Windows.zip"
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: Muuk-*.zip
