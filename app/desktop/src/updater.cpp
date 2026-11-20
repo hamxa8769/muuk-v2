@@ -17,6 +17,12 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+// windows.h defines min/max as macros unless NOMINMAX is set; without
+// this, std::min( at line 489 breaks under MSVC (error C2589). Every other
+// windows.h user in this app (main.cpp, open_path.cpp, ...) defines it.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <winhttp.h>
 #endif
