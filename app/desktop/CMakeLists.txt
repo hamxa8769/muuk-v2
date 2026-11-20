@@ -47,6 +47,13 @@ if(MUUK_BUILD_TESTS)
     )
     target_include_directories(muuk_updater_tests PRIVATE src)
     target_link_libraries(muuk_updater_tests PRIVATE Catch2::Catch2WithMain nlohmann_json::nlohmann_json)
+    if(WIN32)
+        # On Windows the test binary also compiles updater.cpp's WinHTTP
+        # code, so it needs winhttp too -- otherwise the link fails with
+        # 12 unresolved WinHttp symbols (LNK2019). On Linux the WinHTTP
+        # parts are compiled out, so no link is needed there.
+        target_link_libraries(muuk_updater_tests PRIVATE winhttp)
+    endif()
     target_compile_features(muuk_updater_tests PRIVATE cxx_std_20)
     add_test(NAME updater COMMAND muuk_updater_tests)
 endif()
