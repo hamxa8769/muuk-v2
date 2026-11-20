@@ -71,13 +71,18 @@ public:
     // Starts MT5 with the bridge now, without trading yet (the app does it by
     // itself when an MT5 config is opened, and Connect does it too), so the
     // logged-in account shows up. restart: close a running MT5 first.
-    void startMt5(const std::string& configPath, bool restart = false);
+    // allowOtherTerminal: also close/restart a broker MT5 (not this copy's
+    // own) -- only from an explicit user-pressed "Restart MT5 with bridge"
+    // button, never from an automatic path.
+    void startMt5(const std::string& configPath, bool restart = false, bool allowOtherTerminal = false);
     // MT5 was open already but its bridge never connected.
     [[nodiscard]] bool mt5OpenWithoutBridge() const;
     // Call every frame while the bot is connecting to MT5: when the bridge
     // hasn't connected for a minute since MT5 was last started, starts MT5
     // again with it (closing it the way its X button does if it's open), up
-    // to 3 times until the bridge connects.
+    // to 3 times until the bridge connects. A broker MT5 is never restarted
+    // by itself: it only logs what to do (drag the bridge onto the chart, or
+    // press "Restart MT5 with bridge").
     void healMt5(const std::string& configPath);
     // MT5 accounts. Switch MetaTrader 5 to `login` (on `server`; empty = the
     // config's, else the one it was last seen on): closes MT5 the way its X
@@ -211,7 +216,7 @@ private:
     // Starts (or keeps) the bridge for an MT5 config; false (with the error set) if it can't listen.
     bool ensureBridge(const muuk::ctrader_fix::LiveConfig& config);
     void launchMt5(const muuk::ctrader_fix::LiveConfig& config, bool restart = false, const std::string& login = {},
-                   const std::string& server = {});
+                   const std::string& server = {}, bool allowOtherTerminal = false);
     std::atomic<bool> mt5WasAlreadyRunning_{false};
     std::chrono::steady_clock::time_point mt5LaunchAt_{};
     int mt5Heals_ = 0;

@@ -19,13 +19,24 @@ escape, audit, history, reports). On top, MT5 gives what FIX never did:
 the **exact balance, equity, margin, free margin and swap**, the account
 currency (USC = cent) and the symbol's lot sizes.
 
+## Your broker's MT5 (already open)
+
+Muuk finds the MetaTrader 5 that is already open on this PC -- any broker's --
+and uses it. No separate copy, no marker file:
+
+1. Open your broker's MT5 and log in to your demo account (leave it open).
+2. Muuk: **Settings > Account > Platform: MetaTrader 5** -- the list shows every MT5 on the PC ("(broker's MT5)", "(running)" for the open one); "auto" takes the first.
+3. **Connect.** Muuk installs its bridge EA into that MT5 once (a standard EA install, compiled by MT5's own MetaEditor) and, if MT5 is already open, tells you to drag `MuukBridge` from MT5's Navigator onto the gold chart once -- it stays there afterwards, and the bridge connects as soon as it is on a chart. If MT5 is closed, Muuk starts it minimized with the bridge already on a chart.
+
+Muuk never closes or restarts your broker's MT5 by itself. The only way it ever closes one is the **"Restart MT5 with bridge"** button (Settings > Account, or the header pill), which asks first and then closes MT5 the way its X button does and starts it again with the bridge. Everything else -- the heal that restarts a silent MT5, the automatic account switch -- only ever acts on this copy's own MT5 (below).
+
 ## This copy's own MT5
 
 This is the upgrade copy; production runs next to it on the same PC, on a real
-account. So this copy never touches an MT5 unless a `muuk_upgrade_mt5.marker`
-file is next to its `terminal64.exe` (anything else is refused, before anything
-is written or closed), and it runs that MT5 with `/portable`, so its data stays
-in its own folder. Set one up once, in a folder at the top of this drive:
+account. So this copy never closes or restarts an MT5 unless a `muuk_upgrade_mt5.marker`
+file is next to its `terminal64.exe`, and it runs that MT5 with `/portable`, so its data stays
+in its own folder. Installing the bridge EA and starting an MT5 work for any MT5 on the PC
+(see "Your broker's MT5 (already open)" above). Set one up once, in a folder at the top of this drive:
 
 1. Install MT5 into e.g. `F:\MT5Upgrade` (or copy an install's program files there).
 2. Create the empty file `F:\MT5Upgrade\muuk_upgrade_mt5.marker`.
@@ -39,29 +50,34 @@ All of it is in `muuk/ctrader_fix/instance.hpp`; don't carry those values to pro
 
 ## Use it
 
-1. Install your broker's MetaTrader 5 and open it **once** (so Windows has
-   its data folder). Close it again -- Muuk starts it from now on.
+1. Install your broker's MetaTrader 5, open it and log in to your demo account. Leave it open --
+   Muuk uses the MT5 that is already open; if it is closed, Muuk starts it.
 2. Muuk: **Settings > Account > Platform: MetaTrader 5**:
    - MetaTrader 5: which MT5 (each broker installs its own; "auto" = the first);
    - Login, Password, Server: the MT5 account (empty login = the one MT5 used last);
    - Account type: **Demo** or LIVE -- must match the MT5 account: a REAL MT5
      account under a Demo config is refused before any order;
    - Save.
-3. **Connect.** Muuk starts MT5 minimized with the bridge on a chart; the header
-   shows `MT5 <login>` (green, "cent" on a cent account) and the bot trades.
+3. **Connect.** If MT5 is closed, Muuk starts it minimized with the bridge on a chart; if MT5 is already
+   open, Muuk installs the bridge EA into it -- drag `MuukBridge` from the Navigator onto the gold chart once
+   (it stays there afterwards) -- and the header shows `MT5 <login>` (green, "cent" on a cent account) and the
+   bot trades.
 
 MT5 keeps that chart, so the next time MT5 opens (by Muuk or by you) the
-bridge runs by itself. With MT5 already open and no bridge on a chart, close
-MT5 and press Connect (or "Start MT5" in the header).
+bridge runs by itself. With MT5 already open and no bridge on a chart, drag `MuukBridge` onto the gold chart
+once, or press "Restart MT5 with bridge" (Settings > Account).
 
 ### The MT5 account
 
 **The bot trades only the config's account.** Settings > Account > Login names it. If MT5 is logged in to any other account, the bot refuses to connect, so a live account under a demo config, or someone else's account, is never traded.
 
-**Muuk switches MT5 by itself.** When MT5 opens on another account:
+**Muuk switches its own MT5 by itself.** When its own MT5 opens on another account:
 - Muuk closes MT5 (as its X button does) and opens it again, logged in to the config's account;
 - it tries this twice;
 - then the **MT5 accounts** list opens.
+
+A broker MT5 is never closed for a switch: press "Restart MT5 with bridge" (Settings > Account) and MT5
+opens again on the config's account.
 
 The switch can be turned off in that list.
 
@@ -79,9 +95,10 @@ The switch can be turned off in that list.
 - An account without a password in the config logs in with the one MT5 saved for it.
 
 While the bot is connecting, Muuk heals this by itself: when the bridge hasn't
-connected for a minute after MT5 was started, Muuk closes MT5 (as its X button
+connected for a minute after MT5 was started, Muuk closes its own MT5 (as its X button
 does) and starts it again with the bridge -- up to 3 times, counted again once
-the bridge connects.
+the bridge connects. A broker MT5 is never healed this way: Muuk only says what to do
+(drag the bridge onto the chart, or press "Restart MT5 with bridge").
 
 The bridge's chart is the account's **own** gold symbol (`XAUUSD.c` on a
 JustMarkets cent account, `XAUUSDm` on Exness...): the one the bridge traded on

@@ -951,8 +951,19 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
         } else if (controller.mt5OpenWithoutBridge()) {
             glass::pill("MT5 open without the bridge", kAmber);
             ImGui::SameLine(0.0f, 6.0f);
-            if (glass::button("Restart MT5", kAmber)) controller.startMt5(configPathBuffer_.data(), true);
-            ImGui::SetItemTooltip("Muuk closes MetaTrader 5 (as its X button does) and starts it again with the bridge.");
+            if (glass::button("Restart MT5", kAmber)) {
+                if (mt5SelectedTerminalOwned()) {
+                    controller.startMt5(configPathBuffer_.data(), true);
+                } else {
+                    // A broker MT5: only with the confirm popup, never silently.
+                    confirm_ = Confirm::RestartMt5;
+                    openConfirmRequested_ = true;
+                }
+            }
+            ImGui::SetItemTooltip(mt5SelectedTerminalOwned()
+                                      ? "Muuk closes MetaTrader 5 (as its X button does) and starts it again with the bridge."
+                                      : "This closes your broker's MetaTrader 5 and opens it again with the bridge attached. "
+                                        "Muuk never does this by itself.");
         } else {
             const std::string msg = controller.mt5StartMessage();
             glass::pill(controller.mt5Starting() ? "MT5: starting..." : "MT5: not connected",
@@ -1038,6 +1049,10 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
         ImGui::TextColored(kRed, "Error: %s", err.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Dismiss")) controller.clearError();
+        if (err.find("MT5 bridge") != std::string::npos && err.find("isn't connected") != std::string::npos) {
+            ImGui::TextColored(kAmber, "MuukBridge is not on a chart in MT5 yet -- drag it from MT5's Navigator onto "
+                                        "the gold chart once, or press 'Restart MT5 with bridge' in Settings > Account.");
+        }
     }
     if (!flashMessage_.empty() && ImGui::GetTime() < flashUntil_) {
         ImGui::TextColored(kAmber, "%s", flashMessage_.c_str());
@@ -2118,6 +2133,12 @@ void DashboardWindow::renderConfirmPopup(LiveController& controller) {
                      "carries on from that fill. The difference counts as slippage in the basket's P/L.";
             action = "Place now";
             break;
+        case Confirm::RestartMt5:
+            title = "Close and reopen your MT5?";
+            detail = "Muuk closes MetaTrader 5 (as its X button does) and starts it again with the bridge on a chart. "
+                     "MT5 saves what you have open. Muuk never does this on its own -- only because you pressed the button.";
+            action = "Restart MT5 with bridge";
+            break;
         case Confirm::ResetData:
             title = "Start fresh?";
             detail = "Every statistic goes back to zero: booked P/L, volume, history, speed, basket numbers,\n"
@@ -2148,6 +2169,9 @@ void DashboardWindow::renderConfirmPopup(LiveController& controller) {
                 break;
             case Confirm::PlaceNow:
                 controller.placeWaitingOrderNow(placeNowId_);
+                break;
+            case Confirm::RestartMt5:
+                controller.startMt5(configPathBuffer_.data(), true, true);
                 break;
             case Confirm::ResetData:
                 if (controller.resetData(configPathBuffer_.data())) {
@@ -3031,11 +3055,31 @@ void DashboardWindow::saveAccountNow() {
     }
 }
 
+namespace {
+// Label for the MT5 picker: the folder, what kind of MT5 it is, whether it is open.
+std::string mt5InstallLabel(const muuk::mt5_bridge::Mt5Install& i) {
+    std::string label = i.label;
+    label += i.owned ? "  (Muuk's own)" : "  (broker's MT5)";
+    if (i.running) label += "  (running)";
+    if (i.owned && i.dataDir.empty()) label += "  (never opened)";
+    return label;
+}
+}  // namespace
+
+bool DashboardWindow::mt5SelectedTerminalOwned() const {
+    const std::string term = account_.mt5Terminal.data();
+    if (!term.empty()) return muuk::mt5_bridge::isOwnMt5(std::filesystem::path(term));
+    if (!mt5Installs_.empty()) return mt5Installs_.front().owned;
+    return false;
+}
+
 void DashboardWindow::renderMt5AccountFields() {
     ImGui::PushStyleColor(ImGuiCol_Text, glass::palette().textDim);
-    ImGui::TextWrapped("Muuk opens MetaTrader 5 (minimized) and uses the account that is logged in there -- nothing to "
-                       "fill in. Everything is then controlled from here, like cTrader. The account must be HEDGING; "
-                       "cent accounts work (amounts in US cents).");
+    ImGui::TextWrapped("Muuk uses the MetaTrader 5 that is already open on this PC (any broker's) and the account that is "
+                       "logged in there -- nothing to fill in. It installs its bridge EA into that MT5 once; drag "
+                       "MuukBridge from MT5's Navigator onto the gold chart once and it stays there. Everything is then "
+                       "controlled from here, like cTrader. The account must be HEDGING; cent accounts work (amounts in "
+                       "US cents). Muuk never closes or restarts your broker's MT5 by itself.");
     ImGui::PopStyleColor();
     if (!mt5InstallsScanned_) {
         mt5Installs_ = muuk::mt5_bridge::findMt5Installs();
@@ -3061,8 +3105,8 @@ void DashboardWindow::renderMt5AccountFields() {
         row("MetaTrader 5", "Which MT5 on this PC (each broker installs its own).");
         {
             std::string current = account_.mt5Terminal.data();
-            std::string preview = current.empty() ? (mt5Installs_.empty() ? std::string("none found -- install your broker's MT5")
-                                                                          : "auto: " + mt5Installs_.front().label)
+            std::string preview = current.empty() ? (mt5Installs_.empty() ? std::string("none found -- open or install your broker's MT5")
+                                                                          : "auto: " + mt5InstallLabel(mt5Installs_.front()))
                                                   : current;
             if (ImGui::BeginCombo("##mt5term", preview.c_str())) {
                 if (ImGui::Selectable("auto (the first one found)", current.empty())) {
@@ -3070,7 +3114,7 @@ void DashboardWindow::renderMt5AccountFields() {
                     saveAccountNow();
                 }
                 for (const auto& i : mt5Installs_) {
-                    const std::string label = i.label + (i.dataDir.empty() ? "  (never opened)" : "") + "##" + i.terminal.string();
+                    const std::string label = mt5InstallLabel(i) + "##" + i.terminal.string();
                     if (ImGui::Selectable(label.c_str(), current == i.terminal.string())) {
                         copyTo(account_.mt5Terminal, i.terminal.string());
                         saveAccountNow();
@@ -3090,7 +3134,18 @@ void DashboardWindow::renderMt5AccountFields() {
             } else if (controller_ && controller_->mt5Starting()) {
                 ImGui::TextColored(kAmber, "starting MetaTrader 5...");
             } else if (controller_ && controller_->mt5OpenWithoutBridge()) {
-                if (glass::button("Restart MT5 with the bridge", kAmber)) controller_->startMt5(configPath, true);
+                ImGui::TextWrapped("MT5 is open but MuukBridge is not on a chart yet. Drag MuukBridge from MT5's Navigator "
+                                   "onto the gold (XAUUSD) chart once -- it stays there afterwards and the bridge connects. "
+                                   "Or restart MT5 with the bridge (this closes MT5 and opens it again).");
+                if (glass::button("Restart MT5 with the bridge", kAmber)) {
+                    if (mt5SelectedTerminalOwned()) {
+                        controller_->startMt5(configPath, true);
+                    } else {
+                        // A broker MT5: only with the confirm popup, never silently.
+                        confirm_ = Confirm::RestartMt5;
+                        openConfirmRequested_ = true;
+                    }
+                }
                 ImGui::SetItemTooltip("MT5 is open but without Muuk's bridge. Muuk closes it (as its X button does) and "
                                       "starts it again with the bridge.");
             } else {

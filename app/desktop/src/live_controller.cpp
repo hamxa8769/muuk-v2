@@ -41,7 +41,7 @@ LiveController::~LiveController() {
 }
 
 void LiveController::launchMt5(const LiveConfig& config, bool restart, const std::string& login,
-                               const std::string& server) {
+                               const std::string& server, bool allowOtherTerminal) {
     if (mt5Starting_.exchange(true)) return;
     mt5LaunchAt_ = std::chrono::steady_clock::now();
     if (mt5Thread_.joinable()) mt5Thread_.join();
@@ -63,9 +63,9 @@ void LiveController::launchMt5(const LiveConfig& config, bool restart, const std
         std::scoped_lock lock(mt5Mutex_);
         mt5Message_ = "Starting MetaTrader 5...";
     }
-    mt5Thread_ = std::thread([this, o, restart] {
+    mt5Thread_ = std::thread([this, o, restart, allowOtherTerminal] {
         auto logLine = [this](const std::string& line) { appendLog(line); };
-        const auto r = restart ? muuk::mt5_bridge::restartMt5WithBridge(o, logLine)
+        const auto r = restart ? muuk::mt5_bridge::restartMt5WithBridge(o, logLine, allowOtherTerminal)
                                : muuk::mt5_bridge::startMt5WithBridge(o, logLine);
         mt5WasAlreadyRunning_ = r.alreadyRunning;
         {
@@ -91,6 +91,25 @@ void LiveController::healMt5(const std::string& configPath) {
     if (mt5Heals_ >= 3 || mt5LaunchAt_ == std::chrono::steady_clock::time_point{} ||
         std::chrono::steady_clock::now() - mt5LaunchAt_ < std::chrono::seconds(60)) {
         return;
+    }
+    // Never close or restart a broker MT5 by itself: the terminal Muuk
+    // would restart may be the user's production one. Say what to do and stop.
+    try {
+        const LiveConfig config = muuk::ctrader_fix::loadLiveConfig(configPath);
+        std::filesystem::path terminal = config.connection.mt5Terminal;
+        if (terminal.empty()) {
+            const auto installs = muuk::mt5_bridge::findMt5Installs();
+            if (!installs.empty()) terminal = installs.front().terminal;
+        }
+        if (!terminal.empty() && !muuk::mt5_bridge::isOwnMt5(terminal)) {
+            appendLog("[mt5] the bridge hasn't connected for a minute, but this MT5 is your broker's -- Muuk never "
+                      "closes or restarts it by itself. Drag MuukBridge from MT5's Navigator onto the gold chart "
+                      "once, or press 'Restart MT5 with bridge' in Settings > Account.");
+            mt5Heals_ = 3;
+            return;
+        }
+    } catch (const std::exception&) {
+        // No config to judge by: fall through to the restart attempt below.
     }
     ++mt5Heals_;
     appendLog("[mt5] the bridge hasn't connected for a minute -- starting MetaTrader 5 again with it (try " +
@@ -142,13 +161,13 @@ void LiveController::keepMt5OnAccount(const std::string& configPath, const std::
     switchMt5Account(configPath, want, "");
 }
 
-void LiveController::startMt5(const std::string& configPath, bool restart) {
+void LiveController::startMt5(const std::string& configPath, bool restart, bool allowOtherTerminal) {
     try {
         const LiveConfig config = muuk::ctrader_fix::loadLiveConfig(configPath);
         if (!config.connection.isMt5()) return;
         if (!ensureBridge(config)) return;
         if (bridge_->status().connected && !restart) return;  // already there
-        launchMt5(config, restart);
+        launchMt5(config, restart, {}, {}, allowOtherTerminal);
     } catch (const std::exception& ex) {
         setError(ex.what());
     }

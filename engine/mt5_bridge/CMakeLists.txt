@@ -33,6 +33,18 @@ if(MUUK_BUILD_TESTS AND WIN32)
     catch_discover_tests(muuk_mt5_bridge_tests)
 endif()
 
+# The pure launcher logic (data-folder choice, terminal-list merge) is
+# covered by tests that run anywhere -- the gateway test above is Windows-only.
+if(MUUK_BUILD_TESTS AND NOT WIN32)
+    add_executable(muuk_mt5_launcher_tests
+        tests/test_mt5_launcher.cpp
+    )
+    target_include_directories(muuk_mt5_launcher_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(muuk_mt5_launcher_tests PRIVATE muuk_mt5_bridge Catch2::Catch2WithMain)
+    include(Catch)
+    catch_discover_tests(muuk_mt5_launcher_tests)
+endif()
+
 # The console bot lives with the FIX code but can also run the MT5 bridge.
 add_executable(muuk-live ${CMAKE_CURRENT_SOURCE_DIR}/../ctrader_fix/cli/main.cpp)
 target_link_libraries(muuk-live PRIVATE muuk_ctrader_fix muuk_mt5_bridge)

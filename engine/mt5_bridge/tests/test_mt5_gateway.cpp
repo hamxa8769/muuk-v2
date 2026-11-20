@@ -428,17 +428,19 @@ TEST_CASE("MT5 launcher: the bridge EA is built into Muuk, and installed MT5s ar
     const std::string ea = muuk::mt5_bridge::bridgeEaSource();
     REQUIRE(ea.find("MuukBridge.mq5") != std::string::npos);
     REQUIRE(ea.find("OnTradeTransaction") != std::string::npos);
-    // Whatever is installed on this machine: every entry is a real terminal64.exe of this copy's own.
+    // Whatever is installed on this machine: every entry is a real terminal64.exe,
+    // broker MT5s included (owned=false), with owned/running as found.
     for (const auto& i : muuk::mt5_bridge::findMt5Installs()) {
         INFO(i.terminal.string());
         REQUIRE(std::filesystem::is_regular_file(i.terminal));
-        REQUIRE(muuk::mt5_bridge::isOwnMt5(i.terminal));
+        REQUIRE(i.owned == muuk::mt5_bridge::isOwnMt5(i.terminal));
+        REQUIRE(i.running == muuk::mt5_bridge::isMt5Running(i.terminal));
         if (!i.dataDir.empty()) REQUIRE(std::filesystem::is_directory(i.dataDir / "MQL5"));
     }
 }
 
 // Only made-up terminals under the temp folder here: nothing can reach a real MT5.
-TEST_CASE("This copy: an MT5 without the marker is refused untouched, its own one gets the separately named EA") {
+TEST_CASE("This copy: a broker MT5 gets the EA installed but is never closed or restarted by itself") {
     namespace fs = std::filesystem;
     using namespace muuk::mt5_bridge;
     const fs::path dir = fs::temp_directory_path() / "muuk_own_mt5_test";
@@ -450,12 +452,19 @@ TEST_CASE("This copy: an MT5 without the marker is refused untouched, its own on
     const auto silent = [](const std::string&) {};
 
     REQUIRE_FALSE(isOwnMt5(o.terminal));
-    REQUIRE_FALSE(dataDirFor(o.terminal));
-    REQUIRE_THAT(startMt5WithBridge(o, silent).message, Catch::Matchers::ContainsSubstring("Refused"));
+    REQUIRE(*dataDirFor(o.terminal) == dir);  // portable folder: the EA goes in, marker or not
+    // Installing the EA is a standard EA install, so it goes ahead; with no
+    // MetaEditor here it stops right after writing the EA, under its own name.
+    REQUIRE_THAT(startMt5WithBridge(o, silent).message, Catch::Matchers::ContainsSubstring("MetaEditor"));
+    REQUIRE(fs::is_regular_file(dir / "MQL5" / "Experts" / "MuukUpgrade" / "MuukUpgradeBridge.mq5"));
+    REQUIRE_FALSE(fs::exists(dir / "MQL5" / "Experts" / "Muuk"));
+    // But restarting it is refused unless the caller says so explicitly.
     const auto restart = restartMt5WithBridge(o, silent);
     REQUIRE_THAT(restart.message, Catch::Matchers::ContainsSubstring("Refused"));
     REQUIRE_FALSE(restart.started);
-    REQUIRE_FALSE(fs::exists(dir / "MQL5" / "Experts"));  // nothing written
+    const auto restartAllowed = restartMt5WithBridge(o, silent, true);
+    REQUIRE_THAT(restartAllowed.message, Catch::Matchers::ContainsSubstring("MetaEditor"));
+    REQUIRE_FALSE(restartAllowed.started);
 
     std::ofstream(dir / muuk::ctrader_fix::instance::kOwnMt5Marker) << "x";
     REQUIRE(isOwnMt5(o.terminal));

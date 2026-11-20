@@ -72,7 +72,7 @@ public:
     void selectTabByName(const std::string& name);
 
 private:
-    enum class Confirm { None, CloseRange, CloseAllPositions, CancelAllPending, ResetData, PlaceNow };
+    enum class Confirm { None, CloseRange, CloseAllPositions, CancelAllPending, ResetData, PlaceNow, RestartMt5 };
     // The tabs on the right; a KPI card click selects one.
     enum class Tab { None, Positions, Orders, History, Risk, News, Audit, Volume, Performance, Settings, Log };
     // Risk & capital page: account cards, lots, loss limits, guards, lock/escape, the risk table and the
@@ -266,6 +266,9 @@ private:
     void saveAccountNow();
     int bridgeEaPortHint_ = muuk::ctrader_fix::instance::kDefaultEaPort;
     void renderMt5AccountFields();
+    // True when the MT5 the form points at (or the first one found, when
+    // "auto") is this copy's own marker MT5 rather than a broker MT5.
+    [[nodiscard]] bool mt5SelectedTerminalOwned() const;
     AccountForm account_;
     std::string accountLoadedFor_;
     bool accountDirty_ = false;

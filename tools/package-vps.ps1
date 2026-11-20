@@ -69,6 +69,9 @@ New-Item -ItemType Directory -Force $mt5Out | Out-Null
 Copy-Item (Join-Path $PSScriptRoot "mt5\MuukBridge.mq5") $mt5Out -Force
 Copy-Item (Join-Path $repo "docs\mt5.md") (Join-Path $Out "README-MT5.md") -Force
 Copy-Item (Join-Path $repo "engine\ctrader_fix\config.mt5.example.json") (Join-Path $mt5Out "mt5_account.example.json") -Force
+# The same template at the zip root, next to my_account.local.json, so an
+# MT5 user sees the right one at once instead of buried in mt5/.
+Copy-Item (Join-Path $repo "engine\ctrader_fix\config.mt5.example.json") (Join-Path $Out "mt5_account.example.json") -Force
 
 if ($Config) {
     $cfg = Resolve-Path $Config

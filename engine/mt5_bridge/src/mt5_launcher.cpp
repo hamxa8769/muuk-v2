@@ -1,6 +1,7 @@
 #include "muuk/mt5_bridge/mt5_launcher.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -36,12 +37,27 @@ std::wstring lower(std::wstring s) {
     return s;
 }
 
+#ifdef _WIN32  // only the Win32 process matching below uses it
 std::wstring normalized(const fs::path& p) {
     std::error_code ec;
     fs::path abs = fs::weakly_canonical(p, ec);
     if (ec) abs = p;
     std::wstring s = lower(abs.wstring());
     while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    return s;
+}
+#endif
+
+// Platform-neutral key for deduping terminal paths (used by the merge,
+// which is covered by tests on any system).
+std::string pathKey(const fs::path& p) {
+    std::error_code ec;
+    fs::path abs = fs::weakly_canonical(p, ec);
+    if (ec) abs = p;
+    std::string s = abs.generic_string();
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
     return s;
 }
 
@@ -117,7 +133,7 @@ std::string knownGoldSymbol(const fs::path& dataDir, const std::string& login, c
         const std::string sym = trimmed(readFile(dataDir / "MQL5" / "Files" / ("MuukBridge_" + login + ".symbol")));
         if (isGoldName(sym)) return sym;
     }
-    // 2. The gold symbol this broker server has sent prices for (bases\<server>\ticks\<symbol>);
+    // 2. The gold symbol this broker server has sent prices for (bases\<server>\ticks);
     //    a symbol the account can't trade has no ticks.
     if (server.empty()) return {};
     const std::wstring want = lower(fs::path(server).wstring());
@@ -143,14 +159,122 @@ std::string bridgeEaSource() { return std::string(reinterpret_cast<const char*>(
 
 std::optional<fs::path> dataDirFor(const fs::path& terminal) {
     // Portable: the data lives in the install folder, once MT5 has run there.
+    // Any MT5 counts here (broker or own): whether it may be closed or
+    // restarted is a separate question, answered by isOwnMt5.
     std::error_code ec;
     const fs::path dir = terminal.parent_path();
-    if (!isOwnMt5(terminal) || !fs::is_directory(dir / "MQL5", ec)) return std::nullopt;
+    if (!fs::is_directory(dir / "MQL5", ec)) return std::nullopt;
     return dir;
 }
 
+std::vector<fs::path> findMt5DataDirs() {
+    std::vector<fs::path> out;
+#ifdef _WIN32
+    wchar_t* v = nullptr;
+    size_t len = 0;
+    if (_wdupenv_s(&v, &len, L"APPDATA") == 0 && v) {
+        const fs::path root = fs::path(v) / "MetaQuotes" / "Terminal";
+        free(v);
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(root, ec)) {
+            if (e.is_directory()) out.push_back(e.path());
+        }
+    }
+#endif
+    return out;
+}
+
+std::optional<fs::path> chooseMt5DataDir(const std::optional<fs::path>& portable,
+                                         const std::vector<fs::path>& candidates, const std::string& server,
+                                         const std::string& login) {
+    if (portable) return portable;
+    std::error_code ec;
+    std::vector<fs::path> dirs;
+    for (const auto& c : candidates) {
+        if (fs::is_directory(c, ec)) dirs.push_back(c);
+    }
+    if (dirs.empty()) return std::nullopt;
+    // The candidate that belongs to this broker account: its bases\ holds
+    // this server (case insensitive), or it holds the bridge's symbol file
+    // for this login.
+    const std::wstring wantServer = lower(fs::path(server).wstring());
+    for (const auto& d : dirs) {
+        bool match = false;
+        if (!server.empty()) {
+            for (const auto& srv : fs::directory_iterator(d / "bases", ec)) {
+                if (srv.is_directory() && lower(srv.path().filename().wstring()) == wantServer) {
+                    match = true;
+                    break;
+                }
+            }
+        }
+        if (!match && !login.empty() &&
+            fs::is_regular_file(d / "MQL5" / "Files" / ("MuukBridge_" + login + ".symbol"), ec)) {
+            match = true;
+        }
+        if (match) return d;
+    }
+    if (dirs.size() == 1) return dirs.front();
+    return std::nullopt;
+}
+
+std::optional<fs::path> dataDirForTerminal(const fs::path& terminal, const std::string& server,
+                                           const std::string& login) {
+    return chooseMt5DataDir(dataDirFor(terminal), findMt5DataDirs(), server, login);
+}
+
+std::vector<fs::path> runningMt5Terminals() {
+#ifdef _WIN32
+    std::vector<fs::path> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        if (lower(pe.szExeFile) != L"terminal64.exe") continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+        if (!h) continue;
+        wchar_t path[MAX_PATH * 2];
+        DWORD size = static_cast<DWORD>(std::size(path));
+        if (QueryFullProcessImageNameW(h, 0, path, &size)) out.emplace_back(path);
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    return out;
+#else
+    return {};
+#endif
+}
+
+std::vector<Mt5Install> mergeMt5Installs(std::vector<Mt5Install> scanned,
+                                         const std::vector<fs::path>& running) {
+    std::vector<Mt5Install> out = std::move(scanned);
+    for (const auto& terminal : running) {
+        const std::string key = pathKey(terminal);
+        auto it = std::find_if(out.begin(), out.end(),
+                               [&](const Mt5Install& i) { return pathKey(i.terminal) == key; });
+        if (it != out.end()) {
+            it->running = true;
+            it->owned = it->owned || isOwnMt5(terminal);
+            if (it->dataDir.empty()) {
+                if (const auto d = dataDirFor(terminal)) it->dataDir = *d;
+            }
+            continue;
+        }
+        Mt5Install i;
+        i.terminal = terminal;
+        i.owned = isOwnMt5(terminal);
+        i.running = true;
+        i.label = terminal.parent_path().filename().string();
+        if (i.label.empty()) i.label = terminal.string();
+        if (const auto d = dataDirFor(terminal)) i.dataDir = *d;
+        out.push_back(i);
+    }
+    return out;
+}
+
 std::vector<Mt5Install> findMt5Installs() {
-    std::vector<Mt5Install> out;
+    std::vector<Mt5Install> scanned;
     std::vector<fs::path> roots;
 #ifdef _WIN32
     for (const wchar_t* var : {L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramW6432"}) {
@@ -166,45 +290,32 @@ std::vector<Mt5Install> findMt5Installs() {
     const DWORD selfLen = GetModuleFileNameW(nullptr, self, static_cast<DWORD>(std::size(self)));
     if (selfLen > 0) roots.push_back(fs::path(std::wstring(self, selfLen)).root_path());
 #endif
-    std::vector<std::wstring> seen;
     std::error_code ec;
     for (const auto& root : roots) {
         if (!fs::is_directory(root, ec)) continue;
         for (const auto& entry : fs::directory_iterator(root, ec)) {
             const fs::path exe = entry.path() / "terminal64.exe";
-            if (!fs::is_regular_file(exe, ec) || !isOwnMt5(exe)) continue;
-            const std::wstring key = normalized(exe);
-            if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
-            seen.push_back(key);
+            if (!fs::is_regular_file(exe, ec)) continue;
             Mt5Install i;
             i.terminal = exe;
             i.label = entry.path().filename().string();
+            i.owned = isOwnMt5(exe);
             if (const auto d = dataDirFor(exe)) i.dataDir = *d;
-            out.push_back(i);
+            scanned.push_back(i);
         }
     }
-    return out;
+    // Running terminals too: a broker MT5 in a custom or portable location
+    // is found even though no scan root holds it.
+    return mergeMt5Installs(std::move(scanned), runningMt5Terminals());
 }
 
 bool isMt5Running(const fs::path& terminal) {
 #ifdef _WIN32
     const std::wstring want = normalized(terminal);
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
-    bool found = false;
-    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found; ok = Process32NextW(snap, &pe)) {
-        if (lower(pe.szExeFile) != L"terminal64.exe") continue;
-        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-        if (!h) continue;
-        wchar_t path[MAX_PATH * 2];
-        DWORD size = static_cast<DWORD>(std::size(path));
-        if (QueryFullProcessImageNameW(h, 0, path, &size) && normalized(fs::path(path)) == want) found = true;
-        CloseHandle(h);
+    for (const auto& p : runningMt5Terminals()) {
+        if (normalized(p) == want) return true;
     }
-    CloseHandle(snap);
-    return found;
+    return false;
 #else
     (void)terminal;
     return false;
@@ -221,7 +332,7 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
     if (terminal.empty()) {
         const auto installs = findMt5Installs();
         if (installs.empty()) {
-            r.message = "This copy's own MetaTrader 5 isn't set up on this PC -- see docs/mt5.md, 'This copy's own MT5'.";
+            r.message = "No MetaTrader 5 found on this PC -- open or install your broker's MT5, then press Connect again.";
             return r;
         }
         terminal = installs.front().terminal;
@@ -230,18 +341,28 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
         r.message = "MetaTrader 5 not found at " + terminal.string() + " (Settings > Account > MT5 terminal).";
         return r;
     }
-    if (!isOwnMt5(terminal)) {
-        r.message = notOwnMt5Message(terminal);
-        return r;
-    }
-    const auto data = dataDirFor(terminal);
+    const bool owned = isOwnMt5(terminal);
+    const auto data = dataDirForTerminal(terminal, o.server, o.login);
     if (!data) {
-        r.message = "MetaTrader 5 at " + terminal.parent_path().string() +
-                    " has never been opened in portable mode -- open it once with /portable, then connect again.";
+        if (findMt5DataDirs().size() > 1) {
+            r.message = "More than one MT5 data folder on this PC -- pick the MT5 in Settings > Account > "
+                        "MetaTrader 5, then Connect again.";
+        } else {
+            r.message = "MetaTrader 5 at " + terminal.parent_path().string() +
+                        " has no data folder yet -- open it once (so it creates one), then Connect again.";
+        }
         return r;
     }
+    // Portable (its data lives in its install folder) or not: only a portable
+    // terminal is started/compiled with /portable, so a broker MT5 keeps
+    // using its real data folder.
+    const bool portable = (*data == terminal.parent_path());
+#ifndef _WIN32
+    (void)portable;  // only the Windows launch/compile commands use /portable
+#endif
 
     // 1. The EA: the bridge built into Muuk, compiled by this MT5's own MetaEditor.
+    //    Installing an EA into a broker MT5 is a standard EA install.
     const std::string eaName = instance::kEaName;
     const fs::path eaDir = *data / "MQL5" / "Experts" / instance::kEaFolder;
     fs::create_directories(eaDir, ec);
@@ -263,8 +384,8 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
 #ifdef _WIN32
         fs::remove(ex5, ec);
         const fs::path logFile = eaDir / (eaName + ".compile.log");
-        std::wstring cmd = L"\"" + editor.wstring() + L"\" /portable /compile:\"" + mq5.wstring() + L"\" /log:\"" +
-                           logFile.wstring() + L"\"";
+        std::wstring cmd = L"\"" + editor.wstring() + L"\"" + (portable ? L" /portable" : L"") + L" /compile:\"" +
+                           mq5.wstring() + L"\" /log:\"" + logFile.wstring() + L"\"";
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         si.dwFlags = STARTF_USESHOWWINDOW;
@@ -290,8 +411,16 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
 
     if (isMt5Running(terminal)) {
         r.alreadyRunning = true;
-        r.message = "MetaTrader 5 is already open -- the bridge connects if " + eaName + " is on a chart there (it stays "
-                    "on the chart once Muuk has started MT5 once). If it doesn't connect, close MT5 and connect again.";
+        if (owned) {
+            r.message = "MetaTrader 5 is already open -- the bridge connects if " + eaName +
+                        " is on a chart there (it stays on the chart once Muuk has started MT5 once). "
+                        "If it doesn't connect, close MT5 and connect again.";
+        } else {
+            r.message = "MetaTrader 5 is already open -- drag " + eaName +
+                        " from MT5's Navigator onto the gold (XAUUSD) chart once (it stays there afterwards); "
+                        "the bridge connects as soon as it is on a chart. "
+                        "Or press 'Restart MT5 with bridge' in Settings > Account.";
+        }
         say(r.message);
         return r;
     }
@@ -344,7 +473,8 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
         return r;
     }
 #ifdef _WIN32
-    std::wstring cmd = L"\"" + terminal.wstring() + L"\" /portable /config:\"" + startup.wstring() + L"\"";
+    std::wstring cmd = L"\"" + terminal.wstring() + L"\"" + (portable ? L" /portable" : L"") + L" /config:\"" +
+                       startup.wstring() + L"\"";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -372,13 +502,14 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
     return r;
 }
 
-Mt5StartResult restartMt5WithBridge(const Mt5StartOptions& o, const std::function<void(const std::string&)>& log) {
+Mt5StartResult restartMt5WithBridge(const Mt5StartOptions& o, const std::function<void(const std::string&)>& log,
+                                    bool allowOtherTerminal) {
     fs::path terminal = o.terminal;
     if (terminal.empty()) {
         const auto installs = findMt5Installs();
         if (!installs.empty()) terminal = installs.front().terminal;
     }
-    if (!terminal.empty() && !isOwnMt5(terminal)) {  // before anything gets closed
+    if (!terminal.empty() && !isOwnMt5(terminal) && !allowOtherTerminal) {  // before anything gets closed
         Mt5StartResult r;
         r.message = notOwnMt5Message(terminal);
         if (log) log("[mt5] " + r.message);
