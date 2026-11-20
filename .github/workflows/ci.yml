@@ -1,0 +1,57 @@
+# Muuk v2 CI — proves the build + tests on every push / PR.
+#
+# Prepared 2026-11-20 ~11:40 PKT by Muse (research). NOT pushed to
+# hamxa8769/muuk-v2. Ship together with mt5_linux_gate.patch
+# (~/workspace/project-zip/mt5_linux_gate.patch): without that patch the
+# Linux job fails at engine/mt5_bridge tests, which include <windows.h>
+# and drive the gateway over Win32 named pipes — Windows-only.
+#
+# Design choices, grounded in the repo as pushed:
+# - Desktop app OFF on both runners: it needs GLFW/ImGui/OpenGL (Linux)
+#   and Direct3D 11 (Windows) and is not what this CI is proving.
+#   The engine + tests are the proof. Turn it ON later as a separate job
+#   if the desktop build needs covering.
+# - Benchmarks OFF: keeps CI fast; google/benchmark is only fetched when
+#   MUUK_BUILD_BENCHMARKS=ON (top-level CMakeLists.txt).
+# - Tests ON on both runners: the Windows job is what proves the gated
+#   MT5 test still builds and runs on Windows after the patch.
+# - FetchContent needs internet on first configure (Catch2, nlohmann/json,
+#   asio) — GitHub runners have it; this sandbox does not, so the workflow
+#   itself was YAML-validated here but NOT run end-to-end. First green run
+#   on GitHub is the real proof.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMUUK_BUILD_DESKTOP_APP=OFF
+          -DMUUK_BUILD_BENCHMARKS=OFF
+          -DMUUK_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DMUUK_BUILD_DESKTOP_APP=OFF
+          -DMUUK_BUILD_BENCHMARKS=OFF
+          -DMUUK_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
