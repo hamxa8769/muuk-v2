@@ -26,6 +26,11 @@ namespace {
 // throughout; this conversion happens only at the wire boundary.
 constexpr double kWireQtyPerLot = 100.0;
 
+// The dashboard reason (shown as "Next range waits -- ...") while the
+// no-funds hold is on: the account is connected, just empty.
+constexpr const char* kNoFundsWait =
+    "account equity is $0 -- connected and showing live data, but not trading until the account is funded";
+
 std::optional<OrderId> tryParseOrderId(const std::optional<std::string>& clOrdId) {
     if (!clOrdId) return std::nullopt;
     try {
@@ -385,8 +390,10 @@ void LiveRunner::run() {
 
         if (config_.connection.isMt5()) {
             // The bridge sends the account right after logon; the symbol's
-            // money units come from it, so wait for it (briefly) first.
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            // money units come from it, so wait for it first. Ten seconds:
+            // a slow pipe reconnect after an MT5 restart needs the margin,
+            // and a $0 account still answers (see parseBrokerAccountInfo).
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (std::chrono::steady_clock::now() < deadline) {
                 {
                     std::scoped_lock lock(engineMutex_);
@@ -395,12 +402,22 @@ void LiveRunner::run() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
             BrokerAccountInfo a;
+            bool pricesSeen = false;
             {
                 std::scoped_lock lock(engineMutex_);
                 a = brokerAccount_;
+                pricesSeen = latestBid_.has_value() && latestAsk_.has_value();
             }
             // Never trade an account the config doesn't expect: nothing has been sent yet.
             if (!a.known) {
+                if (pricesSeen) {
+                    // The bridge IS talking (prices are flowing) -- the EA
+                    // just hasn't sent its account figures, so asking
+                    // whether it's on the chart would point the wrong way.
+                    throw std::runtime_error("MT5 bridge: the bridge is connected and prices are flowing, but no "
+                                             "account figures arrived from MetaTrader 5 yet -- check the MT5 Experts "
+                                             "log for MuukBridge errors. Not trading.");
+                }
                 throw std::runtime_error("MT5 bridge: no account figures from MetaTrader 5 yet -- is MuukBridge running "
                                          "on the chart? Not trading.");
             }
@@ -1287,7 +1304,12 @@ double LiveRunner::netAtMidLocked(double mid) const {
     return net;
 }
 
-void LiveRunner::onAccountInfoLocked(const FixMessage& msg) {
+// Receiving an AccountInfo message IS the signal MT5 was heard from: the
+// gateway only forwards one after the EA's hello and its account figures,
+// so a $0 balance and $0 equity mean an empty account, not a missing one.
+// (The old code read zeros as "not heard yet", so a $0 demo could never
+// pass the account wait -- it looped on reconnect forever.)
+BrokerAccountInfo parseBrokerAccountInfo(const FixMessage& msg) {
     auto num = [&](int t, double fallback = 0.0) {
         const auto v = msg.getOptionalString(t);
         if (!v || v->empty()) return fallback;
@@ -1298,9 +1320,8 @@ void LiveRunner::onAccountInfoLocked(const FixMessage& msg) {
         }
     };
     auto str = [&](int t) { return msg.getOptionalString(t).value_or(""); };
-    const bool first = !brokerAccount_.known;
     BrokerAccountInfo a;
-    a.known = num(tag::MuukBalance) > 0.0 || num(tag::MuukEquity) > 0.0;  // zeros = not heard from MT5 yet
+    a.known = true;
     a.balance = num(tag::MuukBalance);
     a.equity = num(tag::MuukEquity);
     a.margin = num(tag::MuukMargin);
@@ -1326,20 +1347,49 @@ void LiveRunner::onAccountInfoLocked(const FixMessage& msg) {
     a.commissionInPerLot = num(tag::MuukCommissionInPerLot, -1.0);
     a.commissionOutPerLot = num(tag::MuukCommissionOutPerLot, -1.0);
     // Per-position swap: a repeating group, one id then its swap and commission.
+    const auto ids = msg.getAll(tag::MuukCostPositionId);
+    const auto swaps = msg.getAll(tag::MuukCostSwap);
+    for (std::size_t i = 0; i < ids.size() && i < swaps.size(); ++i) {
+        try {
+            a.swapTotal += std::stod(swaps[i]);
+        } catch (...) {
+        }
+    }
+    return a;
+}
+
+void LiveRunner::onAccountInfoLocked(const FixMessage& msg) {
+    const bool first = !brokerAccount_.known;
+    const bool heldBefore = noFundsHoldLocked();
+    BrokerAccountInfo a = parseBrokerAccountInfo(msg);
+    // The per-position swap map lives here (the parse above only totals
+    // it); one id then its swap and commission.
     positionSwap_.clear();
     const auto ids = msg.getAll(tag::MuukCostPositionId);
     const auto swaps = msg.getAll(tag::MuukCostSwap);
     for (std::size_t i = 0; i < ids.size() && i < swaps.size(); ++i) {
         try {
-            const double sw = std::stod(swaps[i]);
-            positionSwap_[ids[i]] = sw;
-            a.swapTotal += sw;
+            positionSwap_[ids[i]] = std::stod(swaps[i]);
         } catch (...) {
         }
     }
     brokerAccount_ = a;
     brokerAccountAt_ = std::chrono::steady_clock::now();
-    if (first && a.known) {
+    // No-funds hold: an empty account connects and shows everything, but
+    // nothing trades until it is funded. Logged once per change; it lifts
+    // by itself on the next 1-second account update that reports equity.
+    if (noFundsHoldLocked()) {
+        entryWait_ = kNoFundsWait;
+        if (!noFundsHoldLogged_) {
+            log("[mt5] account equity is $0 -- connected and showing live data, but not trading until the account is funded");
+            noFundsHoldLogged_ = true;
+        }
+    } else if (heldBefore) {
+        log("[mt5] account equity is back above $0 -- trading resumes");
+        noFundsHoldLogged_ = false;
+        if (entryWait_ == kNoFundsWait) entryWait_.clear();
+    }
+    if (first) {
         log("[mt5] account " + a.login + " on " + a.server + " (" + a.company + "): " + a.currency + " " +
             usdText(a.balance).substr(a.balance < 0.0 ? 2 : 1) + ", 1:" + std::to_string(static_cast<int>(a.leverage)) +
             (a.cent() ? " -- a cent account (every amount is in US cents)" : "") + ", symbol " + a.symbol);
@@ -1423,6 +1473,10 @@ void LiveRunner::adoptBrokerSymbolLocked(const BrokerAccountInfo& a) {
 
 bool LiveRunner::brokerAccountFreshLocked() const {
     return brokerAccount_.known && std::chrono::steady_clock::now() - brokerAccountAt_ < std::chrono::seconds(15);
+}
+
+bool LiveRunner::noFundsHoldLocked() const {
+    return brokerAccount_.known && brokerAccount_.equity <= 0.0;
 }
 
 double LiveRunner::equityEstimateLocked(double floating) const {
@@ -1632,6 +1686,12 @@ void LiveRunner::onRecoveryFillLocked(OrderId orderId) {
 }
 
 void LiveRunner::sendManagedMarketLocked(OpenLeg leg, const std::string& what) {
+    if (noFundsHoldLocked()) {
+        // A hedge/lock leg still opens new exposure: refused while the
+        // hold is on (logged once by onAccountInfoLocked when it engages).
+        entryWait_ = kNoFundsWait;
+        return;
+    }
     const SymbolSpec& spec = config_.strategy.symbol;
     const std::string clOrdId = std::to_string(leg.id);
     const double lots = leg.volume.toDouble(spec);
@@ -1971,6 +2031,15 @@ bool LiveRunner::stopIsMarketable(OrderSide side, Price price) const {
 }
 
 void LiveRunner::sendStopOrderLocked(const OpenLeg& leg, int sequenceIndex) {
+    if (noFundsHoldLocked()) {
+        // Every new pending order flows through here (engine commands,
+        // released waiting orders, lock stops): none of them may open
+        // exposure on an empty account. Logged once by
+        // onAccountInfoLocked when the hold engages; here it only
+        // refreshes the reason the dashboard shows.
+        entryWait_ = kNoFundsWait;
+        return;
+    }
     const std::string clOrdId = std::to_string(leg.id);
     const int side = (leg.side == OrderSide::BuyStop) ? 1 : 2;
     const double lots = leg.volume.toDouble(config_.strategy.symbol);
@@ -2177,6 +2246,11 @@ void LiveRunner::checkBasketHealthLocked() {
 void LiveRunner::placeWaitingOrderNow(OrderId id) {
     std::scoped_lock lock(engineMutex_);
     if (!tradeSession_) return;
+    if (noFundsHoldLocked()) {
+        entryWait_ = kNoFundsWait;
+        log("[manual] not placing the waiting order: account equity is $0 -- fund the account first");
+        return;
+    }
     const auto it = waitingOrders_.find(id);
     if (it == waitingOrders_.end()) return;
     const OpenLeg leg = it->second;
@@ -2194,6 +2268,14 @@ void LiveRunner::placeWaitingOrderNow(OrderId id) {
 }
 
 bool LiveRunner::prepareNextCycle(bool recenter) {
+    if (noFundsHoldLocked()) {
+        // No cycle arms on an empty account: quotes, the range display,
+        // the account display and brain observation all keep working,
+        // but no order is armed. The next 1-second account update that
+        // reports equity lifts this by itself (see onAccountInfoLocked).
+        entryWait_ = kNoFundsWait;
+        return false;
+    }
     if (!decideBrainCycleLocked()) return false;
     if ((recenter || brainCycleActive_) && latestBid_ && latestAsk_) {
         const SymbolSpec& spec = config_.strategy.symbol;

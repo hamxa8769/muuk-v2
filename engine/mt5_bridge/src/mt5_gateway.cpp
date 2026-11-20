@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 
@@ -344,8 +345,10 @@ void Mt5Gateway::onEaLine(const std::string& line) {
         return;
     }
     if (t == "account") {
+        bool first = false;
         {
             std::scoped_lock lock(mutex_);
+            first = !status_.accountKnown;
             status_.accountKnown = true;
             status_.balance = jsonNumber(j, "balance");
             status_.equity = jsonNumber(j, "equity");
@@ -354,6 +357,16 @@ void Mt5Gateway::onEaLine(const std::string& line) {
             if (jsonNumber(j, "marginPerLot") > 0.0) status_.marginPerLot = jsonNumber(j, "marginPerLot");
             if (jsonNumber(j, "tickValue") > 0.0) status_.tickValue = jsonNumber(j, "tickValue");
             lastCosts_ = j.contains("costs") && j.at("costs").is_array() ? j.at("costs") : nlohmann::json::array();
+        }
+        if (first) {
+            // Once, so the log proves the figures arrived (the runner's
+            // reconnect loop used to claim they never did, on a $0 account).
+            const EaStatus s = status();
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "first account figures from MetaTrader 5: balance %.2f, equity %.2f, free margin %.2f %s",
+                          s.balance, s.equity, s.freeMargin, s.currency.c_str());
+            log(buf);
         }
         if (const auto tc = tradeConn()) sendAccountInfo(tc, j.value("costs", nlohmann::json::array()));
         return;

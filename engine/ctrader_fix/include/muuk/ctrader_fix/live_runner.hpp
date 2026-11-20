@@ -138,6 +138,12 @@ struct BrokerAccountInfo {
     }
 };
 
+// Parses an MT5 bridge AccountInfo message into the account it describes.
+// Receiving the message IS the signal the account was heard from -- even
+// when every figure is zero (an empty demo account is still a connected
+// account); only the figures themselves may be zero.
+BrokerAccountInfo parseBrokerAccountInfo(const FixMessage& msg);
+
 // A point-in-time read of LiveRunner's state, for a UI (or anything else)
 // to poll without needing its own hooks into the engine internals. Built
 // from the same data onQuoteMessage/onTradeMessage already maintain, so
@@ -571,6 +577,10 @@ private:
     // the brain chose the policy), false = the brain vetoed it.
     void maybeInitBrainLocked();
     [[nodiscard]] bool decideBrainCycleLocked();
+    // True while the MT5 account is known and its equity is $0 or less:
+    // connected, but no order that would open new exposure may be sent.
+    // (cTrader never sends account figures, so known stays false there.)
+    [[nodiscard]] bool noFundsHoldLocked() const;
     [[nodiscard]] std::filesystem::path resolveBrainFileLocked() const;
     [[nodiscard]] double medianSpreadLocked() const;
     // Replay dollars per one unit of account money (see live_runner.cpp).
@@ -682,6 +692,7 @@ private:
     void pickRangeShapeLocked();
     std::string entryWait_;
     bool entryWaitLogged_ = false;
+    bool noFundsHoldLogged_ = false;  // the $0-equity hold, logged once per change
     muuk::core::StartSide rangeStartSide_ = muuk::core::StartSide::BuyOnly;
     bool rangeSideSet_ = false;
     double rangeTargetMove_ = 0.0;  // 0 = the configured lastLotTargetMove
