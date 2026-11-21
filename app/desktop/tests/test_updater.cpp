@@ -106,18 +106,26 @@ TEST_CASE("parseLatestRelease ignores releases without the Windows zip") {
     REQUIRE_FALSE(parseLatestRelease(R"({"tag_name": "v2.0.1", "assets": [{"name": "Muuk-v2.0.1-Windows.zip", "size": 9}]})").has_value());
 }
 
-TEST_CASE("Updater background check is a harmless no-op off Windows") {
+TEST_CASE("Updater background check settles harmlessly") {
     Updater updater("0.2.1");
     REQUIRE(updater.state() == Updater::State::Idle);
     updater.startBackgroundCheck();
-    // The worker finishes on its own (no network off Windows); give it a
-    // moment, then it must be back to Idle -- never stuck in Checking.
-    for (int i = 0; i < 200 && updater.state() == Updater::State::Checking; ++i) {
+    // The worker finishes on its own; give it a moment, then it must
+    // have settled -- never stuck in Checking. Off Windows there is no
+    // network, so it settles to Idle. On Windows it really asks GitHub,
+    // and a failed check (no network, or the unauthenticated API rate
+    // limit on a shared IP) legitimately settles to Failed instead --
+    // the check is best-effort by design, and Failed is a terminal
+    // state that offers no update, exactly like Idle. Either way no
+    // release may be reported, since nothing newer was found.
+    for (int i = 0; i < 2000 && updater.state() == Updater::State::Checking; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    REQUIRE(updater.state() == Updater::State::Idle);
+    const auto settled = updater.state();
+    REQUIRE((settled == Updater::State::Idle || settled == Updater::State::Failed));
     REQUIRE(updater.latestTag().empty());
-    // beginInstall without an Available release is ignored, never a crash.
+    // beginInstall without an Available release is ignored, never a crash,
+    // and leaves the settled state unchanged.
     updater.beginInstall();
-    REQUIRE(updater.state() == Updater::State::Idle);
+    REQUIRE(updater.state() == settled);
 }
