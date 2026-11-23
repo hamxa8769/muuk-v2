@@ -64,15 +64,19 @@ TEST_CASE("compareVersions compares numerically, not as text") {
     REQUIRE(compareVersions(Version{3, 0, 0}, Version{2, 9, 9}) == 1);
 }
 
-TEST_CASE("isNewerRelease spots a newer tag and ignores bad input") {
-    REQUIRE(isNewerRelease("v2.0.1", "0.2.1"));
-    REQUIRE(isNewerRelease("v2.0.1", "2.0.0"));
-    REQUIRE(isNewerRelease("v2.0.10", "2.0.9"));
-    REQUIRE_FALSE(isNewerRelease("v2.0.1", "2.0.1"));  // equal: no update
-    REQUIRE_FALSE(isNewerRelease("v2.0.0", "2.0.1"));  // older
-    REQUIRE_FALSE(isNewerRelease("v2.0", "2.0.1"));    // malformed tag
+TEST_CASE("isNewerRelease maps the release tag onto the app version") {
+    // Tags are v2.0.x, the app reports 0.2.x: v2.0.3 IS app 0.2.3, so
+    // the same release is not an update (v0.2.3 kept offering v2.0.3
+    // because 2.0.3 > 0.2.3 numerically).
+    REQUIRE_FALSE(isNewerRelease("v2.0.3", "0.2.3"));  // same release: no update
+    REQUIRE(isNewerRelease("v2.0.4", "0.2.3"));        // the next release is newer
+    REQUIRE(isNewerRelease("v2.0.3", "0.2.2"));        // newer than the previous app
+    REQUIRE_FALSE(isNewerRelease("v2.0.2", "0.2.3"));  // older tag
+    REQUIRE(isNewerRelease("v2.0.10", "0.2.9"));       // numeric, not text, comparison
+    REQUIRE_FALSE(isNewerRelease("v2.0.1", "2.0.0"));  // an app at 2.0.0 is ahead of the v2.0.1 release
+    REQUIRE_FALSE(isNewerRelease("v2.0", "0.2.1"));    // malformed tag
     REQUIRE_FALSE(isNewerRelease("v2.0.1", "banana"));  // malformed current
-    REQUIRE_FALSE(isNewerRelease("", "2.0.1"));
+    REQUIRE_FALSE(isNewerRelease("", "0.2.1"));
 }
 
 TEST_CASE("zipAssetName names the Windows release asset") {

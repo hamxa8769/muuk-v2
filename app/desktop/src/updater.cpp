@@ -89,7 +89,13 @@ bool isNewerRelease(std::string_view latestTag, std::string_view currentVersion)
     Version latest{};
     Version current{};
     if (!parseVersion(latestTag, latest) || !parseVersion(currentVersion, current)) return false;
-    return compareVersions(latest, current) > 0;
+    // Release tags are v2.0.x while the app reports 0.2.x: the tag is
+    // the app version with its first two components swapped (v2.0.3 IS
+    // app 0.2.3). Convert the tag back before comparing, or every
+    // release looks newer than the app that ships it (2.0.3 > 0.2.3
+    // numerically) and the button never stops offering the same version.
+    const Version latestAsApp{latest.minor, latest.major, latest.patch};
+    return compareVersions(latestAsApp, current) > 0;
 }
 
 std::string zipAssetName(std::string_view tag) {

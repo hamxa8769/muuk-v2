@@ -1830,3 +1830,67 @@ TEST_CASE("LiveRunner with Brain v2 works on a cent-style symbol (money in cents
     std::error_code ec;
     std::filesystem::remove_all(brainFile.parent_path(), ec);
 }
+
+TEST_CASE("LiveRunner on MT5 ignores a stale stored symbol id and resolves by name") {
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.platform = "mt5";
+    // A cTrader-era symbol id left in the config (the v0.2.3 live bug):
+    // on MT5 the bridge always reports the symbol as "1", so trusting
+    // this id made the runner drop its own positions and orders as
+    // "other symbols" and declare every fill "closed outside the bot".
+    cfg.connection.symbolId = "41";
+    LiveRunner runner(cfg);
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    (void)server.waitForMessage(msgtype::Logon, kTradeConn);
+    server.sendToClient(kTradeConn, serverHeaderMessage(msgtype::Logon, 1));
+    (void)server.waitForMessage(msgtype::Logon, kQuoteConn);
+    server.sendToClient(kQuoteConn, serverHeaderMessage(msgtype::Logon, 1));
+
+    // The bridge sends the MT5 account figures right after logon; the
+    // runner waits for them before resolving the symbol.
+    FixMessage account = serverHeaderMessage(msgtype::MuukAccountInfo, 2);
+    account.set(tag::MuukLogin, std::string("12345"));
+    account.set(tag::MuukServer, std::string("Test-Demo"));
+    account.set(tag::MuukCompany, std::string("Test Markets Ltd."));
+    account.set(tag::MuukCurrency, std::string("USC"));
+    account.set(tag::MuukTradeMode, std::string("demo"));
+    account.set(tag::MuukSymbol, std::string("XAUUSD"));
+    account.set(tag::MuukBalance, std::string("500000"));
+    account.set(tag::MuukEquity, std::string("500000"));
+    account.set(tag::MuukLeverage, std::string("1000"));
+    account.set(tag::MuukHedging, std::string("Y"));
+    account.set(tag::MuukDigits, std::string("2"));
+    account.set(tag::MuukTickSize, std::string("0.01"));
+    account.set(tag::MuukTickValue, std::string("1"));
+    account.set(tag::MuukVolumeMin, std::string("0.01"));
+    account.set(tag::MuukVolumeStep, std::string("0.01"));
+    server.sendToClient(kTradeConn, account);
+
+    // The runner must ask the SecurityList instead of trusting "41":
+    // had it used the stored id, no request would ever arrive.
+    (void)server.waitForMessage(msgtype::SecurityListRequest, kTradeConn);
+    server.sendToClient(kTradeConn, buildSecurityListResponse());
+
+    // The gateway's id for XAUUSD is "1", not the stale "41".
+    for (int i = 0; i < 100 && runner.snapshot().symbolId != "1"; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    REQUIRE(runner.snapshot().symbolId == "1");
+
+    // The orders it arms carry the resolved id too.
+    (void)server.waitForMessage(msgtype::MarketDataRequest, kQuoteConn);
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn);
+    REQUIRE(order1.getString(tag::Symbol) == "1");
+    if (runnerException) std::rethrow_exception(runnerException);
+}

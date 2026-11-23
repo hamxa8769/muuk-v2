@@ -397,3 +397,30 @@ TEST_CASE("MT5 account settings: a saved password stays with its own login, neve
     REQUIRE(muuk::ctrader_fix::loadLiveConfig(file).connection.mt5Password == "demopass");
     fs::remove_all(dir);
 }
+
+TEST_CASE("MT5 account settings: a stale cTrader symbol id is never kept") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "muuk_mt5_symbolid_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path file = dir / "mt5.local.json";
+    {
+        // An MT5 file carrying a cTrader-era symbol id (the v0.2.3 live
+        // bug: the runner then dropped its own MT5 positions as "other
+        // symbols", because the bridge always reports the symbol as "1").
+        std::ofstream out(file);
+        out << R"({"connection":{"platform":"mt5","environment":"demo","traderLogin":"1300083764","symbolName":"XAUUSD","symbolId":"41",
+                  "mt5":{"login":"1300083764","password":"demopass","server":"JustMarkets-Demo6"}},
+                  "strategy":{"symbol":{"name":"XAUUSD","digits":2,"tickSize":0.01,"tickValue":1.0,"contractSize":100.0,
+                  "volumeStep":0.01,"volumeMin":0.01,"volumeMax":100.0},"range":{"lower":4336.0,"upper":4337.0},
+                  "lotProgression":{"initialLot":0.01,"lotIncrement":0.01},"riskLimits":{"maxOrders":20,"maxLot":1.0},
+                  "costs":{"commissionPerLotRoundTurn":0.0},"basketProfitTargetMoney":3.5}})";
+    }
+    muuk::ctrader_fix::AccountSettings a = muuk::ctrader_fix::accountFromConfigFile(file);
+    REQUIRE(a.symbolId == "41");  // the file still has it when read
+    // Saving the same MT5 account in place clears it: a symbol id is
+    // meaningless to the MT5 bridge.
+    muuk::ctrader_fix::saveAccountSettings(file, a);
+    REQUIRE(muuk::ctrader_fix::loadLiveConfig(file).connection.symbolId.empty());
+    fs::remove_all(dir);
+}

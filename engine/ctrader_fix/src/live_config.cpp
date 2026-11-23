@@ -382,11 +382,15 @@ void saveAccountSettings(const std::filesystem::path& path, const AccountSetting
         c["environment"] = a.environment;
         c["traderLogin"] = a.traderLogin;  // the MT5 account number (only a label here)
         c["symbolName"] = a.symbolName;
+        // A symbol id belongs to a cTrader broker's symbol list: it is
+        // meaningless to the MT5 bridge (which always reports "1"), and
+        // a stale one makes the runner ignore its own positions as
+        // "other symbols". Never keep it on an MT5 file.
+        c["symbolId"] = "";
         if (copyFrom) {
             // A new MT5 file never inherits another account's FIX login.
             c.erase("password");
             c.erase("brokerUid");
-            c["symbolId"] = "";
         }
         std::error_code ec;
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);

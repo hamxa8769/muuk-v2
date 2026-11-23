@@ -662,7 +662,12 @@ void LiveRunner::run() {
 }
 
 void LiveRunner::resolveSymbol() {
-    if (!config_.connection.symbolId.empty()) {
+    // A stored symbol id belongs to one broker's symbol list. On MT5
+    // the bridge always reports the symbol as "1", so a stale cTrader
+    // id in the config would make the runner drop its own positions
+    // and orders as "other symbols" (and declare every fill "closed
+    // outside the bot"). MT5 therefore always resolves by name.
+    if (!config_.connection.isMt5() && !config_.connection.symbolId.empty()) {
         // Already known (e.g. from the same cTrader FIX API settings
         // screen the connection details came from) — skip the
         // SecurityListRequest round-trip entirely.
