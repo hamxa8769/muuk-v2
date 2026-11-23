@@ -267,12 +267,15 @@ TEST_CASE("Updater batch waits for the running app and copies the release (Windo
     // and run with "-n N 127.0.0.1" it lives (N - 1) seconds then exits.
     // (Copying cmd.exe instead was flaky on the runner -- run #13 failed
     // the copy with no further detail -- so ping.exe is used for both.)
+    // Overwrite: the test case runs once per section (Catch2), and the
+    // previous run cleanup can leave the file behind, so a stale
+    // destination must not fail the copy.
     const fs::path pingExe = fs::path(comspec).parent_path() / "ping.exe";
     const auto copyWithRetry = [&](const fs::path& from, const fs::path& to) {
         bool ok = false;
         for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
             ec.clear();
-            ok = fs::copy_file(from, to, ec);
+            ok = fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
             if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         return ok;
