@@ -31,6 +31,7 @@ StrategyConfig baseConfig(const SymbolSpec& spec) {
     cfg.riskLimits.maxLot = Volume::fromDouble(10.0, spec);
     cfg.basketProfitTargetMoney = 0.0; // disabled unless a test overrides it
     cfg.maxRejectRetries = 3;
+    cfg.shiftAfterFills = 0;  // the proposal tests pin the fixed range; the shift has its own tests below
     return cfg;
 }
 
@@ -952,4 +953,181 @@ TEST_CASE("Break-even escape: from the set level on, the target drops to the esc
     // Survives export/restore.
     EngineState saved = engine.exportState();
     REQUIRE(saved.filledLevel == 2);
+}
+
+
+TEST_CASE("shiftAfterFills=2: after every 2 fills the range widens by $1 around the same center") {
+    const SymbolSpec spec = xauusdSpec();
+    StrategyConfig cfg = baseConfig(spec);
+    cfg.range = RangeConfig{Price::fromDouble(4336.00, spec), Price::fromDouble(4338.00, spec)};
+    cfg.shiftAfterFills = 2;  // the default
+    cfg.shiftStepPoints = 1.0;
+    cfg.shiftMaxGap = 15.0;
+    StrategyEngine engine(cfg);
+
+    const CommandBatch initial = engine.start();
+    REQUIRE(initial.size() == 2);
+    const OrderId buyId = placeCmd(initial, 0).id;   // Buy Stop @4338, seq1
+    const OrderId sellId = placeCmd(initial, 1).id;  // Sell Stop @4336, seq2
+    REQUIRE(placeCmd(initial, 0).price == Price::fromDouble(4338.00, spec));
+    REQUIRE(placeCmd(initial, 1).price == Price::fromDouble(4336.00, spec));
+
+    // Fill 1 (Buy): no shift yet; the Sell Stop is already pending, so nothing new.
+    CommandBatch out = engine.onOrderConfirmed(OrderConfirmedEvent{buyId, Price::fromDouble(4338.00, spec)});
+    REQUIRE(out.empty());
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.00, spec));
+
+    // Fill 2 (Sell): the range widens $2 -> $3 around 4337, and the fresh
+    // Buy Stop is armed at the new upper boundary.
+    out = engine.onOrderConfirmed(OrderConfirmedEvent{sellId, Price::fromDouble(4336.00, spec)});
+    REQUIRE(out.size() == 1);
+    REQUIRE(placeCmd(out, 0).side == OrderSide::BuyStop);
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4338.50, spec));
+    REQUIRE(engine.currentRange().lowerBound == Price::fromDouble(4335.50, spec));
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.50, spec));
+    const OrderId buy2Id = placeCmd(out, 0).id;
+
+    // Fill 3 (Buy @4338.50): no shift; the Sell Stop is armed at the (widened) lower boundary.
+    out = engine.onOrderConfirmed(OrderConfirmedEvent{buy2Id, Price::fromDouble(4338.50, spec)});
+    REQUIRE(out.size() == 1);
+    REQUIRE(placeCmd(out, 0).side == OrderSide::SellStop);
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4335.50, spec));
+    const OrderId sell2Id = placeCmd(out, 0).id;
+
+    // Fill 4 (Sell @4335.50): the range widens $3 -> $4 around 4337.
+    out = engine.onOrderConfirmed(OrderConfirmedEvent{sell2Id, Price::fromDouble(4335.50, spec)});
+    REQUIRE(out.size() == 1);
+    REQUIRE(placeCmd(out, 0).side == OrderSide::BuyStop);
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4339.00, spec));
+    REQUIRE(engine.currentRange().lowerBound == Price::fromDouble(4335.00, spec));
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4339.00, spec));
+}
+
+TEST_CASE("shiftAfterFills=1: the shift moves the still-pending opposite order out to the new boundary") {
+    const SymbolSpec spec = xauusdSpec();
+    StrategyConfig cfg = baseConfig(spec);
+    cfg.range = RangeConfig{Price::fromDouble(4336.00, spec), Price::fromDouble(4338.00, spec)};
+    cfg.shiftAfterFills = 1;
+    StrategyEngine engine(cfg);
+
+    const CommandBatch initial = engine.start();
+    const OrderId buyId = placeCmd(initial, 0).id;
+    const OrderId sellId = placeCmd(initial, 1).id;
+
+    // Fill 1 (Buy): the range widens at once, so the still-pending Sell
+    // Stop is cancelled and re-placed at the new lower boundary (same
+    // sequence, new id); nothing else is armed, the Sell side is covered.
+    CommandBatch out = engine.onOrderConfirmed(OrderConfirmedEvent{buyId, Price::fromDouble(4338.00, spec)});
+    REQUIRE(out.size() == 2);
+    REQUIRE(std::holds_alternative<CancelOrderCommand>(out[0]));
+    REQUIRE(std::get<CancelOrderCommand>(out[0]).id == sellId);
+    REQUIRE(placeCmd(out, 1).side == OrderSide::SellStop);
+    REQUIRE(placeCmd(out, 1).sequenceIndex == 2);
+    REQUIRE(placeCmd(out, 1).price == Price::fromDouble(4335.50, spec));
+    REQUIRE(engine.currentRange().lowerBound == Price::fromDouble(4335.50, spec));
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.50, spec));
+    REQUIRE(engine.activeOrderCount() == 1);
+}
+
+TEST_CASE("shiftMaxGap caps the range and the shift goes quiet once the cap is reached") {
+    const SymbolSpec spec = xauusdSpec();
+    StrategyConfig cfg = baseConfig(spec);
+    cfg.range = RangeConfig{Price::fromDouble(4336.00, spec), Price::fromDouble(4338.00, spec)};
+    cfg.shiftAfterFills = 1;
+    cfg.shiftStepPoints = 5.0;
+    cfg.shiftMaxGap = 4.0;
+    StrategyEngine engine(cfg);
+
+    const CommandBatch initial = engine.start();
+    const OrderId buyId = placeCmd(initial, 0).id;
+
+    // Fill 1: $2 -> $4 (the step would ask for $7, the cap says $4).
+    CommandBatch out = engine.onOrderConfirmed(OrderConfirmedEvent{buyId, Price::fromDouble(4338.00, spec)});
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4339.00, spec));
+    REQUIRE(engine.currentRange().lowerBound == Price::fromDouble(4335.00, spec));
+    // The pending Sell Stop moved to the new lower boundary.
+    REQUIRE(placeCmd(out, 1).price == Price::fromDouble(4335.00, spec));
+    const OrderId sellId = placeCmd(out, 1).id;
+
+    // Fill 2 (the moved Sell Stop): already at the $4 cap, so the shift
+    // does nothing -- just the normal re-arm at the unchanged boundary.
+    out = engine.onOrderConfirmed(OrderConfirmedEvent{sellId, Price::fromDouble(4335.00, spec)});
+    REQUIRE(out.size() == 1);
+    REQUIRE(placeCmd(out, 0).side == OrderSide::BuyStop);
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4339.00, spec));
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4339.00, spec));
+}
+
+TEST_CASE("shiftAfterFills=0 never widens the range") {
+    const SymbolSpec spec = xauusdSpec();
+    StrategyConfig cfg = baseConfig(spec);
+    cfg.range = RangeConfig{Price::fromDouble(4336.00, spec), Price::fromDouble(4338.00, spec)};
+    cfg.shiftAfterFills = 0;
+    StrategyEngine engine(cfg);
+
+    const CommandBatch initial = engine.start();
+    const OrderId buyId = placeCmd(initial, 0).id;
+    const OrderId sellId = placeCmd(initial, 1).id;
+    CommandBatch out = engine.onOrderConfirmed(OrderConfirmedEvent{buyId, Price::fromDouble(4338.00, spec)});
+    REQUIRE(out.empty());
+    out = engine.onOrderConfirmed(OrderConfirmedEvent{sellId, Price::fromDouble(4336.00, spec)});
+    REQUIRE(out.size() == 1);
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4338.00, spec));
+    REQUIRE(engine.currentRange().lowerBound == Price::fromDouble(4336.00, spec));
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.00, spec));
+}
+
+TEST_CASE("a new cycle starts from the configured range again after a shift") {
+    const SymbolSpec spec = xauusdSpec();
+    StrategyConfig cfg = baseConfig(spec);
+    cfg.range = RangeConfig{Price::fromDouble(4336.00, spec), Price::fromDouble(4338.00, spec)};
+    cfg.shiftAfterFills = 1;
+    StrategyEngine engine(cfg);
+
+    const CommandBatch initial = engine.start();
+    const OrderId buyId = placeCmd(initial, 0).id;
+    engine.onOrderConfirmed(OrderConfirmedEvent{buyId, Price::fromDouble(4338.00, spec)});
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.50, spec));
+
+    engine.stopCycle();
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.00, spec));
+    REQUIRE(engine.currentRange().lowerBound == Price::fromDouble(4336.00, spec));
+    const CommandBatch fresh = engine.start();
+    REQUIRE(placeCmd(fresh, 0).price == Price::fromDouble(4338.00, spec));
+    REQUIRE(placeCmd(fresh, 1).price == Price::fromDouble(4336.00, spec));
+}
+
+TEST_CASE("exportState/restoreState carries the shifted range and the fill count") {
+    const SymbolSpec spec = xauusdSpec();
+    StrategyConfig cfg = baseConfig(spec);
+    cfg.range = RangeConfig{Price::fromDouble(4336.00, spec), Price::fromDouble(4338.00, spec)};
+    cfg.shiftAfterFills = 2;
+    StrategyEngine engine(cfg);
+
+    const CommandBatch initial = engine.start();
+    const OrderId buyId = placeCmd(initial, 0).id;
+    const OrderId sellId = placeCmd(initial, 1).id;
+    engine.onOrderConfirmed(OrderConfirmedEvent{buyId, Price::fromDouble(4338.00, spec)});
+    engine.onOrderConfirmed(OrderConfirmedEvent{sellId, Price::fromDouble(4336.00, spec)});
+    REQUIRE(engine.currentRange().upperBound == Price::fromDouble(4338.50, spec));
+
+    EngineState saved = engine.exportState();
+    REQUIRE(saved.range.upperBound == Price::fromDouble(4338.50, spec));
+    REQUIRE(saved.fillsThisCycle == 2);
+    REQUIRE(saved.pendingOrders.size() == 1);
+
+    StrategyEngine restored(cfg);
+    restored.restoreState(saved);
+    REQUIRE(restored.currentRange().upperBound == Price::fromDouble(4338.50, spec));
+    REQUIRE(restored.status() == EngineStatus::Active);
+    // One more fill (3rd) does not shift; the 4th does -- the count survived.
+    const OrderId buy2Id = saved.pendingOrders[0].order.id;
+    CommandBatch out = restored.onOrderConfirmed(OrderConfirmedEvent{buy2Id, Price::fromDouble(4338.50, spec)});
+    REQUIRE(restored.currentRange().upperBound == Price::fromDouble(4338.50, spec));
+    REQUIRE(out.size() == 1);
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4335.50, spec));
+    const OrderId sell2Id = placeCmd(out, 0).id;
+    out = restored.onOrderConfirmed(OrderConfirmedEvent{sell2Id, Price::fromDouble(4335.50, spec)});
+    REQUIRE(restored.currentRange().upperBound == Price::fromDouble(4339.00, spec));
+    REQUIRE(placeCmd(out, 0).price == Price::fromDouble(4339.00, spec));
 }

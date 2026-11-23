@@ -64,6 +64,17 @@ struct StrategyConfig {
     // breach of the basket profit target still closes everything as usual.
     bool reArmOnFill = true;
 
+    // Shift the range out after every N fills (0 = off; default 2): both
+    // boundary orders move out around the same center, the gap widening
+    // by shiftStepPoints (at least $1.00) but never past shiftMaxGap, so
+    // the bot stops trading the same trapped range and opens fewer,
+    // wider cycles. Mirrors the brain replay's shiftAfterFills/stepAtr/
+    // maxGap (market_brain_v2.cpp), but with a fixed $ step: the live
+    // engine owns no ATR.
+    int shiftAfterFills = 2;
+    double shiftStepPoints = 1.0;
+    double shiftMaxGap = 15.0;
+
     // 0 (default): start()/restart() arm both full-width boundary orders
     // immediately, at range.upperBound/lowerBound exactly as configured.
     //
@@ -118,6 +129,8 @@ struct EngineState {
     // Deepest level filled this cycle. <0 = unknown (older state file):
     // estimated on restore.
     int filledLevel = -1;
+    // Fills this cycle (drives the range shift; 0 in older state files).
+    int fillsThisCycle = 0;
 };
 
 // Deterministic, I/O-free strategy state machine implementing the
@@ -209,7 +222,7 @@ public:
     [[nodiscard]] BasketPnlResult lastBasketPnl() const { return lastBasketPnl_; }
     // The range currently in force -- differs from the configured one once
     // seed-anchor mode has re-derived it from a real fill.
-    [[nodiscard]] RangeConfig currentRange() const { return config_.range; }
+    [[nodiscard]] RangeConfig currentRange() const { return range_; }
     [[nodiscard]] bool seeding() const { return seeding_; }
 
     // Snapshot of the cycle in progress, and the reverse: restoreState()
@@ -252,6 +265,7 @@ private:
     };
 
     [[nodiscard]] Price boundaryPriceForSide(OrderSide side) const;
+    void shiftRangeOut(CommandBatch& out);
     [[nodiscard]] OrderId allocateOrderId() { return nextOrderId_++; }
     void resetCycleState();
     CommandBatch armInitialOrders();
@@ -286,6 +300,8 @@ private:
     double swapMoneyAccrued_ = 0.0;
     double commissionAccrued_ = 0.0;
     int filledLevel_ = 0;
+    RangeConfig range_;  // the range in force (config_.range, widened by the shift)
+    int fillsThisCycle_ = 0;
     BasketPnlResult lastBasketPnl_{};
 };
 

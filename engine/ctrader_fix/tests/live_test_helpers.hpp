@@ -54,6 +54,7 @@ inline LiveConfig testConfig(const MockFixServer& server) {
     cfg.strategy.riskLimits.maxOrders = 100;
     cfg.strategy.riskLimits.maxLot = Volume::fromDouble(10.0, spec);
     cfg.strategy.basketProfitTargetMoney = 0.0;  // disabled: keep this test focused on order flow
+    cfg.strategy.shiftAfterFills = 0;  // pin the fixed range: these tests check order flow, the shift has its own engine tests
     cfg.connection.syncPositionsOnConnect = false;  // the mock broker only answers it in the sync test
     return cfg;
 }

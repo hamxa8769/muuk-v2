@@ -5,10 +5,10 @@
 
 namespace muuk::core {
 
-StrategyEngine::StrategyEngine(StrategyConfig config) : config_(config) {}
+StrategyEngine::StrategyEngine(StrategyConfig config) : config_(config), range_(config.range) {}
 
 Price StrategyEngine::boundaryPriceForSide(OrderSide side) const {
-    return side == OrderSide::BuyStop ? config_.range.upperBound : config_.range.lowerBound;
+    return side == OrderSide::BuyStop ? range_.upperBound : range_.lowerBound;
 }
 
 void StrategyEngine::resetCycleState() {
@@ -20,6 +20,8 @@ void StrategyEngine::resetCycleState() {
     swapMoneyAccrued_ = 0.0;
     commissionAccrued_ = 0.0;
     filledLevel_ = 0;
+    range_ = config_.range;
+    fillsThisCycle_ = 0;
     lastBasketPnl_ = BasketPnlResult{};
     seeding_ = false;
 }
@@ -144,6 +146,7 @@ void StrategyEngine::reconfigure(const StrategyConfig& config) {
     assert((status_ == EngineStatus::Idle || status_ == EngineStatus::Completed) &&
            "reconfigure() is only valid while no cycle is running");
     config_ = config;
+    range_ = config.range;
 }
 
 void StrategyEngine::updateExitRules(const StrategyConfig& config) {
@@ -211,7 +214,7 @@ BasketPnlResult StrategyEngine::evaluateBasketPnl(const TickEvent& tick) const {
 EngineState StrategyEngine::exportState() const {
     EngineState s;
     s.status = status_;
-    s.range = config_.range;
+    s.range = range_;
     for (const auto& armed : pendingOrders_) s.pendingOrders.push_back(EngineState::Armed{armed.order, armed.retryCount});
     s.buyVolumeSteps = buyAggregate_.totalVolumeSteps;
     s.buySumEntryPriceTicksVolume = buyAggregate_.sumEntryPriceTicksVolume;
@@ -224,6 +227,7 @@ EngineState StrategyEngine::exportState() const {
     s.swapMoneyAccrued = swapMoneyAccrued_;
     s.commissionAccrued = commissionAccrued_;
     s.filledLevel = filledLevel_;
+    s.fillsThisCycle = fillsThisCycle_;
     return s;
 }
 
@@ -233,6 +237,7 @@ void StrategyEngine::restoreState(const EngineState& s) {
     // An idle state has no range of its own -- the next start() uses the
     // configured one, so keep it.
     if (s.status != EngineStatus::Idle) config_.range = s.range;
+    range_ = config_.range;
     for (const auto& armed : s.pendingOrders) pendingOrders_.push_back(ArmedOrder{armed.order, armed.retryCount});
     buyAggregate_ = SideAggregate{s.buyVolumeSteps, s.buySumEntryPriceTicksVolume};
     sellAggregate_ = SideAggregate{s.sellVolumeSteps, s.sellSumEntryPriceTicksVolume};
@@ -244,6 +249,7 @@ void StrategyEngine::restoreState(const EngineState& s) {
     filledLevel_ = s.filledLevel >= 0
                        ? s.filledLevel
                        : std::max(0, s.nextSequenceIndex - 1 - static_cast<int>(s.pendingOrders.size()));
+    fillsThisCycle_ = s.fillsThisCycle;
     if (s.commissionAccrued >= 0.0) {
         commissionAccrued_ = s.commissionAccrued;
     } else {
@@ -319,6 +325,33 @@ CommandBatch StrategyEngine::onTick(const TickEvent& tick) {
     return out;
 }
 
+void StrategyEngine::shiftRangeOut(CommandBatch& out) {
+    const int64_t gapNow = range_.upperBound.ticks - range_.lowerBound.ticks;
+    const int64_t stepTicks =
+        std::max<int64_t>(1, Price::fromDouble(config_.shiftStepPoints, config_.symbol).ticks);
+    const int64_t minWidenTicks = std::max<int64_t>(1, Price::fromDouble(1.0, config_.symbol).ticks);
+    const int64_t maxGapTicks = Price::fromDouble(config_.shiftMaxGap, config_.symbol).ticks;
+    const int64_t wider = std::min(maxGapTicks, std::max(gapNow + stepTicks, gapNow + minWidenTicks));
+    if (wider <= gapNow) return;  // already at the cap: nothing to move
+    const int64_t center = (range_.lowerBound.ticks + range_.upperBound.ticks) / 2;
+    range_.lowerBound = Price{center - wider / 2};
+    range_.upperBound = Price{range_.lowerBound.ticks + wider};
+    // Move every still-pending order out to the new boundary (same side
+    // and sequence, new id); the re-arm below arms the other side if it
+    // has none pending. Re-arming appends to the back of pendingOrders_,
+    // so take the front each time: the loop runs once per order that was
+    // pending when the shift started, never once per order it just made.
+    const std::size_t toMove = pendingOrders_.size();
+    for (std::size_t n = 0; n < toMove; ++n) {
+        const ArmedOrder armed = pendingOrders_[0];
+        out.push_back(CancelOrderCommand{armed.order.id});
+        pendingOrders_.erase_at(0);
+        if (status_ != EngineStatus::HaltedByRisk) {
+            tryArmOrder(out, armed.order.side, armed.order.sequenceIndex, 0,
+                        boundaryPriceForSide(armed.order.side));
+        }
+    }
+}
 CommandBatch StrategyEngine::onOrderConfirmed(const OrderConfirmedEvent& event) {
     CommandBatch out;
 
@@ -339,6 +372,7 @@ CommandBatch StrategyEngine::onOrderConfirmed(const OrderConfirmedEvent& event) 
     pendingOrders_.erase_at(foundIndex);
 
     filledLevel_ = std::max(filledLevel_, armed.order.sequenceIndex);
+    ++fillsThisCycle_;
 
     // Gross P/L is measured from the price each order was *meant* to fill
     // at, and the gap to the actual fill is charged separately as slippage
@@ -380,18 +414,25 @@ CommandBatch StrategyEngine::onOrderConfirmed(const OrderConfirmedEvent& event) 
         }
         pendingOrders_.clear();
 
-        const int64_t width = config_.range.upperBound.ticks - config_.range.lowerBound.ticks;
+        const int64_t width = range_.upperBound.ticks - range_.lowerBound.ticks;
         if (armed.order.side == OrderSide::BuyStop) {
-            config_.range.upperBound = event.fillPrice;
-            config_.range.lowerBound = Price{event.fillPrice.ticks - width};
+            range_.upperBound = event.fillPrice;
+            range_.lowerBound = Price{event.fillPrice.ticks - width};
         } else {
-            config_.range.lowerBound = event.fillPrice;
-            config_.range.upperBound = Price{event.fillPrice.ticks + width};
+            range_.lowerBound = event.fillPrice;
+            range_.upperBound = Price{event.fillPrice.ticks + width};
         }
     }
 
     if (!config_.reArmOnFill) {
         return out;
+    }
+
+    // After every shiftAfterFills fills, the range steps out around the
+    // same center (see shiftRangeOut): the bot stops trading the same
+    // trapped range.
+    if (config_.shiftAfterFills > 0 && fillsThisCycle_ % config_.shiftAfterFills == 0) {
+        shiftRangeOut(out);
     }
 
     // Proposal §3/§4: a fill arms the *opposite* side's next order (never

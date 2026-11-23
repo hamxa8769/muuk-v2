@@ -255,6 +255,9 @@ struct LiveConfig {
 // engine types or the credentials.
 struct LiveSettings {
     double rangeWidth = 2.0;     // $ between the two boundaries
+    int shiftAfterFills = 2;      // fills per range shift; 0 = never shift
+    double shiftStepPoints = 1.0; // $ the gap widens per shift
+    double shiftMaxGap = 15.0;    // $ the gap never grows past
     double seedOffset = 0.0;     // $ beyond bid/ask for the two seed orders (0 = no seeding)
     double initialLot = 0.01;
     double lotIncrement = 0.01;

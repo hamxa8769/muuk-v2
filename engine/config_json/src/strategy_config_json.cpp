@@ -74,6 +74,9 @@ StrategyConfig parseStrategyConfig(const nlohmann::json& j) {
     cfg.maxRejectRetries = j.value("maxRejectRetries", cfg.maxRejectRetries);
     cfg.reArmOnFill = j.value("reArmOnFill", cfg.reArmOnFill);
     cfg.seedOffsetPoints = j.value("seedOffsetPoints", cfg.seedOffsetPoints);
+    cfg.shiftAfterFills = j.value("shiftAfterFills", cfg.shiftAfterFills);
+    cfg.shiftStepPoints = j.value("shiftStepPoints", cfg.shiftStepPoints);
+    cfg.shiftMaxGap = j.value("shiftMaxGap", cfg.shiftMaxGap);
     cfg.startSide = parseStartSide(j.value("startSide", std::string("both")));
 
     return cfg;

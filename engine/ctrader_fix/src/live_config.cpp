@@ -190,6 +190,9 @@ LiveSettings settingsFromConfig(const LiveConfig& config) {
                        ? config.connection.autoRangeWidthPoints
                        : (config.strategy.range.upperBound - config.strategy.range.lowerBound).toDouble(spec);
     s.seedOffset = config.strategy.seedOffsetPoints;
+    s.shiftAfterFills = config.strategy.shiftAfterFills;
+    s.shiftStepPoints = config.strategy.shiftStepPoints;
+    s.shiftMaxGap = config.strategy.shiftMaxGap;
     s.initialLot = config.strategy.lotProgression.initialLot.toDouble(spec);
     s.lotIncrement = config.strategy.lotProgression.lotIncrement.toDouble(spec);
     s.lotMultiplier = config.strategy.lotProgression.multiplier;
@@ -235,6 +238,9 @@ void applySettingsToConfig(LiveConfig& config, const LiveSettings& s) {
     st.range = RangeConfig{Price{center - halfWidth}, Price{center + halfWidth}};
 
     st.seedOffsetPoints = s.seedOffset;
+    st.shiftAfterFills = std::max(0, s.shiftAfterFills);
+    st.shiftStepPoints = std::clamp(s.shiftStepPoints, 0.1, 100.0);
+    st.shiftMaxGap = std::clamp(s.shiftMaxGap, 0.1, 1000.0);
     st.lotProgression = LotProgressionConfig{Volume::fromDouble(s.initialLot, spec),
                                               Volume::fromDouble(s.lotIncrement, spec), s.lotMultiplier};
     st.basketProfitTargetMoney = s.profitTarget;
@@ -454,6 +460,9 @@ void saveLiveSettings(const std::filesystem::path& path, const LiveSettings& s) 
 
     auto& st = j["strategy"];
     st["seedOffsetPoints"] = s.seedOffset;
+    st["shiftAfterFills"] = s.shiftAfterFills;
+    st["shiftStepPoints"] = s.shiftStepPoints;
+    st["shiftMaxGap"] = s.shiftMaxGap;
     st["startSide"] = muuk::config_json::startSideToString(s.startSide);
     st["basketProfitTargetMoney"] = s.profitTarget;
     st["basketStopLossMoney"] = s.stopLoss;

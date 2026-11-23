@@ -463,6 +463,9 @@ void settingInt(const char* label, const char* help, int* v, bool* dirty) {
 void clampSettings(LiveSettings& s) {
     s.rangeWidth = std::max(0.05, s.rangeWidth);
     s.seedOffset = std::max(0.0, s.seedOffset);
+    s.shiftAfterFills = std::clamp(s.shiftAfterFills, 0, 20);
+    s.shiftStepPoints = std::clamp(s.shiftStepPoints, 0.25, 100.0);
+    s.shiftMaxGap = std::max(0.1, s.shiftMaxGap);
     s.initialLot = std::max(0.01, s.initialLot);
     s.lotIncrement = std::max(0.0, s.lotIncrement);
     s.lotMultiplier = std::clamp(s.lotMultiplier, 1.0, 5.0);
@@ -665,7 +668,7 @@ void basketLegsTable(const BasketRecord& b, bool inProgress) {
             ImGui::TextDisabled("--");
         } else {
             ImGui::TextColored(pnlColor(leg.net), "%s", money(leg.net).c_str());
-            ImGui::SetItemTooltip("Gross %s - commission $%.2f", money(leg.gross).c_str(), leg.commission);
+            ImGui::SetItemTooltip("Gross %s - commission %s", money(leg.gross).c_str(), amount(leg.commission).c_str());
         }
         ImGui::TableNextColumn();
         ImGui::TextDisabled("%s%s%s", timeOf(leg.openedAt).c_str(), open ? "" : "  -  ",
@@ -1392,7 +1395,7 @@ void DashboardWindow::renderKpiCards(const std::optional<LiveSnapshot>& snap, bo
          snap ? "Range " + price(snap->rangeLower) + " - " + price(snap->rangeUpper) : "", Tab::Settings,
          "Settings (range width, entry offset)");
     card("k_float", "NET P/L (AFTER COSTS)", connected ? money(shownFloating) : std::string("--"), pnlColor(floating),
-         connected && snap ? "Gross " + money(snap->live.gross) + " | costs $" + price(snap->live.costs())
+         connected && snap ? "Gross " + money(snap->live.gross) + " | costs " + money(-snap->live.costs())
                            : std::string(""),
          Tab::Positions, "Positions");
     card("k_pos", "OPEN POSITIONS", snap ? std::to_string(snap->positions.size()) : std::string("--"), text,
@@ -1713,6 +1716,16 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
                               &e.rangeMaxWidth, 0.5, "%.2f", &settingsDirty_);
                 e.rangeMaxWidth = std::clamp(e.rangeMaxWidth, std::max(0.1, s.rangeWidth), 1000.0);
             }
+        settingInt("Shift range after N fills (0 = off)",
+                   "After this many fills the range steps out around the same center, the gap widening by the step below (at most the widest shifted range) -- the bot stops trading the same trapped range and opens fewer, wider cycles. 2 = after every 2nd fill.",
+                   &s.shiftAfterFills, &settingsDirty_);
+        s.shiftAfterFills = std::clamp(s.shiftAfterFills, 0, 20);
+        settingDouble("  shift step ($)", "Each shift widens the gap by this much (at least $1.00).",
+                      &s.shiftStepPoints, 0.25, "%.2f", &settingsDirty_);
+        s.shiftStepPoints = std::clamp(s.shiftStepPoints, 0.25, 100.0);
+        settingDouble("  widest shifted range ($)", "A shifted range never gets wider than this, even as it keeps stepping out.",
+                      &s.shiftMaxGap, 0.5, "%.2f", &settingsDirty_);
+        s.shiftMaxGap = std::clamp(s.shiftMaxGap, std::max(0.1, s.rangeWidth), 1000.0);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::AlignTextToFramePadding();
@@ -2448,7 +2461,7 @@ void DashboardWindow::renderHistoryTab(LiveController& controller, const std::op
              text);
         stat("IN PROFIT", winRate, text);
         stat("NET P/L (ALL TIME)", money(net), pnlColor(net));
-        stat("COMMISSION PAID", "$" + price(commission), commission > 0.005 ? kAmber : text);
+        stat("COMMISSION PAID", amount(commission), commission > 0.005 ? kAmber : text);
         stat("BEST / WORST", money(best) + "  /  " + money(worst), text);
         ImGui::EndTable();
     }
@@ -2821,7 +2834,7 @@ void DashboardWindow::renderVolumeTab() {
         ImGui::TextColored(kRed, "%s", lots(b.lostLots).c_str());
         ImGui::TableNextColumn();
         if (b.commission > 0.005) {
-            ImGui::TextColored(kAmber, "-$%.2f", b.commission);
+            ImGui::TextColored(kAmber, "%s", money(-b.commission).c_str());
         } else {
             ImGui::TextDisabled("$0.00");
         }

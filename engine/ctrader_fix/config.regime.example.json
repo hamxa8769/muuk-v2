@@ -89,6 +89,9 @@
       "profit": 0.5
     },
     "reArmOnFill": true,
+    "shiftAfterFills": 2,
+    "shiftStepPoints": 1.0,
+    "shiftMaxGap": 15.0,
     "startSide": "both",
     "lastLotTarget": {
       "enabled": true,
