@@ -152,8 +152,12 @@ std::string buildUpdateBatch(const std::string& appDir, const std::string& extra
     bat += "rem robocopy exit codes 0-7 mean success (copied, or nothing to do); 8+ is a failure.\r\n";
     bat += "if %RC% GEQ 8 goto give_up\r\n";
     bat += "echo Restarting %EXE_NAME%... >> \"%LOG%\"\r\n";
+    bat += "if not exist \"%APP_DIR%\\%EXE_NAME%\" goto no_restart\r\n";
     bat += "start \"\" \"%APP_DIR%\\%EXE_NAME%\"\r\n";
     bat += "echo start exit code: %ERRORLEVEL% >> \"%LOG%\"\r\n";
+    bat += "goto done\r\n";
+    bat += ":no_restart\r\n";
+    bat += "echo %EXE_NAME% not found in %APP_DIR% -- not restarted >> \"%LOG%\"\r\n";
     bat += "goto done\r\n";
     bat += ":give_up\r\n";
     bat += "set \"FAILED=1\"\r\n";
