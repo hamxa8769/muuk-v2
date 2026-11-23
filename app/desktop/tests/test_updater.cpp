@@ -267,7 +267,9 @@ TEST_CASE("Updater batch waits for the running app and copies the release (Windo
     wchar_t comspec[MAX_PATH]{};
     REQUIRE(GetEnvironmentVariableW(L"COMSPEC", comspec, static_cast<DWORD>(std::size(comspec))) > 0);
     const fs::path fakeExe = root / "muuk-upgrade-desktop.exe";
-    REQUIRE(fs::copy_file(fs::path(comspec), fakeExe, ec) && !ec);
+    const bool copied = fs::copy_file(fs::path(comspec), fakeExe, ec);
+    REQUIRE(copied);
+    REQUIRE(!ec);
 
     const auto startFakeApp = [&]() {
         // The fake app lives ~3s (ping -n 4), then exits by itself.
