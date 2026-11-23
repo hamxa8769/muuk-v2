@@ -246,10 +246,15 @@ std::string oldBatchV021(const std::string& appDir, const std::string& srcDir) {
 // muuk-upgrade-desktop.exe, kept alive by its own ping count) is started
 // first, so the batch must wait for it to exit before copying. The
 // fake app's lifetime is chosen per section: ~3s for the new batch,
-// ~90s for the regression section.
+// ~299s for the regression section.
 TEST_CASE("Updater batch waits for the running app and copies the release (Windows)") {
     namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() / "muuk_updater_batch_test";
+    // Catch2 runs this test case once per section, so each execution gets
+    // its own temp dir: a leftover file (or a still-running fake app) from
+    // one execution can never break the next one's setup.
+    static int execution = 0;
+    const fs::path root =
+        fs::temp_directory_path() / ("muuk_updater_batch_test_" + std::to_string(execution++));
     std::error_code ec;
     fs::remove_all(root, ec);
     const fs::path src = root / "src";
@@ -337,20 +342,25 @@ TEST_CASE("Updater batch waits for the running app and copies the release (Windo
 
     SECTION("v0.2.1 batch gives up while the app is still running (regression)") {
         writeFileText(root / "update.bat", oldBatchV021(app.string(), src.string()));
-        // The app stays alive ~90s, past the old batch's 60s wait budget,
-        // so the old batch must give up on its own (whether its timeout
+        // The app stays alive ~299s, far past the old batch's 60s wait
+        // budget (even if each wait iteration is slow on the runner), so
+        // the old batch must give up on its own (whether its timeout
         // ticks or fails instantly) instead of ever reaching the copy.
-        PROCESS_INFORMATION fake = startFakeApp(91);
-        const bool ran = runForTest(root / "update.bat", 120000);
+        PROCESS_INFORMATION fake = startFakeApp(300);
+        const bool ran = runForTest(root / "update.bat", 180000);
         if (!ran) {
-            std::cout << "batch did not finish in 120s; log:\n"
+            std::cout << "batch did not finish in 180s; log:\n"
                       << readFileText(root / "update.log") << "\nbatch still there: "
                       << fs::exists(root / "update.bat") << std::endl;
         }
         REQUIRE(ran);
         REQUIRE(!fs::exists(app / "newfile.txt"));  // never copied: the old batch gave up
         REQUIRE(!fs::exists(root / "update.bat"));  // the old batch always deletes itself
-        REQUIRE(waitFakeApp(fake, 60000));  // let the long-lived fake app exit before cleanup
+        // The fake app outlives the test on purpose; stop it so it does
+        // not linger and hold its exe file locked.
+        TerminateProcess(fake.hProcess, 1);
+        CloseHandle(fake.hThread);
+        CloseHandle(fake.hProcess);
     }
 
     fs::remove_all(root, ec);
