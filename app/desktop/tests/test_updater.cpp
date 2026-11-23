@@ -242,8 +242,8 @@ std::string oldBatchV021(const std::string& appDir, const std::string& srcDir) {
 }  // namespace
 
 // Runs the generated batch for real on Windows: a stand-in for the
-// running desktop app (a copy of cmd.exe renamed to
-// muuk-upgrade-desktop.exe, kept alive by a ping sleep) is started
+// running desktop app (a copy of ping.exe renamed to
+// muuk-upgrade-desktop.exe, kept alive by its own ping count) is started
 // first, so the batch must wait for it to exit before copying. The
 // fake app's lifetime is chosen per section: ~3s for the new batch,
 // ~90s for the regression section.
@@ -263,23 +263,38 @@ TEST_CASE("Updater batch waits for the running app and copies the release (Windo
 
     wchar_t comspec[MAX_PATH]{};
     REQUIRE(GetEnvironmentVariableW(L"COMSPEC", comspec, static_cast<DWORD>(std::size(comspec))) > 0);
+    // Both stand-ins are copies of ping.exe: it is a small system binary,
+    // and run with "-n N 127.0.0.1" it lives (N - 1) seconds then exits.
+    // (Copying cmd.exe instead was flaky on the runner -- run #13 failed
+    // the copy with no further detail -- so ping.exe is used for both.)
+    const fs::path pingExe = fs::path(comspec).parent_path() / "ping.exe";
+    const auto copyWithRetry = [&](const fs::path& from, const fs::path& to) {
+        bool ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+            ec.clear();
+            ok = fs::copy_file(from, to, ec);
+            if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        return ok;
+    };
     const fs::path fakeExe = root / "muuk-upgrade-desktop.exe";
-    const bool copied = fs::copy_file(fs::path(comspec), fakeExe, ec);
+    const bool copied = copyWithRetry(pingExe, fakeExe);
+    if (!copied) std::cout << "copy of ping.exe to fake app failed: " << ec.message() << std::endl;
     REQUIRE(copied);
     REQUIRE(!ec);
     // The app folder gets a stand-in for the real app exe (a copy of
     // ping.exe: it exits at once with no arguments), so the batch's
     // restart step has a real program to launch instead of failing on a
     // missing file.
-    const bool stubCopied =
-        fs::copy_file(fs::path(comspec).parent_path() / "ping.exe", app / "muuk-upgrade-desktop.exe", ec);
+    const bool stubCopied = copyWithRetry(pingExe, app / "muuk-upgrade-desktop.exe");
+    if (!stubCopied) std::cout << "copy of ping.exe to app dir failed: " << ec.message() << std::endl;
     REQUIRE(stubCopied);
     REQUIRE(!ec);
 
     const auto startFakeApp = [&](int pingCount) {
-        // The fake app lives (pingCount - 1) seconds, then exits by itself.
-        std::wstring cmd = L"\"" + fakeExe.wstring() + L"\" /c ping -n " + std::to_wstring(pingCount) +
-                           L" 127.0.0.1 >nul";
+        // The fake app IS ping.exe (renamed): it lives (pingCount - 1)
+        // seconds, then exits by itself.
+        std::wstring cmd = L"\"" + fakeExe.wstring() + L"\" -n " + std::to_wstring(pingCount) + L" 127.0.0.1";
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
