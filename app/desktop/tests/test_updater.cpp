@@ -4,9 +4,19 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <thread>
 
 #include "updater.hpp"
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace muuk::desktop::updater;
 
@@ -129,3 +139,179 @@ TEST_CASE("Updater background check settles harmlessly") {
     updater.beginInstall();
     REQUIRE(updater.state() == settled);
 }
+
+TEST_CASE("buildUpdateBatch never sleeps with timeout (v0.2.1 regression)") {
+    const std::string bat = buildUpdateBatch("C:\\Muuk", "C:\\Temp\\MuukUpdate\\extracted");
+    // The v0.2.1 batch slept with `timeout /t 1`; run with no console that
+    // command exits immediately, so the wait for the app to quit burned its
+    // whole budget in milliseconds and gave up before the app had even
+    // started quitting. The new batch sleeps with ping instead.
+    REQUIRE(bat.find("timeout /t") == std::string::npos);
+    REQUIRE(bat.find("ping -n 2 127.0.0.1") != std::string::npos);
+    // The wait is still bounded, and the app is still waited for first.
+    REQUIRE(bat.find("tasklist") != std::string::npos);
+    REQUIRE(bat.find("muuk-upgrade-desktop.exe") != std::string::npos);
+    REQUIRE(bat.find("GEQ 120") != std::string::npos);
+}
+
+TEST_CASE("buildUpdateBatch logs, keeps itself on failure, and restarts the app") {
+    const std::string bat =
+        buildUpdateBatch("C:\\Users\\Asad Khan\\Muuk", "C:\\Temp\\MuukUpdate\\extracted");
+    // Every step is logged next to the batch, so a failed update can be diagnosed.
+    REQUIRE(bat.find("update.log") != std::string::npos);
+    // The copy never overwrites the user's own configs.
+    REQUIRE(bat.find("robocopy") != std::string::npos);
+    REQUIRE(bat.find("/XF *.local.json") != std::string::npos);
+    // The robocopy exit code is captured before anything can reset it
+    // (an echo between robocopy and the check would reset ERRORLEVEL to 0).
+    const std::size_t rcSet = bat.find("set \"RC=%ERRORLEVEL%\"");
+    REQUIRE(rcSet != std::string::npos);
+    REQUIRE(bat.find("if %RC% GEQ 8 goto give_up", rcSet) != std::string::npos);
+    // Restart uses the empty-title form of start, so a path with spaces works.
+    REQUIRE(bat.find("start \"\" \"%APP_DIR%\\%EXE_NAME%\"") != std::string::npos);
+    // The batch deletes itself only on success; on failure it stays next
+    // to update.log.
+    REQUIRE(bat.find("if \"%FAILED%\"==\"1\" goto keep") != std::string::npos);
+    REQUIRE(bat.find("del \"%~f0\"") != std::string::npos);
+    // The injected folders are the ones passed in.
+    REQUIRE(bat.find("C:\\Users\\Asad Khan\\Muuk") != std::string::npos);
+    REQUIRE(bat.find("C:\\Temp\\MuukUpdate\\extracted") != std::string::npos);
+}
+
+TEST_CASE("buildUpdateCommandLine quotes the interpreter and the batch path") {
+    REQUIRE(buildUpdateCommandLine(L"C:\\Windows\\System32\\cmd.exe",
+                                   L"C:\\Users\\Asad Khan\\AppData\\Local\\Temp\\MuukUpdate\\update.bat") ==
+            L"\"C:\\Windows\\System32\\cmd.exe\" /c \"\"C:\\Users\\Asad Khan\\AppData\\Local\\Temp\\MuukUpdate\\update.bat\"\"");
+}
+
+#ifdef _WIN32
+
+namespace {
+// Runs a command line, waits up to timeoutMs, returns true when the child
+// exited on its own. Mirrors the updater's own runCommand.
+bool runForTest(const std::wstring& cmdline, DWORD timeoutMs) {
+    std::wstring mutableCmd = cmdline;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
+                       &pi)) {
+        return false;
+    }
+    const DWORD waited = WaitForSingleObject(pi.hProcess, timeoutMs);
+    if (waited != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return waited == WAIT_OBJECT_0;
+}
+
+std::string readFileText(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+void writeFileText(const std::filesystem::path& p, const std::string& text) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+
+// The v0.2.1 batch, exactly as it shipped: it sleeps with `timeout`,
+// which exits immediately in a windowless batch, so the wait for the app
+// to quit burns its whole budget in milliseconds and the update gives up
+// before the app has even started quitting.
+std::string oldBatchV021(const std::string& appDir, const std::string& srcDir) {
+    std::string bat;
+    bat += "@echo off\r\n";
+    bat += "setlocal\r\n";
+    bat += "set \"APP_DIR=" + appDir + "\"\r\n";
+    bat += "set \"SRC_DIR=" + srcDir + "\"\r\n";
+    bat += "set \"EXE_NAME=muuk-upgrade-desktop.exe\"\r\n";
+    bat += "set \"WAIT_SECS=0\"\r\n";
+    bat += ":wait_for_exit\r\n";
+    bat += "tasklist /FI \"IMAGENAME eq %EXE_NAME%\" 2>nul | find /I \"%EXE_NAME%\" >nul\r\n";
+    bat += "if errorlevel 1 goto do_copy\r\n";
+    bat += "set /a WAIT_SECS+=1\r\n";
+    bat += "if %WAIT_SECS% GEQ 60 goto give_up\r\n";
+    bat += "timeout /t 1 /nobreak >nul\r\n";
+    bat += "goto wait_for_exit\r\n";
+    bat += ":do_copy\r\n";
+    bat += "robocopy \"%SRC_DIR%\" \"%APP_DIR%\" /E /XF *.local.json /R:2 /W:2 /NFL /NDL /NJH /NJS\r\n";
+    bat += "if errorlevel 8 goto give_up\r\n";
+    bat += "start \"\" \"%APP_DIR%\\%EXE_NAME%\"\r\n";
+    bat += ":give_up\r\n";
+    bat += "(goto) 2>nul & del \"%~f0\"\r\n";
+    return bat;
+}
+}  // namespace
+
+// Runs the generated batch for real on Windows: a stand-in for the
+// running desktop app (a copy of cmd.exe renamed to
+// muuk-upgrade-desktop.exe, kept alive ~3s by a ping sleep) is started
+// first, so the batch must wait for it to exit before copying.
+TEST_CASE("Updater batch waits for the running app and copies the release (Windows)") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "muuk_updater_batch_test";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    const fs::path src = root / "src";
+    const fs::path app = root / "app";
+    fs::create_directories(src);
+    fs::create_directories(app);
+    writeFileText(src / "newfile.txt", "new");
+    writeFileText(src / "my_account.local.json", "overwrite me");
+    writeFileText(app / "my_account.local.json", "keep me");
+    writeFileText(app / "old.txt", "old");
+
+    wchar_t comspec[MAX_PATH]{};
+    REQUIRE(GetEnvironmentVariableW(L"COMSPEC", comspec, static_cast<DWORD>(std::size(comspec))) > 0);
+    const fs::path fakeExe = root / "muuk-upgrade-desktop.exe";
+    REQUIRE(fs::copy_file(fs::path(comspec), fakeExe, ec) && !ec);
+
+    const auto startFakeApp = [&]() {
+        // The fake app lives ~3s (ping -n 4), then exits by itself.
+        std::wstring cmd = L"\"" + fakeExe.wstring() + L"\" /c ping -n 4 127.0.0.1 >nul";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        REQUIRE(CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
+                               &pi) != 0);
+        return pi;
+    };
+    const auto waitFakeApp = [&](PROCESS_INFORMATION& pi) {
+        const DWORD waited = WaitForSingleObject(pi.hProcess, 15000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return waited == WAIT_OBJECT_0;
+    };
+
+    SECTION("new batch waits, copies, logs, and deletes itself") {
+        writeFileText(root / "update.bat", buildUpdateBatch(app.string(), src.string()));
+        PROCESS_INFORMATION fake = startFakeApp();
+        const bool ran = runForTest(buildUpdateCommandLine(comspec, (root / "update.bat").wstring()), 120000);
+        REQUIRE(waitFakeApp(fake));
+        REQUIRE(ran);
+        REQUIRE(readFileText(app / "newfile.txt") == "new");
+        REQUIRE(readFileText(app / "my_account.local.json") == "keep me");
+        REQUIRE(readFileText(app / "old.txt") == "old");
+        const std::string log = readFileText(root / "update.log");
+        REQUIRE(log.find("robocopy exit code: 1") != std::string::npos);
+        REQUIRE(log.find("Update finished") != std::string::npos);
+        REQUIRE(!fs::exists(root / "update.bat"));  // deleted itself on success
+    }
+
+    SECTION("v0.2.1 batch gives up while the app is still running (regression)") {
+        writeFileText(root / "update.bat", oldBatchV021(app.string(), src.string()));
+        PROCESS_INFORMATION fake = startFakeApp();
+        const bool ran = runForTest(buildUpdateCommandLine(comspec, (root / "update.bat").wstring()), 120000);
+        REQUIRE(waitFakeApp(fake));
+        REQUIRE(ran);
+        REQUIRE(!fs::exists(app / "newfile.txt"));  // never copied: gave up in milliseconds
+        REQUIRE(!fs::exists(root / "update.bat"));  // the old batch always deletes itself
+    }
+
+    fs::remove_all(root, ec);
+}
+
+#endif  // _WIN32

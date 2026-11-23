@@ -43,6 +43,21 @@ struct Version {
 [[nodiscard]] bool isNewerRelease(std::string_view latestTag, std::string_view currentVersion);
 // The release asset for a tag: "Muuk-v2.0.1-Windows.zip".
 [[nodiscard]] std::string zipAssetName(std::string_view tag);
+// Builds the update.bat text for the given app folder and extracted
+// release folder. Exposed for tests: the batch is plain text and is
+// generated the same on every platform. It runs with no console window,
+// so it must never sleep with `timeout` -- without a console that
+// command exits immediately, and the wait for the app to quit gives up
+// before the app has even started quitting (the v0.2.1 updater bug:
+// the app closed, nothing was copied, nothing restarted). The wait
+// uses `ping` instead, which sleeps fine without a console. The batch
+// logs every step to update.log next to itself and deletes itself only
+// on success, so a failure can be diagnosed from the log.
+[[nodiscard]] std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir);
+// Command line that runs a batch file through the command interpreter
+// (%COMSPEC%, usually C:\Windows\System32\cmd.exe), quoted so paths
+// with spaces work. Exposed for tests.
+[[nodiscard]] std::wstring buildUpdateCommandLine(const std::wstring& comspec, const std::wstring& batPath);
 // False for the user's own config files -- the updater must never copy
 // over one. True for everything else in the zip. Case-insensitive, and
 // the check is on the file name only (a folder named *.local.json is

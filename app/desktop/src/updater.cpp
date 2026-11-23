@@ -104,6 +104,78 @@ bool keepFileOnUpdate(std::string_view relativePath) {
     return !endsWith(lowerAscii(name), ".local.json");
 }
 
+
+// The batch the app launches and then quits for: waits until the app has
+// exited, copies the new release over the app folder (never touching the
+// user's *.local.json configs), restarts the app, and deletes itself --
+// but only on success, so a failed update leaves the batch and its log
+// behind for diagnosis.
+//
+// The batch runs with no console window, so it must never sleep with
+// `timeout`: without a console that command exits immediately, and the
+// wait loop then burns its whole budget in milliseconds and gives up
+// before the app has even started quitting (the v0.2.1 bug: download
+// fine, app closed, nothing copied, nothing restarted). The wait uses
+// `ping`, which sleeps fine with no console. Every step is logged to
+// update.log next to the batch.
+std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir) {
+    std::string bat;
+    bat += "@echo off\r\n";
+    bat += "rem Muuk self-update: copies the extracted release over the app folder, then\r\n";
+    bat += "rem restarts the app. The user's config files (*.local.json) are never overwritten.\r\n";
+    bat += "rem This batch runs with no console window: never sleep with `timeout` here,\r\n";
+    bat += "rem it exits immediately without a console. The wait below uses `ping`.\r\n";
+    bat += "setlocal\r\n";
+    bat += "set \"APP_DIR=" + appDir + "\"\r\n";
+    bat += "set \"SRC_DIR=" + extractedDir + "\"\r\n";
+    bat += "set \"LOG=%~dp0update.log\"\r\n";
+    bat += "set \"EXE_NAME=muuk-upgrade-desktop.exe\"\r\n";
+    bat += "set \"FAILED=0\"\r\n";
+    bat += "echo Muuk update started %DATE% %TIME% > \"%LOG%\"\r\n";
+    bat += "echo APP_DIR=%APP_DIR% >> \"%LOG%\"\r\n";
+    bat += "echo SRC_DIR=%SRC_DIR% >> \"%LOG%\"\r\n";
+    bat += "set \"WAIT_SECS=0\"\r\n";
+    bat += ":wait_for_exit\r\n";
+    bat += "tasklist /FI \"IMAGENAME eq %EXE_NAME%\" 2>nul | find /I \"%EXE_NAME%\" >nul\r\n";
+    bat += "if errorlevel 1 goto do_copy\r\n";
+    bat += "set /a WAIT_SECS+=1\r\n";
+    bat += "echo Waiting for %EXE_NAME% to exit (%WAIT_SECS%s) >> \"%LOG%\"\r\n";
+    bat += "if %WAIT_SECS% GEQ 120 goto give_up\r\n";
+    bat += "ping -n 2 127.0.0.1 >nul\r\n";
+    bat += "goto wait_for_exit\r\n";
+    bat += ":do_copy\r\n";
+    bat += "echo App has exited, copying the new release... >> \"%LOG%\"\r\n";
+    bat += "robocopy \"%SRC_DIR%\" \"%APP_DIR%\" /E /XF *.local.json /R:2 /W:2 /NFL /NDL /NJH /NJS >> \"%LOG%\" 2>&1\r\n";
+    bat += "set \"RC=%ERRORLEVEL%\"\r\n";
+    bat += "echo robocopy exit code: %RC% >> \"%LOG%\"\r\n";
+    bat += "rem robocopy exit codes 0-7 mean success (copied, or nothing to do); 8+ is a failure.\r\n";
+    bat += "if %RC% GEQ 8 goto give_up\r\n";
+    bat += "echo Restarting %EXE_NAME%... >> \"%LOG%\"\r\n";
+    bat += "start \"\" \"%APP_DIR%\\%EXE_NAME%\"\r\n";
+    bat += "echo start exit code: %ERRORLEVEL% >> \"%LOG%\"\r\n";
+    bat += "goto done\r\n";
+    bat += ":give_up\r\n";
+    bat += "set \"FAILED=1\"\r\n";
+    bat += "echo Update FAILED or gave up at %DATE% %TIME% -- the old app was NOT restarted. >> \"%LOG%\"\r\n";
+    bat += "goto end\r\n";
+    bat += ":done\r\n";
+    bat += "echo Update finished %DATE% %TIME% >> \"%LOG%\"\r\n";
+    bat += ":end\r\n";
+    bat += "rem On success the batch deletes itself; on failure it stays next to\r\n";
+    bat += "rem update.log so the failure can be reported.\r\n";
+    bat += "if \"%FAILED%\"==\"1\" goto keep\r\n";
+    bat += "(goto) 2>nul & del \"%~f0\"\r\n";
+    bat += ":keep\r\n";
+    return bat;
+}
+
+// Command line that runs a batch file through the command interpreter.
+// The /c argument is double-quoted (""path"") so a path with spaces
+// survives cmd's quote stripping.
+std::wstring buildUpdateCommandLine(const std::wstring& comspec, const std::wstring& batPath) {
+    return L"\"" + comspec + L"\" /c \"\"" + batPath + L"\"\"";
+}
+
 // ---- release JSON ----
 
 std::optional<ReleaseInfo> parseLatestRelease(const std::string& jsonText) {
@@ -399,37 +471,6 @@ bool fileContainsName(const std::filesystem::path& file, const std::string& name
     return false;
 }
 
-// The batch the app launches and then quits for: waits until the app has
-// exited, copies the new release over the app folder (never touching the
-// user's *.local.json configs), restarts the app, deletes itself.
-std::string buildUpdateBatch(const std::filesystem::path& app, const std::filesystem::path& extracted) {
-    const std::string appDirStr = app.string();
-    const std::string srcDirStr = extracted.string();
-    std::string bat;
-    bat += "@echo off\r\n";
-    bat += "rem Muuk self-update: copies the extracted release over the app folder, then\r\n";
-    bat += "rem restarts the app. The user's config files (*.local.json) are never overwritten.\r\n";
-    bat += "setlocal\r\n";
-    bat += "set \"APP_DIR=" + appDirStr + "\"\r\n";
-    bat += "set \"SRC_DIR=" + srcDirStr + "\"\r\n";
-    bat += "set \"EXE_NAME=muuk-upgrade-desktop.exe\"\r\n";
-    bat += "set \"WAIT_SECS=0\"\r\n";
-    bat += ":wait_for_exit\r\n";
-    bat += "tasklist /FI \"IMAGENAME eq %EXE_NAME%\" 2>nul | find /I \"%EXE_NAME%\" >nul\r\n";
-    bat += "if errorlevel 1 goto do_copy\r\n";
-    bat += "set /a WAIT_SECS+=1\r\n";
-    bat += "if %WAIT_SECS% GEQ 60 goto give_up\r\n";
-    bat += "timeout /t 1 /nobreak >nul\r\n";
-    bat += "goto wait_for_exit\r\n";
-    bat += ":do_copy\r\n";
-    bat += "robocopy \"%SRC_DIR%\" \"%APP_DIR%\" /E /XF *.local.json /R:2 /W:2 /NFL /NDL /NJH /NJS\r\n";
-    bat += "rem robocopy exit codes 0-7 mean success (copied, or nothing to do); 8+ is a failure.\r\n";
-    bat += "if errorlevel 8 goto give_up\r\n";
-    bat += "start \"\" \"%APP_DIR%\\%EXE_NAME%\"\r\n";
-    bat += ":give_up\r\n";
-    bat += "(goto) 2>nul & del \"%~f0\"\r\n";
-    return bat;
-}
 
 }  // namespace
 
@@ -552,14 +593,22 @@ void Updater::installWorker() {
             fail("the update script could not be written -- nothing was changed");
             return;
         }
-        bat << buildUpdateBatch(app, extracted);
+        bat << buildUpdateBatch(app.string(), extracted.string());
     }
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    std::wstring cmdline = L"\"" + batPath.wstring() + L"\"";
-    if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr,
-                       nullptr, &si, &pi)) {
+    // Launch through the command interpreter explicitly (a bare .bat path
+    // leaves the interpreter up to CreateProcess) and without
+    // DETACHED_PROCESS: the batch runs with no window either way, and an
+    // explicit cmd.exe /c is the documented way to run a batch file.
+    wchar_t comspecBuf[MAX_PATH]{};
+    const DWORD comspecLen =
+        GetEnvironmentVariableW(L"COMSPEC", comspecBuf, static_cast<DWORD>(std::size(comspecBuf)));
+    const std::wstring comspec = comspecLen > 0 ? comspecBuf : L"cmd.exe";
+    std::wstring cmdline = buildUpdateCommandLine(comspec, batPath.wstring());
+    if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
+                       &pi)) {
         fail("the update script could not be started -- nothing was changed");
         return;
     }
