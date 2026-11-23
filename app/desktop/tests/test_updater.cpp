@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <thread>
 
@@ -16,6 +17,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 using namespace muuk::desktop::updater;
@@ -178,30 +180,23 @@ TEST_CASE("buildUpdateBatch logs, keeps itself on failure, and restarts the app"
     REQUIRE(bat.find("C:\\Temp\\MuukUpdate\\extracted") != std::string::npos);
 }
 
-TEST_CASE("buildUpdateCommandLine quotes the interpreter and the batch path") {
-    REQUIRE(buildUpdateCommandLine(L"C:\\Windows\\System32\\cmd.exe",
-                                   L"C:\\Users\\Asad Khan\\AppData\\Local\\Temp\\MuukUpdate\\update.bat") ==
-            L"\"C:\\Windows\\System32\\cmd.exe\" /c \"\"C:\\Users\\Asad Khan\\AppData\\Local\\Temp\\MuukUpdate\\update.bat\"\"");
-}
 
 #ifdef _WIN32
 
 namespace {
 // Runs a command line, waits up to timeoutMs, returns true when the child
 // exited on its own. Mirrors the updater's own runCommand.
-bool runForTest(const std::wstring& cmdline, DWORD timeoutMs) {
-    std::wstring mutableCmd = cmdline;
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
-                       &pi)) {
-        return false;
-    }
-    const DWORD waited = WaitForSingleObject(pi.hProcess, timeoutMs);
-    if (waited != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+bool runForTest(const std::filesystem::path& batPath, DWORD timeoutMs) {
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"open";
+    info.lpFile = batPath.c_str();
+    info.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&info)) return false;
+    const DWORD waited = WaitForSingleObject(info.hProcess, timeoutMs);
+    if (waited != WAIT_OBJECT_0) TerminateProcess(info.hProcess, 1);
+    CloseHandle(info.hProcess);
     return waited == WAIT_OBJECT_0;
 }
 
@@ -291,7 +286,12 @@ TEST_CASE("Updater batch waits for the running app and copies the release (Windo
     SECTION("new batch waits, copies, logs, and deletes itself") {
         writeFileText(root / "update.bat", buildUpdateBatch(app.string(), src.string()));
         PROCESS_INFORMATION fake = startFakeApp();
-        const bool ran = runForTest(buildUpdateCommandLine(comspec, (root / "update.bat").wstring()), 120000);
+        const bool ran = runForTest(root / "update.bat", 60000);
+        if (!ran) {
+            std::cout << "batch did not finish in 60s; log:\n"
+                      << readFileText(root / "update.log") << "\nbatch still there: "
+                      << fs::exists(root / "update.bat") << std::endl;
+        }
         REQUIRE(waitFakeApp(fake));
         REQUIRE(ran);
         REQUIRE(readFileText(app / "newfile.txt") == "new");
@@ -306,7 +306,12 @@ TEST_CASE("Updater batch waits for the running app and copies the release (Windo
     SECTION("v0.2.1 batch gives up while the app is still running (regression)") {
         writeFileText(root / "update.bat", oldBatchV021(app.string(), src.string()));
         PROCESS_INFORMATION fake = startFakeApp();
-        const bool ran = runForTest(buildUpdateCommandLine(comspec, (root / "update.bat").wstring()), 120000);
+        const bool ran = runForTest(root / "update.bat", 60000);
+        if (!ran) {
+            std::cout << "batch did not finish in 60s; log:\n"
+                      << readFileText(root / "update.log") << "\nbatch still there: "
+                      << fs::exists(root / "update.bat") << std::endl;
+        }
         REQUIRE(waitFakeApp(fake));
         REQUIRE(ran);
         REQUIRE(!fs::exists(app / "newfile.txt"));  // never copied: gave up in milliseconds

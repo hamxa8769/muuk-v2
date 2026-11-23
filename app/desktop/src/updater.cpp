@@ -25,6 +25,7 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#include <shellapi.h>
 #endif
 
 namespace muuk::desktop::updater {
@@ -167,13 +168,6 @@ std::string buildUpdateBatch(const std::string& appDir, const std::string& extra
     bat += "(goto) 2>nul & del \"%~f0\"\r\n";
     bat += ":keep\r\n";
     return bat;
-}
-
-// Command line that runs a batch file through the command interpreter.
-// The /c argument is double-quoted (""path"") so a path with spaces
-// survives cmd's quote stripping.
-std::wstring buildUpdateCommandLine(const std::wstring& comspec, const std::wstring& batPath) {
-    return L"\"" + comspec + L"\" /c \"\"" + batPath + L"\"\"";
 }
 
 // ---- release JSON ----
@@ -595,25 +589,14 @@ void Updater::installWorker() {
         }
         bat << buildUpdateBatch(app.string(), extracted.string());
     }
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    // Launch through the command interpreter explicitly (a bare .bat path
-    // leaves the interpreter up to CreateProcess) and without
-    // DETACHED_PROCESS: the batch runs with no window either way, and an
-    // explicit cmd.exe /c is the documented way to run a batch file.
-    wchar_t comspecBuf[MAX_PATH]{};
-    const DWORD comspecLen =
-        GetEnvironmentVariableW(L"COMSPEC", comspecBuf, static_cast<DWORD>(std::size(comspecBuf)));
-    const std::wstring comspec = comspecLen > 0 ? comspecBuf : L"cmd.exe";
-    std::wstring cmdline = buildUpdateCommandLine(comspec, batPath.wstring());
-    if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
-                       &pi)) {
+    // Launch through the shell: it invokes cmd.exe with the quoting handled
+    // for us, and the batch runs with no window. (A hand-built cmd.exe /c
+    // command line hung on the CI runner -- the batch never ran.)
+    const HINSTANCE launched = ShellExecuteW(nullptr, L"open", batPath.c_str(), nullptr, nullptr, SW_HIDE);
+    if (reinterpret_cast<INT_PTR>(launched) <= 32) {
         fail("the update script could not be started -- nothing was changed");
         return;
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     setState(State::ReadyToInstall);  // the dashboard quits now; the batch copies and restarts us
 }
 

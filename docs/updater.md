@@ -23,9 +23,9 @@ change ships as a patch bump (0.2.0 → 0.2.1 → 0.2.2, …) with a new tag
    a real zip, and `muuk-upgrade-desktop.exe` inside it. A bad download
    is deleted and a clear error is shown — the install is never touched.
 4. **Install + restart.** The zip is unpacked to `%TEMP%\MuukUpdate\extracted`
-   and a small `update.bat` is written and launched through `cmd.exe /c`. The
-   app then quits cleanly (disconnects first, same as Disconnect). The batch
-   waits until the app has exited (up to 120 s, sleeping with `ping` — the
+   and a small `update.bat` is written and launched through the shell
+   (no window). The app then quits cleanly (disconnects first, same as
+   Disconnect). The batch waits until the app has exited (up to 120 s, sleeping with `ping` — the
    batch runs with no console window, and `timeout` does not work there: it
    exits immediately, which is why v0.2.1 closed the app but never copied
    or restarted anything), copies the new release over the app folder,

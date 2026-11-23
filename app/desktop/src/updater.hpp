@@ -54,10 +54,6 @@ struct Version {
 // logs every step to update.log next to itself and deletes itself only
 // on success, so a failure can be diagnosed from the log.
 [[nodiscard]] std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir);
-// Command line that runs a batch file through the command interpreter
-// (%COMSPEC%, usually C:\Windows\System32\cmd.exe), quoted so paths
-// with spaces work. Exposed for tests.
-[[nodiscard]] std::wstring buildUpdateCommandLine(const std::wstring& comspec, const std::wstring& batPath);
 // False for the user's own config files -- the updater must never copy
 // over one. True for everything else in the zip. Case-insensitive, and
 // the check is on the file name only (a folder named *.local.json is
