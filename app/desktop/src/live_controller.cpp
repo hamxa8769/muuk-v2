@@ -260,6 +260,7 @@ bool LiveController::startRunner(const std::string& configPath) {
     if (news_) runner_->setNewsFeed(news_);
     // The running basket survives a disconnect / app restart (see LiveRunner::setStateFile).
     runner_->setStateFile(muuk::ctrader_fix::defaultStateFile(configPath));
+    runner_->setBrainJournalFile(muuk::ctrader_fix::brainJournalFileFor(configPath));
     const std::filesystem::path historyFile = muuk::ctrader_fix::historyFileFor(configPath);
     runner_->setBasketHandler([this, historyFile](const muuk::ctrader_fix::BasketRecord& basket) {
         muuk::ctrader_fix::appendBasketHistory(historyFile, basket);  // throws on failure -- LiveRunner logs it

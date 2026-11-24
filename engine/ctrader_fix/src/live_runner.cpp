@@ -238,6 +238,20 @@ LiveSnapshot LiveRunner::snapshot() const {
     snap.marketRead = marketRead_.why;
     snap.marketScore = marketRead_.score;
     snap.brainStatus = !config_.brain.enabled ? "off" : (brain_ ? brain_->status() : "no trained brain");
+    if (brainCycleActive_) {
+        // The cycle running right now: its cell and the policy it runs on.
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "cell %d | gap %.2f | x%.1f | %d levels | exit %.2f",
+                      BrainJournal::cellIndex(brainSituation_.base), brainDecision_.gap,
+                      brainDecision_.policy.lotMultiplier, brainDecision_.policy.maxLevels,
+                      brainDecision_.policy.exitFactor);
+        snap.brainDetail = buf;
+    }
+    if (brainTallyDay_ == dayKey_) {
+        snap.brainCyclesToday = brainCyclesToday_;
+        snap.brainWinsToday = brainWinsToday_;
+        snap.brainLocksToday = brainLocksToday_;
+    }
     snap.regimeStatus = regimeStatus_;
     snap.platform = config_.connection.platform;
     snap.brokerAccount = brokerAccount_;
@@ -2498,6 +2512,7 @@ bool LiveRunner::decideBrainCycleLocked() {
         entryWait_ = "brain: " + cycle.decision.why;
         if (!brainWaitLogged_) {
             log("[brain v2] no new cycle: " + cycle.decision.why);
+            brainJournal_.appendSkip(cycle.situation, cycle.decision);
             brainWaitLogged_ = true;
         }
         return false;
@@ -3305,6 +3320,15 @@ void LiveRunner::maybeFinalizeBasket() {
             lastBasketNet_ = b.net;
             lastBasketLocked_ = locked;
             brainCycleActive_ = false;
+            // Phase 1 memory: one journal line per closed brain basket, in
+            // replay units like observeBasket. Best-effort: the journal
+            // never throws, so it cannot break basket finalization.
+            brainJournal_.appendCycle(brainSituation_, brainDecision_, b.net * brainMoneyScaleLocked(), locked,
+                                      static_cast<int>(b.legs.size()), b.closeReason);
+            brainTallyDay_ = dayKey_;
+            ++brainCyclesToday_;
+            if (b.net > 0.0) ++brainWinsToday_;
+            if (locked) ++brainLocksToday_;
         } catch (const std::exception& ex) {
             log(std::string("[brain v2] could not learn from the basket: ") + ex.what());
         }

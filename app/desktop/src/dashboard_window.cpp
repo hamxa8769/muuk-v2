@@ -1444,7 +1444,15 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
                             snap->targetMoveNow);
     }
     if (snap && connected && !snap->brainStatus.empty()) {
-        ImGui::TextDisabled("Brain: %s", snap->brainStatus.c_str());
+        if (!snap->brainDetail.empty()) {
+            ImGui::TextDisabled("Brain: %s | %s", snap->brainStatus.c_str(), snap->brainDetail.c_str());
+        } else {
+            ImGui::TextDisabled("Brain: %s", snap->brainStatus.c_str());
+        }
+        if (snap->brainStatus != "off") {
+            ImGui::TextDisabled("Brain today: %d cycles, %d wins, %d locks", snap->brainCyclesToday,
+                                snap->brainWinsToday, snap->brainLocksToday);
+        }
     }
     if (snap && connected && !snap->regimeStatus.empty()) {
         ImGui::TextDisabled("Chart: %s", snap->regimeStatus.c_str());

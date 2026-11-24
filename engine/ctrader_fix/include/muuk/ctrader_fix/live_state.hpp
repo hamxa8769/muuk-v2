@@ -112,5 +112,8 @@ void resetStateStatistics(const std::filesystem::path& file);
 // one per account file, so two accounts' baskets never mix. The first time,
 // an older shared muuk_history/baskets.jsonl is moved here.
 [[nodiscard]] std::filesystem::path historyFileFor(const std::filesystem::path& configPath);
+// That config's brain cycle journal: muuk_history/<config name>.brain_journal.jsonl --
+// one JSON line per closed brain basket / vetoed cycle (Phase 1 memory).
+[[nodiscard]] std::filesystem::path brainJournalFileFor(const std::filesystem::path& configPath);
 
 }  // namespace muuk::ctrader_fix

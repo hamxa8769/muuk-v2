@@ -317,6 +317,11 @@ std::filesystem::path historyFileFor(const std::filesystem::path& configPath) {
     return file;
 }
 
+std::filesystem::path brainJournalFileFor(const std::filesystem::path& configPath) {
+    const std::filesystem::path dir = dataDirectoryFor(configPath) / "muuk_history";
+    return dir / (configStem(configPath) + ".brain_journal.jsonl");
+}
+
 std::filesystem::path defaultStateFile(const std::filesystem::path& configPath) {
     std::string name = configPath.filename().string();
     if (name.size() > 5 && name.substr(name.size() - 5) == ".json") name.resize(name.size() - 5);

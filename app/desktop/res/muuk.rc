@@ -20,11 +20,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Muuk"
             VALUE "FileDescription", "Muuk Upgrade"
-            VALUE "FileVersion", "0.2.5"
+            VALUE "FileVersion", "0.2.6"
             VALUE "InternalName", "muuk-upgrade-desktop"
             VALUE "OriginalFilename", "muuk-upgrade-desktop.exe"
             VALUE "ProductName", "Muuk Upgrade"
-            VALUE "ProductVersion", "0.2.5"
+            VALUE "ProductVersion", "0.2.6"
         END
     END
     BLOCK "VarFileInfo"

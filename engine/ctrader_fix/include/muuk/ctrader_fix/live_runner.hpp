@@ -18,6 +18,7 @@
 #include "muuk/core/risk_table.hpp"
 #include "muuk/core/strategy_engine.hpp"
 #include "muuk/ctrader_fix/basket_history.hpp"
+#include "muuk/ctrader_fix/brain_journal.hpp"
 #include "muuk/ctrader_fix/brain_keeper_v2.hpp"
 #include "muuk/ctrader_fix/fix_session.hpp"
 #include "muuk/ctrader_fix/latency_stats.hpp"
@@ -257,6 +258,10 @@ struct LiveSnapshot {
     std::string marketRead;               // the market read in one line (trend, structure, ATR)
     int marketScore = 0;                  // -4..+4
     std::string brainStatus;              // Brain v2: keeper status line, "off" when disabled
+    std::string brainDetail;              // Brain v2: the running cycle's cell + policy, "" when no brain cycle runs
+    int brainCyclesToday = 0;             // brain-driven baskets closed today (wins/locks below)
+    int brainWinsToday = 0;               // of those, closed with net > 0
+    int brainLocksToday = 0;              // of those, locked
     std::string regimeStatus;             // Smart ranges: the chart read behind the current range, "" while centered
     // MT5 through the bridge: the account as MT5 reports it (exact balance,
     // equity, margin and swap). brokerAccountFresh: heard from in the last 15 s.
@@ -331,6 +336,10 @@ public:
     // positions are listed, and nothing new opens until they're closed.
     // Needs connection.syncPositionsOnConnect (the default).
     void setStateFile(std::filesystem::path file) { stateFile_ = std::move(file); }
+
+    // Where the brain's cycle journal goes (brain_journal.jsonl next to the
+    // account config, via brainJournalFileFor). Empty = journaling off.
+    void setBrainJournalFile(std::filesystem::path file) { brainJournal_.setFile(std::move(file)); }
 
     // Starts the lifetime statistics over: speed totals, quote count,
     // basket numbering and this session's booked results. Leaves the
@@ -967,6 +976,11 @@ private:
     bool lastBasketLocked_ = false;   // it locked
     std::deque<double> recentSpreads_;  // last 120 quote spreads, for the spread median
     int64_t brainFedUntilMs_ = 0;     // newest closed bar already handed to the keeper
+    BrainJournal brainJournal_;      // Phase 1 memory: one JSON line per closed brain basket / vetoed cycle
+    int brainCyclesToday_ = 0;       // brain-driven baskets closed today (see brainTallyDay_)
+    int brainWinsToday_ = 0;         // of those, closed with net > 0
+    int brainLocksToday_ = 0;        // of those, locked
+    std::string brainTallyDay_;      // local date the tally above counts for; "" = none yet
 };
 
 }  // namespace muuk::ctrader_fix

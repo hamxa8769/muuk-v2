@@ -1,4 +1,5 @@
 add_library(muuk_ctrader_fix STATIC
+    src/brain_journal.cpp
     src/brain_keeper_v2.cpp
     src/fix_message.cpp
     src/fix_session.cpp
@@ -34,6 +35,7 @@ if(MUUK_BUILD_TESTS)
         tests/test_fix_session.cpp
         tests/test_live_runner.cpp
         tests/test_live_resume.cpp
+        tests/test_brain_journal.cpp
         tests/test_broker_account_info.cpp
         tests/test_reporting.cpp
         tests/test_market_hours.cpp
