@@ -157,10 +157,11 @@ TEST_CASE("Brain v2 gates: strong trend, a lost last basket and a wide spread al
 TEST_CASE("Brain v2 online learning: one bad basket can veto a cell, one small one cannot flip it") {
     BrainV2Config cfg;
     BrainV2 brain = trainedBrain();
+    brain.cells[0].samples = 100;
     brain.cells[0].best = BrainV2Policy{1, 1.0, 3, 1.0};
     brain.cells[0].meanPnl = 2.0;
-    brain.cells[0].sumPnl = 100.0;
-    brain.cells[0].sumSquares = 210.0;
+    brain.cells[0].sumPnl = 200.0;
+    brain.cells[0].sumSquares = 420.0;
     brain.cells[0].score = 1.9;
     const SituationV2 s = situation();
     const BrainV2Policy used{1, 1.0, 3, 1.0};
@@ -170,10 +171,13 @@ TEST_CASE("Brain v2 online learning: one bad basket can veto a cell, one small o
         REQUIRE(brain.cells[0].best.gapChoice == -1);
         REQUIRE_FALSE(decideWithBrainV2(brain, s, cfg, {}).trade);
     }
-    SECTION("a $10 loss on a 50-sample cell leaves it trading") {
+    SECTION("a $10 loss on a 100-sample cell leaves it trading") {
+        // (100 samples: the shrunk lock rate of a clean cell is 1/111 = 0.9%,
+        // below the 0.015 filter; a 50-sample cell would shrink to 1.64%
+        // and be vetoed even with zero locks.)
         observeBasketOutcome(brain, s, used, -10.0, false, cfg);
         REQUIRE(brain.cells[0].best.gapChoice == 1);
-        REQUIRE(brain.cells[0].meanPnl == Catch::Approx(90.0 / 51.0));
+        REQUIRE(brain.cells[0].meanPnl == Catch::Approx(190.0 / 101.0));
     }
     SECTION("an outcome for a policy the cell does not use changes nothing") {
         observeBasketOutcome(brain, s, BrainV2Policy{2, 1.0, 3, 1.0}, -500.0, true, cfg);
@@ -200,8 +204,8 @@ TEST_CASE("Brain v2 file: a brain survives a save and a load") {
 TEST_CASE("Brain v2 learning: on ranging bars it learns a policy, never x2/8, and the test decides adoption") {
     BrainV2Config cfg;
     cfg.base.periods = 3;
-    const std::vector<Bar> bars = ranging(6000);
-    const BrainV2 brain = learnBrainV2(bars, {}, 6000, cfg);
+    const std::vector<Bar> bars = ranging(12000);
+    const BrainV2 brain = learnBrainV2(bars, {}, 12000, cfg);
     REQUIRE(brain.trained);
     REQUIRE(brain.cells.size() == 81);
     int tradable = 0;

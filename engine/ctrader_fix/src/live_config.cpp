@@ -154,6 +154,7 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
     cfg.connection.accountKind = conn.value("accountKind", std::string("standard"));
     if (conn.contains("recovery")) cfg.connection.recovery = recoveryFromJson(conn.at("recovery"));
     if (conn.contains("entry")) cfg.connection.entry = entryFromJson(conn.at("entry"));
+    cfg.connection.regimeRanges = conn.value("regimeRanges", false);
     cfg.connection.autoContinue = conn.value("autoContinue", true);
     cfg.connection.syncPositionsOnConnect = conn.value("syncPositionsOnConnect", true);
 
@@ -221,6 +222,7 @@ LiveSettings settingsFromConfig(const LiveConfig& config) {
     s.accountKind = config.connection.accountKind;
     s.recovery = config.connection.recovery;
     s.entry = config.connection.entry;
+    s.regimeRanges = config.connection.regimeRanges;
     s.commissionPerLot = config.strategy.costs.commissionPerLotRoundTurn;
     s.commissionPerMillion = config.strategy.costs.commissionPerMillionPerSide;
     s.autoContinue = config.connection.autoContinue;
@@ -263,6 +265,7 @@ void applySettingsToConfig(LiveConfig& config, const LiveSettings& s) {
     config.connection.accountKind = s.accountKind;
     config.connection.recovery = s.recovery;
     config.connection.entry = s.entry;
+    config.connection.regimeRanges = s.regimeRanges;
     st.escapeFromLevel = s.escapeFromLevel;
     st.escapeProfitMoney = s.escapeProfit;
     st.costs.commissionPerLotRoundTurn = s.commissionPerLot;
@@ -460,6 +463,7 @@ void saveLiveSettings(const std::filesystem::path& path, const LiveSettings& s) 
     conn["accountKind"] = s.accountKind;
     conn["recovery"] = recoveryToJson(s.recovery);
     conn["entry"] = entryToJson(s.entry);
+    conn["regimeRanges"] = s.regimeRanges;
     j["strategy"]["breakEvenEscape"] = {{"fromLevel", s.escapeFromLevel}, {"profit", s.escapeProfit}};
 
     auto& st = j["strategy"];

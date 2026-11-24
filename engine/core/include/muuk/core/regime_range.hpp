@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <optional>
 #include <string>
 
 #include "muuk/core/market_read.hpp"
@@ -97,6 +98,22 @@ struct RegimeRange {
     double buyStop = 0.0;
     bool clamped = false;   // minGap / maxGap decided the distance
 };
+
+// The regime placement for one cycle: the read behind it plus where the
+// orders go. The replay and the live runner share this, so a cycle places
+// the same range in training and live.
+struct RegimePlacement {
+    RegimeRead read;
+    RegimeRange range;
+};
+
+// Place one cycle's two orders from the bars ending at the cycle, in a
+// ranging market only: the orders sit just outside the market's own recent
+// high/low (its Bollinger band when calm), at least `gap` apart -- the
+// brain's gap is a floor, not the distance. Nothing in a trend (the range
+// is stale there) or with too few bars to read a regime: the caller falls
+// back to a centered range.
+[[nodiscard]] std::optional<RegimePlacement> placeRegimeRange(const std::deque<Bar>& bars, double mid, double gap);
 
 // One-minute bars -> bars of `minutes`, oldest first.
 [[nodiscard]] std::deque<Bar> aggregateBars(const std::deque<Bar>& bars, int minutes);

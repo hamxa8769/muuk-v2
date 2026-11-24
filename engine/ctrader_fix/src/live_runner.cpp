@@ -1,4 +1,5 @@
 #include "muuk/ctrader_fix/live_runner.hpp"
+#include "muuk/core/regime_range.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -237,6 +238,7 @@ LiveSnapshot LiveRunner::snapshot() const {
     snap.marketRead = marketRead_.why;
     snap.marketScore = marketRead_.score;
     snap.brainStatus = !config_.brain.enabled ? "off" : (brain_ ? brain_->status() : "no trained brain");
+    snap.regimeStatus = regimeStatus_;
     snap.platform = config_.connection.platform;
     snap.brokerAccount = brokerAccount_;
     snap.brokerAccountFresh = brokerAccountFreshLocked();
@@ -2288,9 +2290,34 @@ bool LiveRunner::prepareNextCycle(bool recenter) {
         // A brain-driven cycle always re-centers on the live mid at the
         // brain's gap, even when the configured range is fixed.
         const double width = brainCycleActive_ ? brainDecision_.gap : rangeWidthNowLocked();
-        const int64_t halfWidth = std::max<int64_t>(1, Price::fromDouble(width, spec).ticks / 2);
-        const int64_t mid = Price::fromDouble((*latestBid_ + *latestAsk_) / 2.0, spec).ticks;
-        range = RangeConfig{Price{mid - halfWidth}, Price{mid + halfWidth}};
+        const double midPrice = (*latestBid_ + *latestAsk_) / 2.0;
+        // Smart ranges (chart): the range sits on the market's own recent
+        // high/low (ranging) or its Bollinger band (calm), read from the
+        // bars, instead of centered on the live price. The width stays the
+        // brain's gap / the configured width; the chart decides where the
+        // range sits. Too few bars yet: the plain centered range.
+        bool placed = false;
+        if (config_.connection.regimeRanges) {
+            // Same placement as the replay (placeRegimeRange): the range
+            // sits on the market's own high/low, not on the live mid.
+            if (const std::optional<muuk::core::RegimePlacement> placement =
+                    muuk::core::placeRegimeRange(bars_.closed(), midPrice, width)) {
+                const muuk::core::RegimeRange& rr = placement->range;
+                range = RangeConfig{Price::fromDouble(rr.sellStop, spec), Price::fromDouble(rr.buyStop, spec)};
+                char buf[280];
+                std::snprintf(buf, sizeof(buf), "%s | orders %.2f - %.2f", placement->read.why.c_str(), rr.sellStop,
+                              rr.buyStop);
+                regimeStatus_ = buf;
+                log(std::string("[range] smart range: ") + regimeStatus_);
+                placed = true;
+            }
+        }
+        if (!placed) {
+            const int64_t halfWidth = std::max<int64_t>(1, Price::fromDouble(width, spec).ticks / 2);
+            const int64_t mid = Price::fromDouble(midPrice, spec).ticks;
+            range = RangeConfig{Price{mid - halfWidth}, Price{mid + halfWidth}};
+            regimeStatus_.clear();
+        }
     }
     pickRangeShapeLocked();
     engine_->reconfigure(engineConfigLocked());
@@ -2485,6 +2512,14 @@ bool LiveRunner::decideBrainCycleLocked() {
 
 bool LiveRunner::entryFilterBlocksLocked() {
     const EntryFilterConfig& e = config_.connection.entry;
+    // Smart ranges (chart) already read the market to place the range --
+    // ranging markets are where they trade, so the trend filter (which
+    // only opens while the price trends) must not block them.
+    if (config_.connection.regimeRanges) {
+        entryWait_.clear();
+        entryWaitLogged_ = false;
+        return false;
+    }
     if (e.trendMin <= 0.0) {
         entryWait_.clear();
         entryWaitLogged_ = false;

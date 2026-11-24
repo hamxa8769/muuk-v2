@@ -1685,6 +1685,7 @@ TEST_CASE("Smart entry: the range is ATR x rangeAtr wide (never under the fixed 
 TEST_CASE("Smart entry: the trend filter holds new ranges in a sideways market") {
     MockFixServer server;
     LiveConfig cfg = resumeConfig(server);
+    cfg.connection.regimeRanges = false;  // the trend filter is what this test exercises
     cfg.connection.entry.trendMin = 1.0;
     Bot bot(cfg, freshStateFile("entry_chop"));
     (void)handshake(server, {}, {});
@@ -1702,6 +1703,7 @@ TEST_CASE("Smart entry: the trend filter holds new ranges in a sideways market")
 TEST_CASE("Smart entry: in a down trend the range opens with a Sell Stop first") {
     MockFixServer server;
     LiveConfig cfg = resumeConfig(server);  // configured: Buy Stop first
+    cfg.connection.regimeRanges = false;  // the trend filter is what this test exercises
     cfg.connection.entry.trendMin = 1.0;
     cfg.connection.entry.startWithTrend = true;
     Bot bot(cfg, freshStateFile("entry_trend"));

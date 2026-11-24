@@ -141,6 +141,13 @@ struct LiveConnectionConfig {
     // connect). All off = the plain fixed range. See EntryFilterConfig.
     EntryFilterConfig entry;
 
+    // Smart ranges (chart): a new range sits on the market's own recent
+    // high/low (ranging) or its Bollinger band (calm), read from the last
+    // one-minute bars, instead of centered on the live price. The brain's
+    // gap (or the configured width) still decides the distance; the chart
+    // decides where the range sits. Off = the plain centered range.
+    bool regimeRanges = false;
+
     // How long LiveRunner waits, after a basket has fully closed (every
     // filled leg confirmed flattened at the broker), before starting the
     // next cycle's range. 0 (default) starts immediately, matching the
@@ -292,6 +299,8 @@ struct LiveSettings {
     bool autoContinue = true;
     muuk::core::StartSide startSide = muuk::core::StartSide::Both;  // first order(s) of each range
     EntryFilterConfig entry;  // smart entry: ATR width, trend filter, start with the trend
+    bool regimeRanges = false;  // smart ranges (chart): place each new range on the market's own high/low.
+    // Defaults OFF: both chart placements lost in backtest (see replayCycleV2), so the live bot stays centered.
     MarketHoursConfig market;
 };
 

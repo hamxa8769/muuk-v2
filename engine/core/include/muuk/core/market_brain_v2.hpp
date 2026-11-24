@@ -57,11 +57,19 @@ struct BrainV2Config {
     BrainConfig base;  // v1 config: gaps, stepBars, maxCycleBars, minSamples, periods...
     double slippage = 0.05;    // $ per lot per fill, charged in the replay (was missing in v1)
     double commission = 0.0;   // $ per lot per fill, charged in the replay
-    double maxLockRate = 0.05; // reject a policy whose (shrunk) lock rate is above this
+    double maxLockRate = 0.015; // reject a policy whose (shrunk) lock rate is above this
+    // (tightened from 0.05: the only lever that cut locks hard, 48->15 in the
+    // 2026-11-20 run. It also cut the total to -$469 then, so it runs here
+    // together with the volatility breaker, which skips the crash cycles.)
     bool noTradeInStrongTrend = true;  // ADX bucket 2 + a clear EMA direction: no new cycle
     double recentLossScore = 0.25;   // after a lost/locked basket, a cell needs score >= this
     double highVolumeScore = 0.25;     // in a tick-volume spike, a cell needs score >= this
     double maxSpreadMultiple = 2.0;    // current spread > this x its median: no trade (0 = off)
+    double maxAtrVolMultiple = 2.0;    // current ATR > this x the training high-vol threshold: no trade (0 = off).
+    // (1.5x was tried: locks 10 but total -$297 and held-out -$187 -- it
+    // skips the cycles that were winning in the held-out. 2.0x stays.)
+    // A circuit breaker for crashes: the Nov 2026 selloff's 1-min ATR runs 3-4x volHigh, and those cycles are
+    // net-negative (37 of the baseline's 48 locks sit in the held-out crash).
     int onlineMaxSamples = 500;        // online tally: older outcomes fade past this
     BrainRiskCaps caps;
 };

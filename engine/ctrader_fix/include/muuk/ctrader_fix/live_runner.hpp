@@ -257,6 +257,7 @@ struct LiveSnapshot {
     std::string marketRead;               // the market read in one line (trend, structure, ATR)
     int marketScore = 0;                  // -4..+4
     std::string brainStatus;              // Brain v2: keeper status line, "off" when disabled
+    std::string regimeStatus;             // Smart ranges: the chart read behind the current range, "" while centered
     // MT5 through the bridge: the account as MT5 reports it (exact balance,
     // equity, margin and swap). brokerAccountFresh: heard from in the last 15 s.
     std::string platform = "ctrader";
@@ -895,6 +896,7 @@ private:
     // when the lock (or the last re-lock) happened, and the operator's say.
     muuk::core::BarSeries bars_{60'000, 240};
     muuk::core::MarketRead marketRead_;
+    std::string regimeStatus_;  // last smart-range placement line, for the snapshot
     int64_t marketReadBar_ = -1;               // start of the newest closed bar it was read at
     std::chrono::steady_clock::time_point lockedSince_{};
     bool escapeAwaitingDecision_ = false;      // a try failed: wait for Retry / Close / Keep locked

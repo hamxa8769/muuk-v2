@@ -105,10 +105,12 @@ std::string zipAssetName(std::string_view tag) {
 bool keepFileOnUpdate(std::string_view relativePath) {
     // The file name only: "my_account.local.json" and "sub/x.local.json"
     // are configs, "config.json" and "x.local.JSON" (case-insensitive) is
-    // decided on the extension alone.
+    // decided on the extension alone. The trained brain is the user's own
+    // file too (the keeper learns on it live), so it is kept as well.
     const std::size_t slash = relativePath.find_last_of("/\\");
     const std::string_view name = slash == std::string_view::npos ? relativePath : relativePath.substr(slash + 1);
-    return !endsWith(lowerAscii(name), ".local.json");
+    const std::string lowered = lowerAscii(name);
+    return !endsWith(lowered, ".local.json") && lowered != "brain_v2.txt";
 }
 
 
@@ -152,11 +154,13 @@ std::string buildUpdateBatch(const std::string& appDir, const std::string& extra
     bat += "goto wait_for_exit\r\n";
     bat += ":do_copy\r\n";
     bat += "echo App has exited, copying the new release... >> \"%LOG%\"\r\n";
-    bat += "robocopy \"%SRC_DIR%\" \"%APP_DIR%\" /E /XF *.local.json /R:2 /W:2 /NFL /NDL /NJH /NJS >> \"%LOG%\" 2>&1\r\n";
+    bat += "robocopy \"%SRC_DIR%\" \"%APP_DIR%\" /E /XF *.local.json brain_v2.txt /R:2 /W:2 /NFL /NDL /NJH /NJS >> \"%LOG%\" 2>&1\r\n";
     bat += "set \"RC=%ERRORLEVEL%\"\r\n";
     bat += "echo robocopy exit code: %RC% >> \"%LOG%\"\r\n";
     bat += "rem robocopy exit codes 0-7 mean success (copied, or nothing to do); 8+ is a failure.\r\n";
     bat += "if %RC% GEQ 8 goto give_up\r\n";
+    bat += "rem The trained brain is never overwritten: a later update only installs it when this PC has none yet (the keeper learns on it live).\r\n";
+    bat += "if not exist \"%APP_DIR%\\brain_v2.txt\" copy /Y \"%SRC_DIR%\\brain_v2.txt\" \"%APP_DIR%\\\" >> \"%LOG%\" 2>&1\r\n";
     bat += "echo Restarting %EXE_NAME%... >> \"%LOG%\"\r\n";
     bat += "if not exist \"%APP_DIR%\\%EXE_NAME%\" goto no_restart\r\n";
     bat += "start \"\" \"%APP_DIR%\\%EXE_NAME%\"\r\n";

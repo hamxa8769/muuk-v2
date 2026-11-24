@@ -73,6 +73,15 @@ Copy-Item (Join-Path $repo "engine\ctrader_fix\config.mt5.example.json") (Join-P
 # MT5 user sees the right one at once instead of buried in mt5/.
 Copy-Item (Join-Path $repo "engine\ctrader_fix\config.mt5.example.json") (Join-Path $Out "mt5_account.example.json") -Force
 
+# The trained brain, when the repo has one (only a trainer run that passed the
+# strict gates ever writes it): it rides in the zip root, next to the exes,
+# so the runner finds it. No brain file yet = nothing to copy.
+$brain = Join-Path $repo "brain_v2.txt"
+if (Test-Path $brain) {
+    Copy-Item $brain $Out -Force
+    Write-Host "Trained brain copied (brain_v2.txt)."
+}
+
 if ($Config) {
     $cfg = Resolve-Path $Config
     Copy-Item $cfg $Out -Force

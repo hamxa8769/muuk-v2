@@ -186,6 +186,28 @@ RegimeRead readRegime(const std::deque<Bar>& oneMinuteBars, const RegimeConfig& 
     return r;
 }
 
+std::optional<RegimePlacement> placeRegimeRange(const std::deque<Bar>& bars, double mid, double gap) {
+    const RegimeRead read = readRegime(bars, RegimeConfig{});
+    // Ranging only. In a trend the recent high/low is stale (the range sits
+    // behind the price) and the centered straddle is the honest placement;
+    // the first version re-centered on that stale center and the backtest
+    // proved it loses (v2 -894.98 vs +1230.65 centered; fixed -56885.34 vs
+    // -4511.28). Too few bars: centered too.
+    if (read.regime != MarketRegime::Ranging) return std::nullopt;
+    // Orders at the range's own edges (chosenGap 0: the range decides the
+    // distance), at least `gap` apart -- the brain's gap is a floor, not the
+    // distance. The range's top/bottom are where the price actually turns.
+    RegimeRange rr = computeRegimeRange(read, mid, {}, 0.0, 0.0, RegimeConfig{}, 0.0);
+    if (rr.buyStop - rr.sellStop < gap) {
+        const double center = (rr.buyStop + rr.sellStop) / 2.0;
+        const double half = std::clamp(gap, RegimeConfig{}.minGap, RegimeConfig{}.maxGap) / 2.0;
+        rr.buyStop = center + half;
+        rr.sellStop = center - half;
+        rr.clamped = true;
+    }
+    return RegimePlacement{read, rr};
+}
+
 RegimeRange computeRegimeRange(const RegimeRead& read, double mid, const ExternalLevels& levels, double fillsLow,
                                double fillsHigh, const RegimeConfig& config, double chosenGap) {
     // Choppy: the whole high-to-low is the zone. Calmer: closer to the Bollinger Bands.

@@ -94,6 +94,9 @@ TEST_CASE("keepFileOnUpdate never overwrites the user's own configs") {
     REQUIRE(keepFileOnUpdate("muuk-upgrade-desktop.exe"));
     REQUIRE(keepFileOnUpdate("local.json"));        // not a *.local.json file
     REQUIRE(keepFileOnUpdate("x.local.json.bak"));  // only the exact suffix counts
+    REQUIRE_FALSE(keepFileOnUpdate("brain_v2.txt"));      // the user's live-learned brain is kept
+    REQUIRE_FALSE(keepFileOnUpdate("sub/brain_v2.txt"));  // file name only, like the configs
+    REQUIRE(keepFileOnUpdate("brain_v2.txt.bak"));        // only the exact name counts
 }
 
 TEST_CASE("parseLatestRelease finds the Windows zip asset") {

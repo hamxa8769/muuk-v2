@@ -44,9 +44,11 @@ double scoreOf(const Tally& t) {
 }
 
 // The policies stage B chooses between, safest first: (mult, levels, exitFactor).
-// Gap is chosen in stage A. 2.0/4 is the aggressive end — the v1 lot rule with
+// Gap is chosen in stage A. 2.0/4 is the aggressive end -- the v1 lot rule with
 // the levels capped, so the lock-cost caps can still hold it. A riskier policy
 // is picked only if it scores clearly better (see the 0.05 margin in stage B).
+// (A 6-level-only grid was tried 2026-11-24: the lock rate halved but the
+// cycles doubled, so locks barely moved 48->44 and each lock cost ~2x more.)
 const BrainV2Policy kCandidates[] = {
     {0, 1.0, 3, 1.0}, {0, 1.0, 4, 1.0}, {0, 1.25, 4, 0.5}, {0, 1.25, 4, 1.0},
     {0, 1.5, 6, 0.5}, {0, 1.0, 6, 1.0}, {0, 1.5, 3, 1.0}, {0, 2.0, 4, 1.0},
@@ -184,6 +186,13 @@ BrainV2Decision decideWithBrainV2(const BrainV2& brain, const SituationV2& situa
         d.why = "too few bars to read this market";
         return d;
     }
+    if (config.maxAtrVolMultiple > 0.0 && brain.volHigh > 0.0 && situation.base.atr > config.maxAtrVolMultiple * brain.volHigh) {
+        char buf[300];
+        std::snprintf(buf, sizeof(buf), "ATR %.2f is %.1fx the training high-vol threshold %.2f -- extreme volatility, no new cycle",
+                      situation.base.atr, situation.base.atr / brain.volHigh, brain.volHigh);
+        d.why = buf;
+        return d;
+    }
     static constexpr const char* kLevels[] = {"low", "mid", "high"};
     static constexpr const char* kSessions[] = {"Asia", "London", "New York"};
     char where[200];
@@ -247,6 +256,10 @@ ReplayCycleV2 replayCycleV2(const std::vector<Bar>& bars, const std::vector<doub
     const double mid = bars[start].close;
     double buyLine = mid + gap / 2.0;
     double sellLine = mid - gap / 2.0;
+    // Centered on the tick that starts the cycle. Both chart-based
+    // placements lost in backtest (center - $894.98 / 48 locks; edges
+    // - $525.11 / 55 locks; centered + $1,230.65 / 48), so the replay
+    // stays centered. The live toggle defaults off (see regimeRanges).
     std::vector<Leg> legs;
     double costs = 0.0;
     bool nextBuy = true;

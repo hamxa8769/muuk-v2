@@ -2,7 +2,9 @@
 // (MT5 export format, as in BrainKeeper::loadHistoryFolder) and prints the
 // walk-forward table for v2 vs fixed 3 x ATR vs the v1 brain, plus the
 // held-out last 15% and the gate verdict. Demo-only: a brain is saved only
-// when it passes the adoption test.
+// when it passes the STRICT gates (better + drawdown + locks + periods up +
+// held-out positive), not merely the walk-forward adoption test -- the
+// 2026-11-20 run saved a gates-failed brain that way.
 //
 //   muuk_brain_v2_trainer <history folder> [--bars N] [--slippage X]
 //       [--commission X] [--periods N] [--out brain_v2.txt]
@@ -111,7 +113,7 @@ int main(int argc, char** argv) {
     }
     const BrainV2Training t = trainBrainV2(history.bars, history.spreads, BrainV2{}, cfg);
     std::cout << t.report;
-    if (t.brain.trained) {
+    if (t.brain.trained && t.gatesPassed) {
         int tradable = 0;
         std::map<std::string, int> policies;
         for (const auto& c : t.brain.cells) {
@@ -125,9 +127,13 @@ int main(int argc, char** argv) {
         for (const auto& [policy, count] : policies) std::cout << "  " << policy << ": " << count << " cells\n";
         std::ofstream out(outFile, std::ios::trunc);
         out << serializeBrainV2(t.brain);
-        std::cout << "saved " << outFile << " (adopted: passed its walk-forward test)\n";
+        std::cout << "saved " << outFile << " (strict gates PASSED)\n";
         return 0;
     }
-    std::cout << "nothing saved: v2 did not pass its test on these bars\n";
+    if (t.better) {
+        std::cout << "nothing saved: v2 passed walk-forward but NOT the strict gates (locks / held-out) -- see above\n";
+    } else {
+        std::cout << "nothing saved: v2 did not pass its test on these bars\n";
+    }
     return 1;
 }

@@ -1443,6 +1443,12 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
         ImGui::TextDisabled("Smart entry: this range is $%.2f wide, target move $%.2f", snap->rangeWidthNow,
                             snap->targetMoveNow);
     }
+    if (snap && connected && !snap->brainStatus.empty()) {
+        ImGui::TextDisabled("Brain: %s", snap->brainStatus.c_str());
+    }
+    if (snap && connected && !snap->regimeStatus.empty()) {
+        ImGui::TextDisabled("Chart: %s", snap->regimeStatus.c_str());
+    }
     if (snap && !snap->anotherTrader.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, kRed);
         ImGui::TextWrapped("Something else trades this account: %s. Another Muuk on another PC/VPS (or an EA) with "
@@ -1716,6 +1722,16 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
                               &e.rangeMaxWidth, 0.5, "%.2f", &settingsDirty_);
                 e.rangeMaxWidth = std::clamp(e.rangeMaxWidth, std::max(0.1, s.rangeWidth), 1000.0);
             }
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Smart ranges (chart)");
+        ImGui::SetItemTooltip("On: each new range sits on the market's own recent high/low (ranging) or its "
+                              "Bollinger band (calm), read from the last one-minute bars, instead of centered on "
+                              "the live price. The width stays the brain's gap / the configured width; the chart "
+                              "decides where the range sits. The trend filter does not apply while this is on.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("On##regimeranges", &s.regimeRanges)) settingsDirty_ = true;
         settingInt("Shift range after N fills (0 = off)",
                    "After this many fills the range steps out around the same center, the gap widening by the step below (at most the widest shifted range) -- the bot stops trading the same trapped range and opens fewer, wider cycles. 2 = after every 2nd fill.",
                    &s.shiftAfterFills, &settingsDirty_);

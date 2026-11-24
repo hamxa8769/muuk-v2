@@ -55,8 +55,9 @@ struct Version {
 // on success, so a failure can be diagnosed from the log.
 [[nodiscard]] std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir);
 // False for the user's own config files -- the updater must never copy
-// over one. True for everything else in the zip. Case-insensitive, and
-// the check is on the file name only (a folder named *.local.json is
+// over one -- and for the trained brain (brain_v2.txt), which the keeper
+// learns on live. True for everything else in the zip. Case-insensitive,
+// and the check is on the file name only (a folder named *.local.json is
 // not a thing, but "sub/x.local.json" is still a config file).
 [[nodiscard]] bool keepFileOnUpdate(std::string_view relativePath);
 

@@ -132,3 +132,24 @@ TEST_CASE("Regime range: the walls and the basket's trades widen it, walls too f
 // NOTE (Brain v2 merge): the StrategyEngine::moveRange test from the worktree
 // is omitted here: moveRange does not exist in this tree's StrategyEngine.
 // Live regime wiring into LiveRunner is a separate step; see BRAIN_UPGRADE.md.
+
+TEST_CASE("Regime placement: one call places the cycle's orders on the chart; too few bars places nothing") {
+    // Sideways bars: the orders sit just outside the market's own recent high/low.
+    const std::optional<RegimePlacement> placed = placeRegimeRange(sideways(), 4340.0, 6.0);
+    REQUIRE(placed.has_value());
+    REQUIRE(placed->read.regime == MarketRegime::Ranging);
+    REQUIRE(placed->range.buyStop > placed->range.sellStop);
+    const double distance = placed->range.buyStop - placed->range.sellStop;
+    REQUIRE(distance >= 6.0);  // the brain's gap is a floor
+    REQUIRE(distance <= 15.0);
+    REQUIRE(placed->range.buyStop >= placed->read.recentHigh);
+    REQUIRE(placed->range.sellStop <= placed->read.recentLow);
+    REQUIRE(placed->range.buyStop - 4340.0 >= 0.5);
+    REQUIRE(4340.0 - placed->range.sellStop >= 0.5);
+
+    // A steady rise places nothing: the range is stale in a trend, the centered straddle stays.
+    REQUIRE_FALSE(placeRegimeRange(rising(), 4240.0, 6.0).has_value());
+
+    // Too few bars: nothing to read a regime from.
+    REQUIRE_FALSE(placeRegimeRange(sideways(60), 4340.0, 6.0).has_value());
+}
