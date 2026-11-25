@@ -68,6 +68,10 @@ public:
     // What starting MetaTrader 5 did ("" = nothing yet), and whether it's still busy (compiling / launching).
     [[nodiscard]] std::string mt5StartMessage() const;
     [[nodiscard]] bool mt5Starting() const { return mt5Starting_.load(); }
+    // Whether the last start attempt failed (MT5 not started, and not
+    // already running): the dashboard shows the launcher's message then,
+    // instead of leaving it in the log.
+    [[nodiscard]] bool mt5StartFailed() const { return mt5StartFailed_.load(); }
     // Starts MT5 with the bridge now, without trading yet (the app does it by
     // itself when an MT5 config is opened, and Connect does it too), so the
     // logged-in account shows up. restart: close a running MT5 first.
@@ -231,6 +235,7 @@ private:
     std::map<std::string, std::string> mt5ServerHints_;  // guarded by mt5Mutex_
     std::thread mt5Thread_;
     std::atomic<bool> mt5Starting_{false};
+    std::atomic<bool> mt5StartFailed_{false};
     bool mt5LaunchedThisStart_ = false;
     mutable std::mutex mt5Mutex_;
     std::string mt5Message_;

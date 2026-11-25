@@ -43,6 +43,7 @@ LiveController::~LiveController() {
 void LiveController::launchMt5(const LiveConfig& config, bool restart, const std::string& login,
                                const std::string& server, bool allowOtherTerminal) {
     if (mt5Starting_.exchange(true)) return;
+    mt5StartFailed_ = false;  // a new attempt clears the old failure
     mt5LaunchAt_ = std::chrono::steady_clock::now();
     if (mt5Thread_.joinable()) mt5Thread_.join();
     muuk::mt5_bridge::Mt5StartOptions o;
@@ -72,6 +73,7 @@ void LiveController::launchMt5(const LiveConfig& config, bool restart, const std
             std::scoped_lock lock(mt5Mutex_);
             mt5Message_ = r.message;
         }
+        mt5StartFailed_ = !r.started && !r.alreadyRunning;
         if (!r.started && !r.alreadyRunning) appendLog("[mt5] " + r.message);
         mt5Starting_ = false;
     });

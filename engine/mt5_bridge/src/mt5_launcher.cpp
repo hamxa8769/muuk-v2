@@ -119,6 +119,20 @@ std::string notOwnMt5Message(const fs::path& terminal) {
            " next to it). Production's MT5 must stay untouched: see docs/mt5.md, 'This copy's own MT5'.";
 }
 
+// A MuukBridge symbol file name: MuukBridge_<login>.symbol. The bridge EA
+// (tools/mt5/MuukBridge.mq5) writes one into MQL5\Files for the account it
+// runs on, so its presence says this folder has run the bridge before.
+bool isBridgeSymbolFile(const std::string& name, std::string* loginOut) {
+    const std::string prefix = "MuukBridge_";
+    const std::string suffix = ".symbol";
+    if (name.size() <= prefix.size() + suffix.size() || name.rfind(prefix, 0) != 0 ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return false;
+    }
+    if (loginOut) *loginOut = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    return true;
+}
+
 }  // namespace
 
 bool isOwnMt5(const fs::path& terminal) {
@@ -186,7 +200,7 @@ std::vector<fs::path> findMt5DataDirs() {
 
 std::optional<fs::path> chooseMt5DataDir(const std::optional<fs::path>& portable,
                                          const std::vector<fs::path>& candidates, const std::string& server,
-                                         const std::string& login) {
+                                         const std::string& login, std::string* why) {
     if (portable) return portable;
     std::error_code ec;
     std::vector<fs::path> dirs;
@@ -214,13 +228,77 @@ std::optional<fs::path> chooseMt5DataDir(const std::optional<fs::path>& portable
         }
         if (match) return d;
     }
+    // No login/server match -- and the config need not have either (both are
+    // optional): fall back to Muuk's own markers. The bridge EA writes
+    // MQL5\Files\MuukBridge_<login>.symbol into the data folder it runs in,
+    // so a folder that has run the bridge before is this account's folder
+    // even when the config knows no login or server. If exactly one
+    // candidate has one, take it; if several do, take the one whose symbol
+    // file was written most recently (the folder the bridge ran in last).
+    {
+        std::error_code mec;
+        std::optional<fs::path> best;
+        fs::file_time_type bestTime{};
+        std::string bestLogin;
+        std::size_t bestCount = 0;
+        for (const auto& d : dirs) {
+            fs::file_time_type newest{};
+            std::string newestLogin;
+            std::size_t count = 0;
+            for (const auto& e : fs::directory_iterator(d / "MQL5" / "Files", mec)) {
+                std::string login;
+                if (!e.is_regular_file(mec) || !isBridgeSymbolFile(e.path().filename().string(), &login)) continue;
+                const auto t = e.last_write_time(mec);
+                if (mec) continue;
+                ++count;
+                if (count == 1 || t > newest) {
+                    newest = t;
+                    newestLogin = login;
+                }
+            }
+            if (count == 0) continue;
+            // Newest symbol file wins; ties break by more symbol files, then
+            // by path, so the choice is deterministic.
+            if (!best || newest > bestTime ||
+                (newest == bestTime && (count > bestCount || (count == bestCount && d.string() < best->string())))) {
+                best = d;
+                bestTime = newest;
+                bestLogin = newestLogin;
+                bestCount = count;
+            }
+        }
+        if (best) {
+            if (why) *why = "MuukBridge symbol file for account " + bestLogin + " found there";
+            return best;
+        }
+        // Second marker: Muuk's own EA installed here
+        // (MQL5\Experts\MuukUpgrade\MuukUpgradeBridge.ex5). Same rule: the
+        // most recently installed wins.
+        std::optional<fs::path> bestEa;
+        fs::file_time_type bestEaTime{};
+        for (const auto& d : dirs) {
+            const fs::path ex5 =
+                d / "MQL5" / "Experts" / instance::kEaFolder / (std::string(instance::kEaName) + ".ex5");
+            if (!fs::is_regular_file(ex5, mec)) continue;
+            const auto t = fs::last_write_time(ex5, mec);
+            if (mec) continue;
+            if (!bestEa || t > bestEaTime || (t == bestEaTime && d.string() < bestEa->string())) {
+                bestEa = d;
+                bestEaTime = t;
+            }
+        }
+        if (bestEa) {
+            if (why) *why = "MuukBridge EA installed there";
+            return bestEa;
+        }
+    }
     if (dirs.size() == 1) return dirs.front();
     return std::nullopt;
 }
 
 std::optional<fs::path> dataDirForTerminal(const fs::path& terminal, const std::string& server,
-                                           const std::string& login) {
-    return chooseMt5DataDir(dataDirFor(terminal), findMt5DataDirs(), server, login);
+                                           const std::string& login, std::string* why) {
+    return chooseMt5DataDir(dataDirFor(terminal), findMt5DataDirs(), server, login, why);
 }
 
 std::vector<fs::path> runningMt5Terminals() {
@@ -342,17 +420,25 @@ Mt5StartResult startMt5WithBridge(const Mt5StartOptions& o, const std::function<
         return r;
     }
     const bool owned = isOwnMt5(terminal);
-    const auto data = dataDirForTerminal(terminal, o.server, o.login);
+    std::string dataWhy;
+    const auto data = dataDirForTerminal(terminal, o.server, o.login, &dataWhy);
     if (!data) {
         if (findMt5DataDirs().size() > 1) {
-            r.message = "More than one MT5 data folder on this PC -- pick the MT5 in Settings > Account > "
-                        "MetaTrader 5, then Connect again.";
+            // Picking the terminal in Settings does NOT fix this: a
+            // non-portable broker MT5 has no portable folder, so the folder
+            // is resolved from %APPDATA% either way. What makes it
+            // resolvable is the bridge having run once: it writes its marker
+            // file into the folder it runs in.
+            r.message = "More than one MT5 data folder on this PC and Muuk can't tell which one is yours yet -- "
+                        "open MT5 yourself once, attach MuukBridge to the gold chart, and press Connect again. "
+                        "MuukBridge writes its marker file into that folder, so the next start finds it by itself.";
         } else {
             r.message = "MetaTrader 5 at " + terminal.parent_path().string() +
                         " has no data folder yet -- open it once (so it creates one), then Connect again.";
         }
         return r;
     }
+    if (!dataWhy.empty()) say("using MT5 data folder " + data->string() + " (" + dataWhy + ")");
     // Portable (its data lives in its install folder) or not: only a portable
     // terminal is started/compiled with /portable, so a broker MT5 keeps
     // using its real data folder.

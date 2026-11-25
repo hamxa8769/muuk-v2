@@ -2248,19 +2248,25 @@ struct BrainPathRunner {
 };
 
 TEST_CASE("brainFileCandidates searches next to the config file first, then the state file, then the working directory") {
-    const auto paths = brainFileCandidates("/tmp/muuk-test-acct/my_account.local.json",
-                                           "/tmp/muuk-test-acct/muuk_state/my_account.state.json", "brain_v2.txt");
+    // Paths are built from temp_directory_path() so the expectations are
+    // absolute on every platform: a "/tmp/..." literal resolves against
+    // the current drive on Windows and the comparison fails there.
+    const auto acct = std::filesystem::temp_directory_path() / "muuk-test-acct";
+    const auto config = acct / "my_account.local.json";
+    const auto state = acct / "muuk_state" / "my_account.state.json";
+    const auto paths = brainFileCandidates(config, state, "brain_v2.txt");
     REQUIRE(paths.size() == 3);
-    REQUIRE(paths[0] == std::filesystem::path("/tmp/muuk-test-acct/brain_v2.txt"));
-    REQUIRE(paths[1] == std::filesystem::path("/tmp/muuk-test-acct/muuk_state/brain_v2.txt"));
+    REQUIRE(paths[0] == acct / "brain_v2.txt");
+    REQUIRE(paths[1] == acct / "muuk_state" / "brain_v2.txt");
     REQUIRE(paths[2] == std::filesystem::path("brain_v2.txt"));
-    // An absolute brainFile is used as-is, alone.
-    const auto absolute = brainFileCandidates("/tmp/muuk-test-acct/my_account.local.json",
-                                              "/tmp/muuk-test-acct/muuk_state/my_account.state.json",
-                                              "/elsewhere/custom.txt");
+    // An absolute brainFile is used as-is, alone. (A "/elsewhere/..."
+    // literal is NOT absolute on Windows — root directory without a
+    // drive — so the absolute path is built from the temp directory.)
+    const auto elsewhere = std::filesystem::temp_directory_path() / "elsewhere" / "custom.txt";
+    const auto absolute = brainFileCandidates(config, state, elsewhere.string());
     REQUIRE(absolute.size() == 1);
-    REQUIRE(absolute[0] == std::filesystem::path("/elsewhere/custom.txt"));
-    REQUIRE(brainFileCandidates("/tmp/x/c.json", "/tmp/x/muuk_state/c.state.json", "").empty());
+    REQUIRE(absolute[0] == elsewhere);
+    REQUIRE(brainFileCandidates(acct / "x" / "c.json", acct / "x" / "muuk_state" / "c.state.json", "").empty());
     // Config in the working directory: the config-dir and working-directory
     // candidates are the same file, so it appears once.
     const auto deduped =
@@ -2563,7 +2569,20 @@ TEST_CASE("LiveRunner reloads the brain when its file changes, without a restart
     writeBrainAt(dir / "brain_v2.txt", true, 2500);
     sendTestQuote(bot.server, "4336.50", "4336.52");
     const FixMessage order1 = bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
-    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    // StopPx is the brain's gap (4x ATR) around the live mid 4336.51:
+    // 4338.51 when ATR is exactly 1.00, 4338.37 when the two quotes
+    // straddle a wall-clock minute boundary. Then the first quote's
+    // forming bar (open = high = low = close = 4336.51) closes with true
+    // range 0.01 against the previous close 4336.50, so ATR(14) =
+    // (13 x 1.00 + 0.01) / 14 = 0.9293, gap 4.0 x 0.9293 = 3.72, and the
+    // buy stop is 4336.51 + 1.86 = 4338.37. Both values still prove the
+    // reload: had the cycle fallen back to the configured width (1.00),
+    // the buy stop would be 4336.51 + 0.50 = 4337.01, which neither
+    // tolerated value equals. (The order's existence alone already proves
+    // the reload -- the no-trade brain vetoes -- and the "2500 bars"
+    // check below pins the reloaded file.)
+    const double stopPx = order1.getDouble(tag::StopPx);
+    REQUIRE((stopPx == Catch::Approx(4338.51) || stopPx == Catch::Approx(4338.37)));
     REQUIRE(bot.runner.snapshot().brainStatus.find("2500 bars") != std::string::npos);
 
     bot.finish();

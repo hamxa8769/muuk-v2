@@ -96,6 +96,19 @@ download a zip by hand.
   brain that is newer than the release is never overwritten -- the in-app trainer's brain wins, and so does a
   same-age brain with a recorded ER mode. An update from v0.2.6 therefore gets the new trained brain, not
   just the new code.
+- MT5 start fix: starting MT5 failed whenever more than one MT5 data folder existed on the PC and the config
+  had no login or server (both are optional) -- the folder could only be matched by server or by this login's
+  symbol file, and neither was known. The folder is resolved now from Muuk's own markers: any
+  `MuukBridge_<login>.symbol` file (the bridge EA writes one into the folder it runs in), newest first, else
+  the installed MuukBridge EA, newest first. The chosen folder and why are logged. If no folder has a marker
+  yet, the message says so honestly and tells the user to open MT5 once and attach MuukBridge to the gold
+  chart -- after that the marker exists and the next start resolves by itself. (Picking the terminal in
+  Settings never fixed this: a non-portable broker MT5 has no portable folder.)
+- A failed MT5 start is visible now: the launcher's own message shows as a red line in the header (and under
+  the "Open MetaTrader 5" button in Settings > Account) whenever the last start failed and the bridge is
+  still not connected. Before, the reason only lived in the log and in a tooltip on the "MT5: not connected"
+  pill. The header's "Open MT5" / "Restart MT5" buttons also move onto their own line when row 1 runs out
+  of room, instead of being clipped off-screen.
 
 ## 0.2.6 — 2026-11-24 — Phase 1 of the hi-fi brain
 

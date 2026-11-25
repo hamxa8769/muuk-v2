@@ -44,17 +44,25 @@ struct Mt5Install {
 // Picks the data folder for a terminal: its portable folder first, else the
 // %APPDATA% candidate whose bases\ holds the configured server (case
 // insensitive, the same match knownGoldSymbol uses) or whose MQL5\Files
-// holds this login's bridge symbol file, else the only candidate there is,
-// else nothing (the caller asks the user to pick). The pure choice is
-// covered by tests on any system.
+// holds this login's bridge symbol file, else the candidate Muuk's own
+// markers point at (any MuukBridge_<login>.symbol file, newest first; else
+// the installed MuukBridge EA, newest first), else the only candidate there
+// is, else nothing (the caller tells the user how to make it resolvable).
+// The marker fallback is what saves a config with no login or server (both
+// are optional): the bridge EA writes its symbol file into the folder it
+// runs in, so a folder that ran the bridge before is this account's folder
+// even when the config knows neither. When the marker fallback picks, `why`
+// (when given) says why, for the log. The pure choice is covered by tests
+// on any system.
 [[nodiscard]] std::optional<std::filesystem::path> chooseMt5DataDir(
     const std::optional<std::filesystem::path>& portable, const std::vector<std::filesystem::path>& candidates,
-    const std::string& server, const std::string& login);
+    const std::string& server, const std::string& login, std::string* why = nullptr);
 // The data folder for one terminal: portable first, else the %APPDATA%
-// candidates matched by chooseMt5DataDir.
+// candidates matched by chooseMt5DataDir (`why`, when given, as above).
 [[nodiscard]] std::optional<std::filesystem::path> dataDirForTerminal(const std::filesystem::path& terminal,
                                                                       const std::string& server,
-                                                                      const std::string& login);
+                                                                      const std::string& login,
+                                                                      std::string* why = nullptr);
 [[nodiscard]] bool isMt5Running(const std::filesystem::path& terminal);
 
 struct Mt5StartOptions {

@@ -108,6 +108,15 @@ private:
 
     std::mutex writeMutex_;
 
+    // Set under writeMutex_ by stop() just before the socket is torn down
+    // (and by start() on a failed Logon), cleared by start(). send()
+    // drops -- rather than throws on -- any message that arrives once
+    // teardown has begun: the session is going away, so there is no wire
+    // to write to, and an order/cancel that races with Stop must not
+    // surface as a run-loop exception ("FIX write failed: Bad file
+    // descriptor").
+    bool stopping_ = false;
+
     std::mutex logonMutex_;
     std::condition_variable logonCv_;
     bool logonSettled_ = false;

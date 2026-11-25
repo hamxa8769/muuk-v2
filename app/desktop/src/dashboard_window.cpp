@@ -1040,7 +1040,12 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
             }
         } else if (controller.mt5OpenWithoutBridge()) {
             glass::pill("MT5 open without the bridge", kAmber);
-            ImGui::SameLine(0.0f, 6.0f);
+            // Same overflow guard as the "Open MT5" buttons below.
+            if (ImGui::GetContentRegionAvail().x < 210.0f) {
+                ImGui::NewLine();
+            } else {
+                ImGui::SameLine(0.0f, 6.0f);
+            }
             if (glass::button("Restart MT5", kAmber)) {
                 if (mt5SelectedTerminalOwned()) {
                     controller.startMt5(configPathBuffer_.data(), true);
@@ -1060,7 +1065,14 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
                         controller.mt5Starting() ? kAmber : kRed, true);
             ImGui::SetItemTooltip("%s", msg.empty() ? "Muuk starts MetaTrader 5 with its bridge." : msg.c_str());
             if (!controller.mt5Starting()) {
-                ImGui::SameLine(0.0f, 6.0f);
+                // Row 1 can run out of room (a long broker/host text pushes
+                // the pill to the edge): the buttons after it would be
+                // clipped off-screen, so start them on their own line.
+                if (ImGui::GetContentRegionAvail().x < 210.0f) {
+                    ImGui::NewLine();
+                } else {
+                    ImGui::SameLine(0.0f, 6.0f);
+                }
                 if (glass::button("Open MT5", kBlue)) controller.startMt5(configPathBuffer_.data());
                 ImGui::SetItemTooltip("Starts MetaTrader 5 (minimized) with the bridge on a chart.");
                 ImGui::SameLine(0.0f, 6.0f);
@@ -1147,6 +1159,20 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
         if (err.find("MT5 bridge") != std::string::npos && err.find("isn't connected") != std::string::npos) {
             ImGui::TextColored(kAmber, "MuukBridge is not on a chart in MT5 yet -- drag it from MT5's Navigator onto "
                                         "the gold chart once, or press 'Restart MT5 with bridge' in Settings > Account.");
+        }
+    }
+    // A failed MT5 start used to hide in the log (and in a tooltip on the
+    // "MT5: not connected" pill): show the launcher's own message here, so
+    // the button no longer looks dead.
+    if (account_.platform == 1 && !controller.demo()) {
+        const auto bridge = controller.bridgeStatus();
+        if ((!bridge || !bridge->ready) && !controller.mt5Starting() && controller.mt5StartFailed()) {
+            const std::string m = controller.mt5StartMessage();
+            if (!m.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, kRed);
+                ImGui::TextWrapped("MT5 didn't start: %s", m.c_str());
+                ImGui::PopStyleColor();
+            }
         }
     }
     if (!flashMessage_.empty() && ImGui::GetTime() < flashUntil_) {
@@ -3469,6 +3495,14 @@ void DashboardWindow::renderMt5AccountFields() {
             } else {
                 if (glass::button("Open MetaTrader 5", kBlue)) controller_->startMt5(configPath);
                 ImGui::SetItemTooltip("Starts MT5 minimized with the bridge and shows its logged-in account here.");
+                if (controller_->mt5StartFailed()) {
+                    const std::string m = controller_->mt5StartMessage();
+                    if (!m.empty()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, kRed);
+                        ImGui::TextWrapped("MT5 didn't start: %s", m.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                }
             }
         }
         row("Account type", "Must match the MT5 account: a REAL MT5 account is only traded when this says LIVE.");
@@ -4403,7 +4437,7 @@ void DashboardWindow::renderTargetBar(LiveController& /*controller*/, const Live
     ImGui::SetItemTooltip("Net P/L of the open positions (after commission and spread).\n"
                           "Right, green: towards the profit target. Left, red: towards %s.\n"
                           "The colour deepens as it grows; each move pulses green (up) or red (down).",
-                          haveStop ? "the stop loss" : "a loss the size of the target"));
+                          haveStop ? "the stop loss" : "a loss the size of the target");
 
     // Row 3: the scale under it.
     {

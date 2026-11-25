@@ -38,6 +38,12 @@ void FixSession::start(std::chrono::milliseconds timeout) {
     outgoingSeqNum_ = 1;
     loggedOn_ = false;
     running_ = true;
+    {
+        // A previous stop() (or failed start()) left stopping_ set; clear
+        // it before any send, so the Logon below is actually written.
+        std::scoped_lock lock(writeMutex_);
+        stopping_ = false;
+    }
     logonSettled_ = false;
     logonFailureReason_.reset();
 
@@ -50,12 +56,23 @@ void FixSession::start(std::chrono::milliseconds timeout) {
         const bool settled = logonCv_.wait_for(lock, timeout, [this] { return logonSettled_; });
         if (!settled) {
             running_ = false;
+            {
+                // The reader thread may be answering a TestRequest right
+                // now; mark teardown under writeMutex_ first so its send
+                // drops instead of racing the close below.
+                std::scoped_lock lock(writeMutex_);
+                stopping_ = true;
+            }
             socket_.close();
             if (readThread_.joinable()) readThread_.join();
             throw FixSessionError("timed out waiting for Logon acknowledgement from " + host_);
         }
         if (logonFailureReason_) {
             running_ = false;
+            {
+                std::scoped_lock lock(writeMutex_);
+                stopping_ = true;
+            }
             socket_.close();
             if (readThread_.joinable()) readThread_.join();
             throw FixSessionError("Logon rejected: " + *logonFailureReason_);
@@ -85,9 +102,21 @@ void FixSession::stop() {
 
     shutdownCv_.notify_all();
 
-    asio::error_code ec;
-    socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-    socket_.close(ec);
+    {
+        // Serialize the socket teardown against send(): a send already in
+        // flight finishes on the live socket first, and any send that
+        // starts after this point sees stopping_ and drops instead of
+        // writing to a closed socket (EBADF). The lock is held only for
+        // shutdown/close -- never across a join -- so nothing can
+        // deadlock here: no sender calls stop() while holding
+        // writeMutex_, and the threads joined below never need it while
+        // stop() holds it (their sends either already completed or drop).
+        std::scoped_lock lock(writeMutex_);
+        stopping_ = true;
+        asio::error_code ec;
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
+    }
 
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
     if (readThread_.joinable()) readThread_.join();
@@ -95,6 +124,11 @@ void FixSession::stop() {
 
 void FixSession::send(const FixMessage& appMessage) {
     std::scoped_lock lock(writeMutex_);
+    // The session is being torn down: there is no wire left to write to,
+    // and throwing here would turn an orderly Stop into a run-loop
+    // exception ("FIX write failed: Bad file descriptor"). Drop silently;
+    // the caller is exiting anyway.
+    if (stopping_) return;
 
     FixMessage full(appMessage.msgType());
     full.set(tag::SenderCompID, credentials_.senderCompId);

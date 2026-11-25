@@ -2,6 +2,7 @@
 // list. Runs on Linux too (nothing here touches Windows or a real MT5).
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -71,6 +72,68 @@ TEST_CASE("chooseMt5DataDir: one candidate is used, several unmatched are not") 
     fs::create_directories(other);
     REQUIRE_FALSE(chooseMt5DataDir(std::nullopt, {only, other}, "", ""));
     REQUIRE_FALSE(chooseMt5DataDir(std::nullopt, {}, "", ""));
+    fs::remove_all(root);
+}
+
+TEST_CASE("chooseMt5DataDir: a folder with a MuukBridge symbol file wins over unmatched ones") {
+    const fs::path root = freshDir("muuk_choose_data_marker");
+    const fs::path a = root / "aaa";
+    const fs::path b = root / "bbb";
+    const fs::path c = root / "ccc";
+    fs::create_directories(a);
+    touch(b / "MQL5" / "Files" / "MuukBridge_1300083764.symbol");
+    fs::create_directories(c);
+    std::string why;
+    const auto got = chooseMt5DataDir(std::nullopt, {a, b, c}, "", "", &why);
+    REQUIRE(got);
+    REQUIRE(*got == b);
+    REQUIRE(why.find("1300083764") != std::string::npos);
+    fs::remove_all(root);
+}
+
+TEST_CASE("chooseMt5DataDir: among folders with symbol files, the newest wins") {
+    const fs::path root = freshDir("muuk_choose_data_marker_newest");
+    const fs::path a = root / "aaa";
+    const fs::path b = root / "bbb";
+    const fs::path fa = a / "MQL5" / "Files" / "MuukBridge_111.symbol";
+    const fs::path fb = b / "MQL5" / "Files" / "MuukBridge_222.symbol";
+    touch(fa);
+    touch(fb);
+    fs::last_write_time(fa, fs::file_time_type{} + std::chrono::hours(1));
+    fs::last_write_time(fb, fs::file_time_type{} + std::chrono::hours(2));
+    const auto got = chooseMt5DataDir(std::nullopt, {a, b}, "", "");
+    REQUIRE(got);
+    REQUIRE(*got == b);
+    fs::remove_all(root);
+}
+
+TEST_CASE("chooseMt5DataDir: with no symbol files, a folder with the installed EA wins") {
+    const fs::path root = freshDir("muuk_choose_data_ea");
+    const fs::path a = root / "aaa";
+    const fs::path b = root / "bbb";
+    fs::create_directories(a);
+    touch(b / "MQL5" / "Experts" / "MuukUpgrade" / "MuukUpgradeBridge.ex5");
+    std::string why;
+    const auto got = chooseMt5DataDir(std::nullopt, {a, b}, "", "", &why);
+    REQUIRE(got);
+    REQUIRE(*got == b);
+    REQUIRE(!why.empty());
+    fs::remove_all(root);
+}
+
+TEST_CASE("chooseMt5DataDir: with no symbol files, the newest installed EA wins") {
+    const fs::path root = freshDir("muuk_choose_data_ea_newest");
+    const fs::path a = root / "aaa";
+    const fs::path b = root / "bbb";
+    const fs::path ea = a / "MQL5" / "Experts" / "MuukUpgrade" / "MuukUpgradeBridge.ex5";
+    const fs::path eb = b / "MQL5" / "Experts" / "MuukUpgrade" / "MuukUpgradeBridge.ex5";
+    touch(ea);
+    touch(eb);
+    fs::last_write_time(ea, fs::file_time_type{} + std::chrono::hours(2));
+    fs::last_write_time(eb, fs::file_time_type{} + std::chrono::hours(1));
+    const auto got = chooseMt5DataDir(std::nullopt, {a, b}, "", "");
+    REQUIRE(got);
+    REQUIRE(*got == a);
     fs::remove_all(root);
 }
 
