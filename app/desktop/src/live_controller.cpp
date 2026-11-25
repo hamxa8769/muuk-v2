@@ -260,6 +260,7 @@ bool LiveController::startRunner(const std::string& configPath) {
     if (news_) runner_->setNewsFeed(news_);
     // The running basket survives a disconnect / app restart (see LiveRunner::setStateFile).
     runner_->setStateFile(muuk::ctrader_fix::defaultStateFile(configPath));
+    runner_->setConfigFile(configPath);  // a relative brain file is searched next to it first
     runner_->setBrainJournalFile(muuk::ctrader_fix::brainJournalFileFor(configPath));
     const std::filesystem::path historyFile = muuk::ctrader_fix::historyFileFor(configPath);
     runner_->setBasketHandler([this, historyFile](const muuk::ctrader_fix::BasketRecord& basket) {
@@ -362,6 +363,17 @@ void LiveController::stop() {
 
 bool LiveController::openRange() { return runner_ && running_.load() && runner_->openRange(); }
 
+void LiveController::refreshBrain() {
+    if (runner_ && running_.load()) runner_->refreshBrainFile();
+}
+
+void LiveController::trainBrain(const std::string& historyPath) {
+    if (runner_ && running_.load()) {
+        runner_->trainBrainNow(historyPath.empty() ? std::nullopt
+                                                   : std::optional<std::filesystem::path>(historyPath));
+    }
+}
+
 void LiveController::closeRange(bool reopen) {
     if (runner_ && running_.load()) runner_->closeRange(reopen);
 }
@@ -450,8 +462,8 @@ LiveSnapshot LiveController::demoSnapshot() const {
     const double mid = 4272.10 + 1.6 * std::sin(t * 0.35) + 0.35 * std::sin(t * 1.7);
     s.bid = mid - 0.20;
     s.ask = mid + 0.20;
-    s.settings.autoTarget = true;
-    s.settings.autoTargetPercent = 200;
+    // Step 4: the auto profit target is removed -- the preview uses the fixed target.
+    s.settings.profitTarget = 5.0;
     s.settings.stopLoss = 30.0;
     s.settings.commissionPerMillion = 30.0;
     s.settings.accountBalance = 1000.0;
@@ -490,7 +502,7 @@ LiveSnapshot LiveController::demoSnapshot() const {
     PendingOrderInfo o{id++, OrderSide::SellStop, 0.08, 4271.13};
     o.confirmed = true;
     s.pendingOrders.push_back(o);
-    s.targetNow = muuk::core::autoTargetMoney(s.live.commission + 2.0 * s.live.spread, 200.0);
+    s.targetNow = s.settings.profitTarget;
     {
         double buys = 0.0;
         double sells = 0.0;

@@ -106,6 +106,13 @@ public:
     // Range / position controls -- forwarded straight to LiveRunner (see
     // its comments for exactly what each does). No-ops if not running.
     bool openRange();
+    // Re-reads the brain file now (manual refresh, next to the Brain line).
+    // No-op if not running.
+    void refreshBrain();
+    // Trains a new brain now, in the background (the Train button next to
+    // the Brain line). historyPath: a history CSV file or a folder of them;
+    // empty = the bars the bot collected. No-op if not running.
+    void trainBrain(const std::string& historyPath);
     // reopen=false: don't open a new range after the cooldown (exit guard).
     void closeRange(bool reopen = true);
     // After a failed escape: try once more / keep it locked (LiveRunner).

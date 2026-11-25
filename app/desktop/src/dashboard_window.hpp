@@ -163,6 +163,13 @@ private:
                     bool connected, const std::function<void(muuk::ctrader_fix::LiveSettings&)>& change);
 
     std::array<char, 512> configPathBuffer_{};
+    // API key inputs (Settings > Keys): the full key lives in
+    // editSettings_.keys; these buffers are what the masked fields edit.
+    // API keys are ~40 chars at most; 256 leaves room.
+    std::array<char, 256> geminiKeyBuffer_{};
+    std::array<char, 256> fredKeyBuffer_{};
+    std::array<char, 256> finnhubKeyBuffer_{};
+    std::array<char, 512> trainerHistoryBuffer_{};  // Step 5: history CSV/folder for Train (paths run long)
     AppPrefs prefs_;
     bool darkMode_ = true;
     std::string dismissedResumeNote_;

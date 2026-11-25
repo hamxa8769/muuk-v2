@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -53,13 +54,56 @@ struct Version {
 // uses `ping` instead, which sleeps fine without a console. The batch
 // logs every step to update.log next to itself and deletes itself only
 // on success, so a failure can be diagnosed from the log.
-[[nodiscard]] std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir);
+// installBrain (default false) decides the brain line: true copies the
+// release's brain over the installed one unconditionally (the app already
+// decided the release brain is the one to install -- see
+// shouldInstallReleaseBrain); false keeps the old copy-if-missing line,
+// installing the release brain only when the PC has none yet.
+[[nodiscard]] std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir,
+                                           bool installBrain = false);
 // False for the user's own config files -- the updater must never copy
 // over one -- and for the trained brain (brain_v2.txt), which the keeper
 // learns on live. True for everything else in the zip. Case-insensitive,
 // and the check is on the file name only (a folder named *.local.json is
 // not a thing, but "sub/x.local.json" is still a config file).
 [[nodiscard]] bool keepFileOnUpdate(std::string_view relativePath);
+
+// ---- the trained-brain update rule ----
+//
+// A release ships a trained brain (brain_v2.txt in the zip) and the PC
+// already has one (brain_v2.txt next to the app). Both record what they
+// trained under in their header's second line:
+//   volLow ... trainedUntilMs <ms> ... [shiftAfterFills N stepAtr X] [erMode N stopLoss X]
+// A brain written before Step 6 has no erMode field (erMode -1, "not
+// recorded") and no shift fields. The header is all the rule reads --
+// never the learned table.
+//   valid: line 1 starts with "muuk-brain-v2" and line 2 carries a
+//     trainedUntilMs integer. erMode is -1 when the file does not record
+//     one (pre-Step-6 brain).
+// readBrainHeader returns nullopt when the file is missing or unparseable.
+// shouldInstallReleaseBrain decides whether the update batch may copy the
+// release's brain over the installed one:
+//   release unparseable          -> keep (never install a brain we cannot
+//                                     validate as a brain)
+//   installed missing/unparseable -> install (nothing usable to keep)
+//   installed older (trainedUntilMs < release) -> install
+//   same trainedUntilMs, installed erMode unrecorded (-1) -> install
+//     (the pre-Step-6 brain: same history, but the release brain also
+//     carries the ER mode / shift the gates passed with)
+//   installed newer              -> keep (a locally-trained brain from the
+//                                     in-app trainer is newer -- never
+//                                     clobber it)
+//   same trainedUntilMs, installed erMode recorded -> keep (local training
+//                                     wins the tie)
+// Pure except for the two file reads; unit-tested on Linux.
+struct BrainHeader {
+    bool valid = false;            // line 1 is "muuk-brain-v2 ..." and line 2 has trainedUntilMs
+    long long trainedUntilMs = 0;  // last bar the brain trained on, ms since epoch
+    int erMode = -1;               // -1 when the file does not record one
+};
+[[nodiscard]] std::optional<BrainHeader> readBrainHeader(const std::filesystem::path& path);
+[[nodiscard]] bool shouldInstallReleaseBrain(const std::filesystem::path& installedPath,
+                                             const std::filesystem::path& releasePath);
 
 struct ReleaseInfo {
     std::string tag;          // e.g. "v2.0.1"
@@ -76,7 +120,8 @@ struct ReleaseInfo {
 class Updater {
 public:
     enum class State {
-        Idle,          // up to date, or never checked (also: check failed quietly)
+        Idle,          // never checked yet this run
+        UpToDate,      // checked: this is the latest release (the button says so)
         Checking,      // asking GitHub for the latest release
         Available,     // a newer release exists -- the button is shown
         Downloading,   // the zip is coming down (progress() is 0..1)
@@ -95,11 +140,15 @@ public:
     Updater& operator=(const Updater&) = delete;
 
     // Starts the GitHub check on a background thread. Safe to call every
-    // frame: a check already running (or a download in progress) is ignored.
-    // Never throws, never blocks the UI thread.
+    // frame: a check already running (or a download in progress) is ignored,
+    // and so is a second auto-check once this run already knows the answer
+    // (UpToDate, or an update already found). Never throws, never blocks
+    // the UI thread.
     void startBackgroundCheck();
-    // Manual re-check (the "Check for updates" button). Same as above,
-    // but allowed again once the previous check finished.
+    // Manual re-check (the "Check for updates" / "Up to date" / "Check
+    // failed" button). Allowed again once the previous check finished, but
+    // never while an update is already known (Available) or an install is
+    // ready -- a failed re-check must never hide a known update.
     void checkNow();
     // Starts the download + install on a background thread. Only valid
     // from State::Available; anything else is ignored.

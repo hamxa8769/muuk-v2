@@ -32,6 +32,24 @@ constexpr double kWireQtyPerLot = 100.0;
 constexpr const char* kNoFundsWait =
     "account equity is $0 -- connected and showing live data, but not trading until the account is funded";
 
+// Replay dollars per one unit of account money: the brain's money figures
+// are replay units -- standard-account dollars, where 1 lot earns $100 per
+// $1.00 of price move. The live account counts in its own currency, at its
+// own money per point per lot: the adopted symbol's tickValue / tickSize
+// (MT5: from the bridge; cTrader: from the config / security list). One unit
+// of account money is worth 100 / moneyPerPointPerLot replay dollars:
+//   standard (1.0 per 0.01 tick -> 100): 1.0, a dollar is a dollar;
+//   RoboForex-style ProCent (100 USC per 0.01 tick -> 10,000): 0.01,
+//   so 100 USC of P/L is $1 replay (0.01 lot x $1 = 100 USC);
+//   3-digit XAUUSDc (0.1 per 0.001 tick -> 100): 1.0, so 1 USC of
+//   P/L is $1 replay (that symbol's lot is 1 oz, not 100 oz).
+// The same number converts both ways because it carries the currency
+// and the contract size together. Unknown symbol: assume standard.
+double replayUnitsPerAccountMoney(const muuk::core::SymbolSpec& spec) {
+    const double moneyPerPoint = spec.tickSize > 0.0 ? spec.tickValue / spec.tickSize : 0.0;
+    return moneyPerPoint > 0.0 ? 100.0 / moneyPerPoint : 1.0;
+}
+
 std::optional<OrderId> tryParseOrderId(const std::optional<std::string>& clOrdId) {
     if (!clOrdId) return std::nullopt;
     try {
@@ -237,15 +255,45 @@ LiveSnapshot LiveRunner::snapshot() const {
     snap.escapeHeld = escapeHeld_;
     snap.marketRead = marketRead_.why;
     snap.marketScore = marketRead_.score;
-    snap.brainStatus = !config_.brain.enabled ? "off" : (brain_ ? brain_->status() : "no trained brain");
+    // An untrained keeper still reports "no trained brain": the Brain line
+    // must not claim a brain exists until one has passed its test.
+    snap.brainStatus =
+        !config_.brain.enabled ? "off" : (brain_ && brain_->trained() ? brain_->status() : "no trained brain");
+    snap.brainRefreshNote = brainRefreshNote_;
+    if (brain_) {
+        const BrainTrainingProgress progress = brain_->trainingProgress();
+        if (!progress.stage.empty()) {
+            char trainBuf[160];
+            std::snprintf(trainBuf, sizeof(trainBuf), "Training... %s %d/%d, %zu bars", progress.stage.c_str(),
+                          progress.done, progress.total, progress.bars);
+            snap.brainTraining = trainBuf;
+        }
+        const BrainTrainingResult last = brain_->lastTraining();
+        if (last.ran) snap.brainTrainingResult = last.summary;
+    }
     if (brainCycleActive_) {
         // The cycle running right now: its cell and the policy it runs on.
-        char buf[160];
+        char buf[200];
         std::snprintf(buf, sizeof(buf), "cell %d | gap %.2f | x%.1f | %d levels | exit %.2f",
                       BrainJournal::cellIndex(brainSituation_.base), brainDecision_.gap,
                       brainDecision_.policy.lotMultiplier, brainDecision_.policy.maxLevels,
                       brainDecision_.policy.exitFactor);
         snap.brainDetail = buf;
+        if (brainDecision_.firstSide > 0) {
+            snap.brainDetail += " | first Buy";
+        } else if (brainDecision_.firstSide < 0) {
+            snap.brainDetail += " | first Sell";
+        }
+        if (const auto shift = brain_->trainedShift()) {
+            char shiftBuf[64];
+            std::snprintf(shiftBuf, sizeof(shiftBuf), " | shift %dx%.1f", shift->first, shift->second);
+            snap.brainDetail += shiftBuf;
+        }
+        if (const auto erMode = brain_->trainedErMode()) {
+            char erBuf[32];
+            std::snprintf(erBuf, sizeof(erBuf), " | erMode %d", *erMode);
+            snap.brainDetail += erBuf;
+        }
     }
     if (brainTallyDay_ == dayKey_) {
         snap.brainCyclesToday = brainCyclesToday_;
@@ -1208,6 +1256,25 @@ bool LiveRunner::basketRunningLocked() const {
     if (!engine_) return false;
     const EngineStatus st = engine_->status();
     return st == EngineStatus::Active || (st == EngineStatus::HaltedByRisk && !openLegs_.empty());
+}
+
+muuk::core::BrainV2Config brainV2ConfigFor(const LiveConfig& config) {
+    muuk::core::BrainV2Config cfg;
+    cfg.erMode = std::clamp(config.brain.erMode, 0, 3);
+    const RiskPreset preset = riskPresetFor(config.risk.appetite);
+    cfg.caps.maxLockCost = preset.maxLockCost;
+    cfg.caps.maxLevelsHard = preset.maxLevels;
+    // Step 5: the basket stop loss the panel sets, in replay units, so the
+    // trainer validates the brain under the cap it will actually trade
+    // under (the same conversion the live basket observation uses).
+    cfg.stopLoss = config.strategy.basketStopLossMoney * replayUnitsPerAccountMoney(config.strategy.symbol);
+    return cfg;
+}
+
+double LiveRunner::effectiveDailyLossLimitMoneyLocked() const {
+    const double balance = brokerAccount_.known && brokerAccount_.balance > 0.0 ? brokerAccount_.balance
+                                                                               : config_.connection.accountBalance;
+    return effectiveDailyLossLimitMoney(config_.risk.dailyLossPercent, config_.connection.dailyLossLimitMoney, balance);
 }
 
 double LiveRunner::lockAtLossMoneyLocked() const {
@@ -2356,16 +2423,10 @@ void LiveRunner::pickRangeShapeLocked() {
     const double width = (config_.strategy.range.upperBound - config_.strategy.range.lowerBound).toDouble(spec);
     rangeTargetMove_ = e.targetHalfRange ? std::max(0.01, width / 2.0) : 0.0;
     rangeSideSet_ = false;
-    std::string side;
-    if (e.startWithTrend) {
-        readMarketLocked();
-        if (marketRead_.enoughData && marketRead_.emaFast != marketRead_.emaSlow) {
-            const bool up = marketRead_.emaFast > marketRead_.emaSlow;
-            rangeStartSide_ = up ? StartSide::BuyOnly : StartSide::SellOnly;
-            rangeSideSet_ = true;
-            side = up ? ", first order Buy Stop (EMA8 over EMA21)" : ", first order Sell Stop (EMA8 under EMA21)";
-        }
-    }
+    // Step 4 (research doc D3): "first order with the trend" is gone --
+    // the brain's first side decides (Both for the shipped brain), and the
+    // fallback uses the fixed "First order" dropdown. An old file's
+    // startWithTrend is read but never used any more.
     if (e.anyOn()) {
         std::ostringstream oss;
         oss.setf(std::ios::fixed);
@@ -2373,7 +2434,6 @@ void LiveRunner::pickRangeShapeLocked() {
         oss << "[entry] range width " << width;
         if (e.rangeAtr > 0.0) oss << " (ATR " << marketRead_.atr << " x " << e.rangeAtr << ")";
         if (rangeTargetMove_ > 0.0) oss << ", target move " << rangeTargetMove_;
-        oss << side;
         log(oss.str());
     }
 }
@@ -2393,65 +2453,207 @@ muuk::core::StrategyConfig LiveRunner::engineConfigLocked() const {
         sc.riskLimits.maxOrders = brainDecision_.policy.maxLevels;
         sc.lastLotTarget = true;
         sc.lastLotTargetMove = std::max(0.01, brainDecision_.gap / 2.0 * brainDecision_.policy.exitFactor);
+        // Step 2 (decision D12): the shift the brain was trained with
+        // replaces the config shift for this cycle. The brain's step is in
+        // ATR multiples, the engine's in points: convert with the
+        // cycle-start ATR (the same ATR the gap came from), floored at
+        // $1.00 exactly like the replay's widening.
+        if (const auto shift = brain_->trainedShift()) {
+            sc.shiftAfterFills = shift->first;
+            sc.shiftStepPoints = std::max(1.0, shift->second * brainSituation_.base.atr);
+        }
+        // Step 3: the brain's first order replaces the config's first-order
+        // side for this cycle. firstSide 0 (Both / undecided / an old brain
+        // file) keeps the config's side (the fixed "First order" dropdown --
+        // Step 4 removed "first order with the trend"); +1 arms only the
+        // Buy Stop first, -1 only the Sell Stop first.
+        if (brainDecision_.firstSide > 0) {
+            sc.startSide = StartSide::BuyOnly;
+        } else if (brainDecision_.firstSide < 0) {
+            sc.startSide = StartSide::SellOnly;
+        }
     }
     return sc;
 }
 
-std::filesystem::path LiveRunner::resolveBrainFileLocked() const {
-    const std::filesystem::path configured(config_.brain.brainFile);
-    if (configured.is_absolute()) return configured;
-    // The state file is the anchor the runner knows: a brain file next
-    // to it travels with the account. Without one, the working directory.
-    if (!stateFile_.empty() && stateFile_.has_parent_path()) return stateFile_.parent_path() / configured;
-    return configured;
+namespace {
+// (size, mtime) of a file, or nothing when it isn't there -- the
+// signature a brain re-read is keyed on. Never throws.
+std::optional<std::string> brainFileSignature(const std::filesystem::path& file) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(file, ec);
+    if (ec) return std::nullopt;
+    const auto mtime = std::filesystem::last_write_time(file, ec);
+    if (ec) return std::nullopt;
+    return std::to_string(size) + "@" + std::to_string(mtime.time_since_epoch().count());
+}
+}  // namespace
+
+std::vector<std::filesystem::path> LiveRunner::brainCandidatePathsLocked() const {
+    return brainFileCandidates(configFile_, stateFile_, config_.brain.brainFile);
+}
+
+std::optional<std::pair<muuk::core::BrainV2, std::filesystem::path>> LiveRunner::findTrainedBrainLocked(
+    std::string& tried) const {
+    tried.clear();
+    for (const std::filesystem::path& file : brainCandidatePathsLocked()) {
+        std::error_code ec;
+        if (!std::filesystem::exists(file, ec)) {
+            if (!tried.empty()) tried += "; ";
+            tried += file.string() + " (missing)";
+            continue;
+        }
+        std::optional<muuk::core::BrainV2> loaded;
+        try {
+            loaded = loadBrainV2File(file);
+        } catch (const std::exception& ex) {
+            if (!tried.empty()) tried += "; ";
+            tried += file.string() + " (unreadable: " + ex.what() + ")";
+            continue;
+        }
+        if (!loaded) {
+            if (!tried.empty()) tried += "; ";
+            tried += file.string() + " (unreadable)";
+            continue;
+        }
+        if (!loaded->trained) {
+            if (!tried.empty()) tried += "; ";
+            tried += file.string() + " (untrained)";
+            continue;
+        }
+        return std::make_pair(*loaded, file);
+    }
+    return std::nullopt;
+}
+
+std::string LiveRunner::brainCandidatesSignatureLocked() const {
+    std::string sig;
+    for (const std::filesystem::path& file : brainCandidatePathsLocked()) {
+        if (!sig.empty()) sig += "|";
+        sig += file.string();
+        sig += "=";
+        sig += brainFileSignature(file).value_or("missing");
+    }
+    return sig.empty() ? std::string("none") : sig;
+}
+
+void LiveRunner::adoptBrainLocked(const std::filesystem::path& file) {
+    brain_ = std::make_unique<BrainKeeperV2>(file, brainV2ConfigFor(config_),
+                                             [this](const std::string& line) { log(line); });
+    brainLoadedFile_ = file;
+    brainLoadedSignature_ = brainFileSignature(file).value_or("");
+    log("[brain v2] " + brain_->status());
 }
 
 void LiveRunner::maybeInitBrainLocked() {
-    if (brainInitTried_ || brain_) return;
-    brainInitTried_ = true;
     if (!config_.brain.enabled) return;
-    const std::filesystem::path file = resolveBrainFileLocked();
-    try {
-        const auto loaded = loadBrainV2File(file);
-        if (!loaded || !loaded->trained) {
-            // Missing or untrained: fall back to the configured strategy
-            // and log once. Never crash the runner, and never start the
-            // keeper's background learning over a brain that isn't there.
-            if (!brainFallbackLogged_) {
-                log("[brain v2] no trained brain at " + file.string() + " -- using the configured strategy");
-                brainFallbackLogged_ = true;
-            }
+    if (brain_) {
+        // A loaded brain is re-read only when its own file changed: a
+        // re-write with the same content keeps the keeper (and its live
+        // vetoes), and a vanished file keeps it too -- the in-memory brain
+        // is still valid, and the updater only ever replaces the file.
+        const std::optional<std::string> sig = brainFileSignature(brainLoadedFile_);
+        if (!sig || *sig == brainLoadedSignature_) return;
+        if (brain_->learning()) return;  // never join a training thread; retry on the next decision
+        std::string tried;
+        const auto found = findTrainedBrainLocked(tried);
+        if (!found) {
+            // The new file isn't a trained brain (yet): keep the loaded
+            // one, and don't retry this exact change again.
+            brainLoadedSignature_ = *sig;
+            brainRefreshNote_ = "brain file changed but no trained brain found -- keeping the loaded brain";
+            log("[brain v2] brain file changed but no trained brain found (" + tried +
+                ") -- keeping the loaded brain");
             return;
         }
-        brain_ = std::make_unique<BrainKeeperV2>(file, muuk::core::BrainV2Config{},
-                                                 [this](const std::string& line) { log(line); });
-        log("[brain v2] " + brain_->status());
-    } catch (const std::exception& ex) {
-        if (!brainFallbackLogged_) {
-            log(std::string("[brain v2] could not load ") + file.string() + ": " + ex.what() +
-                " -- using the configured strategy");
-            brainFallbackLogged_ = true;
+        if (found->first.trainedBars == brain_->trainedBars() &&
+            found->first.trainedUntilMs == brain_->trainedUntilMs()) {
+            brainLoadedSignature_ = *sig;  // same brain, re-written: keep the keeper
+            return;
         }
+        adoptBrainLocked(found->second);
+        brainRefreshNote_ = "auto-reloaded " + brainLoadedFile_.filename().string();
+        log("[brain v2] reloaded " + brainLoadedFile_.string());
+        return;
+    }
+    // No brain loaded: retry only when the search set changed since the
+    // last try, so a missing file costs a few stats per cycle decision
+    // and a brain_v2.txt dropped in later is picked up without a restart.
+    const std::string sig = brainCandidatesSignatureLocked();
+    if (sig == brainLastTriedSignature_) return;
+    brainLastTriedSignature_ = sig;
+    std::string tried;
+    const auto found = findTrainedBrainLocked(tried);
+    if (!found) {
+        // Step 5: no trained brain yet -- build the keeper anyway, at the
+        // first candidate path (where the brain will be saved when a run
+        // passes its gates). The bot keeps trading the configured
+        // strategy, the bars it sees accumulate into bars_live.csv, and
+        // the Train button has a keeper to train with from the start.
+        log("[brain v2] no trained brain -- looked in " + tried + " -- using the configured strategy");
+        const std::vector<std::filesystem::path> candidates = brainCandidatePathsLocked();
+        if (!candidates.empty()) adoptBrainLocked(candidates.front());
+        return;
+    }
+    adoptBrainLocked(found->second);
+}
+
+void LiveRunner::refreshBrainFile() {
+    std::scoped_lock lock(engineMutex_);
+    if (!config_.brain.enabled) {
+        brainRefreshNote_ = "brain is off";
+        return;
+    }
+    if (brain_ && brain_->learning()) {
+        brainRefreshNote_ = "still learning from the current brain -- try again shortly";
+        return;
+    }
+    std::string tried;
+    const auto found = findTrainedBrainLocked(tried);
+    if (!found) {
+        brainRefreshNote_ = brain_ && brain_->trained() ? "no trained brain file found -- the loaded brain stays in use"
+                                                        : "no trained brain -- looked in " + tried;
+        if (!brain_ || !brain_->trained()) {
+            log("[brain v2] no trained brain -- looked in " + tried + " -- using the configured strategy");
+        }
+        return;
+    }
+    if (brain_ && found->first.trainedBars == brain_->trainedBars() &&
+        found->first.trainedUntilMs == brain_->trainedUntilMs()) {
+        brainRefreshNote_ = "already loaded: " + found->second.filename().string() + " (" +
+                            std::to_string(found->first.trainedBars) + " bars)";
+        return;
+    }
+    adoptBrainLocked(found->second);
+    brainRefreshNote_ = "reloaded " + brainLoadedFile_.filename().string() + " (" +
+                        std::to_string(found->first.trainedBars) + " bars)";
+}
+
+void LiveRunner::trainBrainNow(std::optional<std::filesystem::path> history) {
+    try {
+        std::scoped_lock lock(engineMutex_);
+        if (!config_.brain.enabled) return;
+        if (!brain_) {
+            // No keeper yet (no cycle decision has run): build one, so the
+            // run has somewhere to train and somewhere to save to.
+            maybeInitBrainLocked();
+            if (!brain_) {
+                const std::vector<std::filesystem::path> candidates = brainCandidatePathsLocked();
+                if (!candidates.empty()) adoptBrainLocked(candidates.front());
+            }
+        }
+        if (brain_) brain_->trainNow(std::move(history));
+    } catch (const std::exception& ex) {
+        log(std::string("[brain v2] train now failed: ") + ex.what());
+    } catch (...) {
+        log("[brain v2] train now failed (unknown error)");
     }
 }
 
 double LiveRunner::brainMoneyScaleLocked() const {
-    // The brain's money figures are replay units: standard-account
-    // dollars, where 1 lot earns $100 per $1.00 of price move. The live
-    // account counts in its own currency, at its own money per point per
-    // lot: the adopted symbol's tickValue / tickSize (MT5: from the
-    // bridge; cTrader: from the config / security list). One unit of
-    // account money is worth 100 / moneyPerPointPerLot replay dollars:
-    //   standard (1.0 per 0.01 tick -> 100): 1.0, a dollar is a dollar;
-    //   RoboForex-style ProCent (100 USC per 0.01 tick -> 10,000): 0.01,
-    //   so 100 USC of P/L is $1 replay (0.01 lot x $1 = 100 USC);
-    //   3-digit XAUUSDc (0.1 per 0.001 tick -> 100): 1.0, so 1 USC of
-    //   P/L is $1 replay (that symbol's lot is 1 oz, not 100 oz).
-    // The same number converts both ways because it carries the currency
-    // and the contract size together. Unknown symbol: assume standard.
-    const muuk::core::SymbolSpec& spec = config_.strategy.symbol;
-    const double moneyPerPoint = spec.tickSize > 0.0 ? spec.tickValue / spec.tickSize : 0.0;
-    return moneyPerPoint > 0.0 ? 100.0 / moneyPerPoint : 1.0;
+    // One conversion, shared with brainV2ConfigFor (see
+    // replayUnitsPerAccountMoney above).
+    return replayUnitsPerAccountMoney(config_.strategy.symbol);
 }
 
 double LiveRunner::medianSpreadLocked() const {
@@ -2522,48 +2724,21 @@ bool LiveRunner::decideBrainCycleLocked() {
     brainSituation_ = cycle.situation;
     brainCycleActive_ = true;
     log("[brain v2] cycle: " + cycle.decision.why);
+    if (const auto shift = brain_->trainedShift()) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "[brain v2] shift from brain: %d fills x %.1f ATR (%.2f)",
+                      shift->first, shift->second, std::max(1.0, shift->second * cycle.situation.base.atr));
+        log(buf);
+    }
     return true;
 }
 
-bool LiveRunner::entryFilterBlocksLocked() {
-    const EntryFilterConfig& e = config_.connection.entry;
-    // Smart ranges (chart) already read the market to place the range --
-    // ranging markets are where they trade, so the trend filter (which
-    // only opens while the price trends) must not block them.
-    if (config_.connection.regimeRanges) {
-        entryWait_.clear();
-        entryWaitLogged_ = false;
-        return false;
-    }
-    if (e.trendMin <= 0.0) {
-        entryWait_.clear();
-        entryWaitLogged_ = false;
-        return false;
-    }
-    readMarketLocked();
-    const auto& m = marketRead_;
-    std::string why;
-    if (!m.enoughData) {
-        why = "waiting for one-minute bars to read the trend";
-    } else if (std::fabs(m.emaFast - m.emaSlow) < e.trendMin * m.atr) {
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "no trend: EMA8 - EMA21 = %.2f, needs %.2f (%.1f x ATR %.2f)",
-                      std::fabs(m.emaFast - m.emaSlow), e.trendMin * m.atr, e.trendMin, m.atr);
-        why = buf;
-    }
-    if (why.empty()) {
-        if (entryWaitLogged_) log("[entry] the price is trending again -- a new range may open");
-        entryWait_.clear();
-        entryWaitLogged_ = false;
-        return false;
-    }
-    entryWait_ = why;
-    if (!entryWaitLogged_) {
-        log("[entry] no new range: " + why + " (trend filter, Settings)");
-        entryWaitLogged_ = true;
-    }
-    return true;
-}
+// Step 4 (research doc D2): the standalone trend filter is gone -- the
+// brain's gates decide whether a cycle opens, and a fallback cycle opens
+// on the configured strategy. What is left of the old entry filter is the
+// brain (re-)load: a brain file dropped in later must load even while the
+// market holds the range, because the decision that loads it runs only
+// after the market passes.
 
 void LiveRunner::maybeRestartAfterBasketClose() {
     // Keep the strategy running continuously: once a basket closes (profit
@@ -2616,7 +2791,16 @@ void LiveRunner::maybeRestartAfterBasketClose() {
     if (afterManualClose) {
         if (!latestBid_ || !latestAsk_) return;  // no live price to center on
         reopenAfterManualClose_ = false;
-        if (!prepareNextCycle(true)) return;  // brain vetoed: asked again on the next tick
+        if (!prepareNextCycle(true)) {
+            // The brain vetoed it: ask the brain again on later ticks.
+            // Without this the flag stays consumed and a vetoed brain is
+            // never re-asked -- so a brain file dropped in later (or a
+            // changed brain file) would never be picked up without a
+            // restart. Same re-arm as openRange / maybeRefreshStaleEntry.
+            reopenAfterManualClose_ = true;
+            reopenCooldownSeconds_ = 0;
+            return;
+        }
         log("[range] opening a new range around " + std::to_string((*latestBid_ + *latestAsk_) / 2.0));
         closeReason_.clear();
         beginBasket();
@@ -3343,6 +3527,10 @@ LiveSettings LiveRunner::settings() const {
 void LiveRunner::applySettings(const LiveSettings& settings) {
     std::scoped_lock lock(engineMutex_);
     applySettingsToConfig(config_, settings);
+    // The risk knob and the ER mode act from the next cycle decision (and
+    // the next basket observation): the keeper keeps its brain and its
+    // live vetoes -- only its caps change.
+    if (brain_) brain_->setConfig(brainV2ConfigFor(config_));
     // Target, stop loss and auto target act at once, also on a running basket.
     if (engine_) engine_->updateExitRules(engineConfigLocked());
     marketDirty_ = true;
@@ -3456,7 +3644,8 @@ bool LiveRunner::marketBlocksLocked() {
     }
     if (!marketKnown_ || marketStatus_.canOpenRange) {
         marketWaitLogged_ = false;
-        return entryFilterBlocksLocked();
+        maybeInitBrainLocked();
+        return false;
     }
     if (!marketWaitLogged_) {
         log("[market] no new range now: " + marketStatus_.label + " -- " + marketStatus_.detail);
@@ -3937,7 +4126,6 @@ bool LiveRunner::adoptBasketFromBrokerLocked(std::string& why) {
     });
 
     // Lots must be exactly the sequence 1, 2, 3... of the current settings, with alternating sides.
-    const StartSide startSide = config_.strategy.startSide;
     for (std::size_t k = 0; k < legs.size(); ++k) {
         const Volume expected = computeSequenceLot(config_.strategy.lotProgression, static_cast<int>(k) + 1, spec);
         if (legs[k].volume != expected) {
@@ -3952,11 +4140,15 @@ bool LiveRunner::adoptBasketFromBrokerLocked(std::string& why) {
             return false;
         }
     }
-    if ((startSide == StartSide::BuyOnly && legs.front().side != OrderSide::BuyStop) ||
-        (startSide == StartSide::SellOnly && legs.front().side != OrderSide::SellStop)) {
-        why = "the first position isn't on the side the settings start with";
-        return false;
-    }
+    // The basket's own first leg IS its recorded start side -- the range
+    // hangs off it, and the config dropdown only says how the NEXT range
+    // starts (Step 4: the old check refused a basket whose first leg came
+    // from "first order with the trend" or a learned first side). The lot
+    // sequence and the alternating sides above are the real validation.
+    rangeStartSide_ = legs.front().side == OrderSide::BuyStop ? StartSide::BuyOnly : StartSide::SellOnly;
+    rangeSideSet_ = true;
+    log("[resume] the basket at the broker started " +
+        std::string(rangeStartSide_ == StartSide::BuyOnly ? "Buy" : "Sell") + "-first");
 
     // The next order: opposite the last fill, next lot. A working order from
     // an earlier run that is exactly that one is kept; any other working
@@ -4421,7 +4613,7 @@ void LiveRunner::auditLocked() {
             dailyLimitHit_ = false;
             markDirty();
         }
-        const double limit = config_.connection.dailyLossLimitMoney;
+        const double limit = effectiveDailyLossLimitMoneyLocked();
         const double todayNet = dayRealized_ + live.net;
         if (limit <= 0.0) {
             set(kAuditDaily, 0, "off -- today " + usd(todayNet), false);
@@ -4450,7 +4642,7 @@ void LiveRunner::auditLocked() {
         } else if (config_.strategy.basketStopLossMoney <= 0.0) {
             warn = "no stop loss";
         }
-        if (config_.connection.dailyLossLimitMoney <= 0.0) warn += std::string(warn.empty() ? "" : "; ") + "no daily loss limit";
+        if (effectiveDailyLossLimitMoneyLocked() <= 0.0) warn += std::string(warn.empty() ? "" : "; ") + "no daily loss limit";
         // Margin the next fill would need vs the typed-in balance (FIX sends neither).
         const double balance = config_.connection.accountBalance;
         if (balance > 0.0 && active && haveQuote) {
@@ -4471,7 +4663,7 @@ void LiveRunner::auditLocked() {
             set(kAuditRisk, 2, warn, true);
         } else if (warn.empty()) {
             set(kAuditRisk, 0, "stop loss " + usd(config_.strategy.basketStopLossMoney) + ", daily limit " +
-                                   usd(config_.connection.dailyLossLimitMoney),
+                                   usd(effectiveDailyLossLimitMoneyLocked()),
                 false);
         } else {
             set(kAuditRisk, 1, warn + " (Settings)", true);

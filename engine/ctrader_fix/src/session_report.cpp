@@ -288,7 +288,9 @@ void settingsTable(Layout& lay, const SessionReportInput& in) {
                                                    std::to_string(s.autoTargetPercent) + "% of the positions' cost"
                                              : amount(s.profitTarget)},
         {"Stop loss (net)", s.stopLoss > 0 ? amount(s.stopLoss) : std::string("off")},
-        {"Daily loss limit", s.dailyLossLimit > 0 ? amount(s.dailyLossLimit) : std::string("off")},
+        {"Daily loss limit", s.dailyLossPercent > 0 ? fmt("%.0f%% of the balance", s.dailyLossPercent)
+                                                     : (s.dailyLossLimit > 0 ? amount(s.dailyLossLimit)
+                                                                             : std::string("off"))},
         {"Lock & pause at loss",
          s.lockAtLoss > 0 || s.lockAtLossPercent > 0
              ? (s.lockAtLoss > 0 ? amount(s.lockAtLoss) : std::string()) +
@@ -336,12 +338,14 @@ void settingsTable(Layout& lay, const SessionReportInput& in) {
                                                       fmt(" to $%.2f", s.entry.rangeMaxWidth)
                                                 : std::string("off (fixed width)")},
         {"Target move", s.entry.targetHalfRange ? std::string("half the range") : fmt("$%.2f", s.lastLotTargetMove)},
-        {"Trend filter", s.entry.trendMin > 0 ? fmt("EMA8-EMA21 at least %.1f x ATR", s.entry.trendMin)
-                                              : std::string("off")},
-        {"First order with the trend", s.entry.startWithTrend ? "on" : "off"},
+        {"Risk appetite", std::string(riskAppetiteName(s.riskAppetite)) + " (worst lock $" +
+                              fmt("%.0f", riskPresetFor(s.riskAppetite).maxLockCost) + ", max " +
+                              std::to_string(riskPresetFor(s.riskAppetite).maxLevels) + " levels)"},
+        {"Brain ER gate", s.erMode == 0 ? std::string("off") : s.erMode == 1 ? std::string("block chop")
+                          : s.erMode == 2   ? std::string("block chop + clean-trend override")
+                                            : std::string("block chop + trend override + ATR percentile")},
         {"Max orders / max lot", (s.maxOrders > 0 ? std::to_string(s.maxOrders) : std::string("no limit")) + " / " +
                                      (s.maxLot > 0 ? fmt("%.2f", s.maxLot) : std::string("no limit"))},
-        {"Max basket loss", s.maxBasketLoss > 0 ? amount(s.maxBasketLoss) : "off"},
         {"Auto-open next range", s.autoContinue ? "on" : "off"},
     };
     PdfDocument& doc = lay.doc();

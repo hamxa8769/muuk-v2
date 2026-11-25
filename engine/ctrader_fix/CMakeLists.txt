@@ -36,6 +36,7 @@ if(MUUK_BUILD_TESTS)
         tests/test_live_runner.cpp
         tests/test_live_resume.cpp
         tests/test_brain_journal.cpp
+        tests/test_brain_trainer.cpp
         tests/test_broker_account_info.cpp
         tests/test_reporting.cpp
         tests/test_market_hours.cpp

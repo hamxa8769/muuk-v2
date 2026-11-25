@@ -57,9 +57,6 @@ ImVec4 pnlColor(double v) {
     return kGrey;
 }
 
-// Auto-target levels 20 / 40 / 60 / 80 / 100 = 200 / 240 / 280 / 320 / 360 % of the cost.
-int targetLevel(int percent) { return std::clamp((percent - 160) / 2, 20, 100); }
-int levelPercent(int level) { return 160 + 2 * level; }
 
 // "2h 05m", "12m 30s", "45s", "3d 4h".
 std::string countdown(int64_t ms) {
@@ -478,12 +475,15 @@ void clampSettings(LiveSettings& s) {
     s.recovery.escapeLookbackBars = std::clamp(s.recovery.escapeLookbackBars, 4, 120);
     s.recovery.escapeStopAtr = std::clamp(s.recovery.escapeStopAtr, 0.2, 10.0);
     s.recovery.escapeMaxTries = std::clamp(s.recovery.escapeMaxTries, 0, 10);
-    s.maxOrders = std::max(0, s.maxOrders);  // 0 = no limit
-    s.maxLot = std::max(0.0, s.maxLot);      // 0 = no limit
-    s.maxBasketLoss = std::max(0.0, s.maxBasketLoss);
+    // Step 4: the hard caps. Max orders is the preset's max levels (the
+    // knob in the Brain panel); max lot never above 1.00; max basket loss is
+    // gone -- it merged into the stop loss, which is clamped above.
+    s.maxOrders = std::clamp(s.maxOrders, 1,
+                             muuk::ctrader_fix::riskPresetFor(s.riskAppetite).maxLevels);
+    s.maxLot = std::clamp(s.maxLot, 0.01, muuk::ctrader_fix::kHardMaxLot);
+    s.dailyLossPercent = std::clamp(s.dailyLossPercent, 0.0, 100.0);
     s.commissionPerLot = std::max(0.0, s.commissionPerLot);
     s.commissionPerMillion = std::max(0.0, s.commissionPerMillion);
-    s.autoTargetPercent = std::clamp(s.autoTargetPercent, 200, 360);  // levels 20..100 (see targetLevel)
     s.recovery.guardLockMarginLevel = std::clamp(s.recovery.guardLockMarginLevel, 0.0, 5000.0);
     s.recovery.guardStopMarginLevel = std::clamp(s.recovery.guardStopMarginLevel, 0.0, 5000.0);
     s.recovery.hedgedMarginPercent = std::clamp(s.recovery.hedgedMarginPercent, 0.0, 100.0);
@@ -741,7 +741,8 @@ void DashboardWindow::render(LiveController& controller) {
     controller.setAutoReconnect(prefs_.autoReconnect);
     controller.tick();  // reconnects a dropped connection when it's time
     // Self-update: one background GitHub check per app run, never blocking
-    // the UI; a failed check stays silent. When the update is downloaded,
+    // the UI; a failed check shows on the update button, without an alarm.
+    // When the update is downloaded,
     // verified and ready, quit cleanly -- the updater's batch file copies
     // the new release over this folder and restarts the app. Open positions
     // stay at the broker and resume on restart, same as Disconnect + quit.
@@ -874,10 +875,13 @@ void DashboardWindow::renderUpdateButton() {
     using Updater = updater::Updater;
     const Updater::State state = updater_.state();
     const float updateWidth = 230.0f;
+    // A newer release is known: gold, with the release tag exactly as
+    // GitHub names it (v2.0.x). The tag comes from the updater's check,
+    // never from a hard-coded string.
     if (state == Updater::State::Available) {
         ImGui::SameLine();
-        if (glass::button(("Update available " + updater_.latestTag()).c_str(), kGreen, ImVec2(updateWidth, 0),
-                          glass::ButtonKind::Primary)) {
+        if (glass::button(("\xE2\xAC\x86 Update available: " + updater_.latestTag()).c_str(), kAmber,
+                          ImVec2(updateWidth, 0), glass::ButtonKind::Primary)) {
             updater_.beginInstall();
         }
         ImGui::SetItemTooltip("A newer Muuk (%s) is on GitHub. Downloads it, installs it over this copy and "
@@ -895,10 +899,13 @@ void DashboardWindow::renderUpdateButton() {
         ImGui::EndDisabled();
         return;
     }
+    // A check is running: a disabled button, so a second click can neither
+    // start a duplicate check nor report an error.
     if (state == Updater::State::Checking) {
         ImGui::SameLine();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("Checking for updates...");
+        ImGui::BeginDisabled(true);
+        glass::button("Checking\xE2\x80\xA6", glass::palette().neutral, ImVec2(updateWidth, 0));
+        ImGui::EndDisabled();
         return;
     }
     if (state == Updater::State::ReadyToInstall) {
@@ -907,11 +914,27 @@ void DashboardWindow::renderUpdateButton() {
         ImGui::TextDisabled("Update downloaded - restarting to install...");
         return;
     }
-    // Idle (up to date) or Failed (offline): a quiet manual check. A failed
-    // check shows no alarm -- the button is just there again.
+    // Checked, and this is the latest release: calm green, not gold.
+    // Clicking checks again.
+    if (state == Updater::State::UpToDate) {
+        ImGui::SameLine();
+        if (glass::button("\xE2\x9C\x93 Up to date", kGreen, ImVec2(updateWidth, 0))) updater_.checkNow();
+        ImGui::SetItemTooltip("You have the latest Muuk (%s). Click to check again.", kMuukVersion);
+        return;
+    }
+    // The last check failed (offline, GitHub unreachable): say so plainly
+    // instead of looking like "never checked". Clicking tries again. The
+    // updater never reaches this state while an update is known, so a
+    // failed check cannot hide one.
+    if (state == Updater::State::Failed) {
+        ImGui::SameLine();
+        if (glass::button("Check failed \xE2\x80\x94 try again", kAmber, ImVec2(updateWidth, 0))) updater_.checkNow();
+        if (!updater_.error().empty()) ImGui::SetItemTooltip("%s", updater_.error().c_str());
+        return;
+    }
+    // Idle: never checked yet this run. A quiet manual check.
     ImGui::SameLine();
-    if (ImGui::SmallButton("Check for updates")) updater_.checkNow();
-    if (!updater_.error().empty()) ImGui::SetItemTooltip("%s", updater_.error().c_str());
+    if (glass::button("Check for updates", glass::palette().neutral, ImVec2(updateWidth, 0))) updater_.checkNow();
 }
 
 void DashboardWindow::renderHeader(LiveController& controller, bool running, bool connected) {
@@ -1091,8 +1114,8 @@ void DashboardWindow::renderHeader(LiveController& controller, bool running, boo
     ImGui::TextDisabled("Config file");
     ImGui::SameLine();
     // The update area is always reserved, so the row never jumps when the
-    // button appears: "Update available vX.Y.Z" / "Downloading... N%" /
-    // "Check for updates".
+    // button changes: "Update available: vX.Y.Z" / "Downloading... N%" /
+    // "Up to date" / "Check failed — try again" / "Check for updates".
     const float updateWidth = 230.0f;
     const float buttonsWidth = 2 * 120.0f + updateWidth + ImGui::GetStyle().ItemSpacing.x * 3;
     ImGui::SetNextItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x - buttonsWidth));
@@ -1449,6 +1472,23 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
         } else {
             ImGui::TextDisabled("Brain: %s", snap->brainStatus.c_str());
         }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("\xE2\x86\xBB##brainrefresh")) controller.refreshBrain();
+        ImGui::SetItemTooltip("Re-read brain_v2.txt now -- picks up a new or replaced brain file without restarting.");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!snap->brainTraining.empty() || snap->brainStatus == "off");
+        if (ImGui::SmallButton("Train##braintrain")) controller.trainBrain(snap->settings.trainerHistoryPath);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Train a new brain now, in the background, on the bars the bot collected (or the history path in Settings). The bot keeps trading its current brain; a new brain is adopted only when the strict gates pass.");
+        if (!snap->brainTraining.empty()) {
+            ImGui::TextDisabled("%s", snap->brainTraining.c_str());
+        }
+        if (!snap->brainTrainingResult.empty()) {
+            ImGui::TextDisabled("Last training: %s", snap->brainTrainingResult.c_str());
+        }
+        if (!snap->brainRefreshNote.empty()) {
+            ImGui::TextDisabled("Brain refresh: %s", snap->brainRefreshNote.c_str());
+        }
         if (snap->brainStatus != "off") {
             ImGui::TextDisabled("Brain today: %d cycles, %d wins, %d locks", snap->brainCyclesToday,
                                 snap->brainWinsToday, snap->brainLocksToday);
@@ -1570,7 +1610,7 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
             }
             if (account_.platform != 1 && snap->settings.commissionPerLot <= 0.0 &&
                 snap->settings.commissionPerMillion <= 0.0) {
-                ImGui::TextColored(kAmber, "Commission is set to $0 - enter your broker's rate in Strategy settings.");
+                ImGui::TextColored(kAmber, "Commission is set to $0 - enter your broker's rate in Settings (Fallback).");
             }
             // The same numbers in the broker's own columns, to compare side by side.
             const auto& b = snap->live;
@@ -1655,26 +1695,253 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
 void DashboardWindow::renderSettingsPanel(LiveController& controller, const std::optional<LiveSnapshot>& snap,
                                           bool connected) {
     beginPage("settings_scroll");
+    // Step 4: one Brain panel holds all of the bot's core settings. `s` lives
+    // at function scope so the Brain section, the Fallback table and the Keys
+    // below all edit the same settings.
+    LiveSettings& s = editSettings_;
     renderAccountSection(controller.isRunning());
     ImGui::Spacing();
     renderThisPcSection();
     ImGui::Spacing();
+    // --- Brain: the bot's core settings. Everything the bot does is driven
+    // from here; the Fallback table below only runs when the brain is off or
+    // has no trained file.
     withFont(boldFont_, [] {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Strategy settings");
+        ImGui::TextUnformatted("Brain");
     });
     if (settingsDirty_) {
         ImGui::SameLine();
         glass::pill("edited", kAmber);
     }
-    ImGui::TextDisabled("Saved to your config file, so the app always opens with them. The range applies from the "
-                        "next range; profit target and market hours at once.");
+    ImGui::TextDisabled("The brain is the bot's core settings: risk, the ER gate, the brain file and the keys. "
+                        "Saved to your config file, so the app always opens with them.");
 
     ImGui::BeginDisabled(!settingsLoaded_);
+    // Live status (same lines as the Range panel) + the refresh icon.
+    if (snap && connected && !snap->brainStatus.empty()) {
+        if (!snap->brainDetail.empty()) {
+            ImGui::TextDisabled("Brain: %s | %s", snap->brainStatus.c_str(), snap->brainDetail.c_str());
+        } else {
+            ImGui::TextDisabled("Brain: %s", snap->brainStatus.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("\xE2\x86\xBB##brainrefresh2")) controller.refreshBrain();
+        ImGui::SetItemTooltip("Re-read brain_v2.txt now -- picks up a new or replaced brain file without restarting.");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!snap->brainTraining.empty() || snap->brainStatus == "off");
+        if (ImGui::SmallButton("Train##braintrain2")) controller.trainBrain(s.trainerHistoryPath);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Train a new brain now, in the background, on the bars the bot collected (or the history path below). The bot keeps trading its current brain; a new brain is adopted only when the strict gates pass.");
+        if (!snap->brainTraining.empty()) {
+            ImGui::TextDisabled("%s", snap->brainTraining.c_str());
+        }
+        if (!snap->brainTrainingResult.empty()) {
+            ImGui::TextDisabled("Last training: %s", snap->brainTrainingResult.c_str());
+        }
+        if (!snap->brainRefreshNote.empty()) {
+            ImGui::TextDisabled("Brain refresh: %s", snap->brainRefreshNote.c_str());
+        }
+        if (snap->brainStatus != "off") {
+            ImGui::TextDisabled("Brain today: %d cycles, %d wins, %d locks", snap->brainCyclesToday,
+                                snap->brainWinsToday, snap->brainLocksToday);
+        }
+    } else {
+        ImGui::TextDisabled("Brain: not loaded yet -- connect the bot to see its status.");
+    }
+
+    // Risk appetite: the ONE knob (D11). The preset sets the worst lock, the
+    // deepest level and the daily loss limit; the brain picks its policies
+    // inside them, it never breaks them.
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Risk appetite"); });
+    ImGui::TextDisabled("One knob for how much the brain may risk. Changing it sets the daily loss limit below.");
+    {
+        const float third = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+        auto appetiteButton = [&](const char* label, muuk::ctrader_fix::RiskAppetite appetite, ImVec4 color) {
+            const bool on = s.riskAppetite == appetite;
+            if (glass::button(label, on ? color : glass::palette().neutral, ImVec2(third, 0))) {
+                s.riskAppetite = appetite;
+                s.dailyLossPercent = muuk::ctrader_fix::riskPresetFor(appetite).dailyLossPercent;
+                settingsDirty_ = true;
+            }
+        };
+        appetiteButton("Cautious", muuk::ctrader_fix::RiskAppetite::Cautious, kGreen);
+        ImGui::SameLine();
+        appetiteButton("Balanced", muuk::ctrader_fix::RiskAppetite::Balanced, kAmber);
+        ImGui::SameLine();
+        appetiteButton("Aggressive", muuk::ctrader_fix::RiskAppetite::Aggressive, kRed);
+    }
+    {
+        const muuk::ctrader_fix::RiskPreset preset = muuk::ctrader_fix::riskPresetFor(s.riskAppetite);
+        ImGui::TextDisabled("Worst lock $%.0f, at most %d levels, daily loss %.0f%% of the balance",
+                            preset.maxLockCost, preset.maxLevels, preset.dailyLossPercent);
+    }
+
+    // Hard caps (D8-D10): real enforcement, not labels -- the runner stops
+    // the day at the daily limit, the engine refuses any lot above 1.00,
+    // and a basket closes at the stop loss.
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Hard caps"); });
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Max single lot");
+    ImGui::SetItemTooltip("No single order is ever bigger than this, not even at the deepest level. Hard cap 1.00.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputDouble("##brainmaxlot", &s.maxLot, 0.01, 0.10, "%.2f")) settingsDirty_ = true;
+    s.maxLot = std::clamp(s.maxLot, 0.01, muuk::ctrader_fix::kHardMaxLot);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Daily loss limit (% of balance)");
+    ImGui::SetItemTooltip("Once today's booked + floating net reaches minus this share of the balance, the running "
+                          "range is closed and no new range opens until tomorrow (your computer's date).");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputDouble("##braindailyloss", &s.dailyLossPercent, 0.5, 1.0, "%.1f%%")) settingsDirty_ = true;
+    s.dailyLossPercent = std::clamp(s.dailyLossPercent, 0.0, 100.0);
+    {
+        const double bal = snap && snap->brokerAccountFresh ? snap->brokerAccount.balance : s.accountBalance;
+        const double dailyLimit =
+            muuk::ctrader_fix::effectiveDailyLossLimitMoney(s.dailyLossPercent, s.dailyLossLimit, bal);
+        if (dailyLimit > 0.0 && bal > 0.0) {
+            ImGui::TextDisabled("= %s of %s now", money(-dailyLimit).c_str(), amount(bal).c_str());
+        } else if (dailyLimit > 0.0) {
+            ImGui::TextDisabled("= %s (balance unknown -- connect the bot to see it in money)",
+                                money(-dailyLimit).c_str());
+        } else {
+            ImGui::TextDisabled("Off -- 0% means no daily limit (not recommended).");
+        }
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Basket stop loss ($)");
+    ImGui::SetItemTooltip("When a basket's net falls to minus this, every position is closed and every pending "
+                          "order cancelled -- the loss is taken instead of growing. 0 = off (the tested default: "
+                          "Step 6 proved a $50 stop cuts the validated edge; the brain's $150 lock cap is the "
+                          "worst case instead).");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputDouble("##brainstoploss", &s.stopLoss, 5.0, 25.0, "%.2f")) settingsDirty_ = true;
+    s.stopLoss = std::max(0.0, s.stopLoss);
+
+    // Brain ER gate (Step 1): Kaufman Efficiency Ratio. Mode 2 is the
+    // tested winner -- the shipped brain records erMode 2 and the keeper
+    // overrides the panel with it (Step 6b); Off is only the no-brain
+    // fallback.
+    ImGui::Spacing();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Brain ER gate");
+    ImGui::SetItemTooltip("Kaufman Efficiency Ratio: clean trend (high ER) trades trend-wise, choppy whipsaw "
+                          "(low ER) is blocked. Off = no ER gate; a loaded brain that records an ER mode "
+                          "overrides this (the shipped brain records mode 2).");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const char* erItems[] = {"Off", "Block chop only", "Block chop + trade clean trends",
+                             "ATR percentile breaker"};
+    int erIndex = std::clamp(s.erMode, 0, 3);
+    if (ImGui::Combo("##brainermode", &erIndex, erItems, 4)) {
+        s.erMode = erIndex;
+        settingsDirty_ = true;
+    }
+    ImGui::TextDisabled("Brain file: %s", s.brainFile.c_str());
+
+    // Step 5: where Train reads its bars from. Empty = the bars the bot
+    // collected (bars_live.csv next to the brain file); or paste the path
+    // to an MT5 1-minute history export (MT5 writes it to
+    // MQL5\Files\MuukHistory via Export). Saved with the settings.
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Trainer history");
+    ImGui::SetItemTooltip("Empty = train on the bars the bot collected. Or paste the path to a history CSV file (or a folder of them) -- an MT5 1-minute history export, for example. A fresh install has almost no bars yet, so the first Train will refuse with 'too few bars' until bars accumulate or a history file is given.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (!settingsDirty_) {  // buffer mirrors the settings until the operator edits it
+        const std::size_t n = std::min(s.trainerHistoryPath.size(), trainerHistoryBuffer_.size() - 1);
+        std::copy_n(s.trainerHistoryPath.begin(), n, trainerHistoryBuffer_.begin());
+        trainerHistoryBuffer_[n] = '\0';
+    }
+    if (ImGui::InputTextWithHint("##trainerhistory", "empty = the bot's own bars", trainerHistoryBuffer_.data(),
+                                 trainerHistoryBuffer_.size())) {
+        s.trainerHistoryPath = trainerHistoryBuffer_.data();
+        settingsDirty_ = true;
+    }
+
+    // Smart ranges (chart): kept, experimental (D7). Both chart placements
+    // lost to centered ranges in backtest -- keep off unless testing it.
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Smart ranges (chart)");
+    ImGui::SetItemTooltip("On: each new range sits on the market's own recent high/low (ranging) or its "
+                          "Bollinger band (calm), read from the last one-minute bars, instead of centered on "
+                          "the live price. The width stays the brain's gap / the configured width; the chart "
+                          "decides where the range sits. EXPERIMENTAL: both chart placements lost to centered "
+                          "ranges in backtest.");
+    ImGui::SameLine();
+    if (ImGui::Checkbox("On##brainregimeranges", &s.regimeRanges)) settingsDirty_ = true;
+
+    // API keys (Gemini / FRED / Finnhub): stored only in this config file
+    // (my_account.local.json) -- never in the repo, never logged -- and
+    // shown masked. The Gemini key is what the brain's news/event
+    // understanding (Phase 5) will call with.
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Keys");
+    ImGui::TextDisabled("API keys for the brain and data feeds. Stored only in this config file -- never in the "
+                        "repo, never logged. Leave empty if unused.");
+    const auto syncKeyBuf = [](std::array<char, 256>& buf, const std::string& key) {
+        const std::size_t n = std::min(key.size(), buf.size() - 1);
+        std::copy_n(key.begin(), n, buf.begin());
+        buf[n] = '\0';
+    };
+    if (!settingsDirty_) {  // buffers mirror the settings until the operator edits one
+        syncKeyBuf(geminiKeyBuffer_, s.keys.gemini);
+        syncKeyBuf(fredKeyBuffer_, s.keys.fred);
+        syncKeyBuf(finnhubKeyBuffer_, s.keys.finnhub);
+    }
+    auto keyRow = [&](const char* label, const char* tip, const char* id, std::array<char, 256>& buf,
+                      std::string* target) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SetItemTooltip("%s", tip);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputText((std::string("##key") + id).c_str(), buf.data(), buf.size(),
+                             ImGuiInputTextFlags_Password)) {
+            *target = buf.data();
+            settingsDirty_ = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", muuk::ctrader_fix::maskApiKey(*target).c_str());
+    };
+    keyRow("Gemini API key",
+           "The brain's key for Google Gemini (free tier): news and event understanding in Phase 5. "
+           "Paste the key from Google AI Studio; it is stored only in this config file.",
+           "gemini", geminiKeyBuffer_, &s.keys.gemini);
+    keyRow("FRED API key",
+           "Federal Reserve Economic Data (free): real yields, dollar index and other macro series "
+           "for the brain's market read.",
+           "fred", fredKeyBuffer_, &s.keys.fred);
+    keyRow("Finnhub API key",
+           "Finnhub (free tier): news and the economic calendar for the news guard.",
+           "finnhub", finnhubKeyBuffer_, &s.keys.finnhub);
+
+    // Removed in Step 4 -- what replaced each option:
+    ImGui::Spacing();
+    ImGui::TextDisabled("Removed in Step 4 -- what replaced them:");
+    ImGui::TextDisabled("  Trend filter: trend is a brain input now (Kaufman Efficiency Ratio), not a block.");
+    ImGui::TextDisabled("  First order with the trend: Both stays -- Step 3 showed a forced first side loses.");
+    ImGui::TextDisabled("  Target move = half the range: the brain's exit decides; fallback uses Profit target.");
+    ImGui::TextDisabled("  Auto profit target: fixed Profit target / Last-lot target only.");
+    ImGui::TextDisabled("  Max basket loss: merged into the stop loss above -- a basket closes at the stop loss.");
+    ImGui::TextDisabled("  Lot growth presets: replaced by the Risk appetite knob above.");
+    ImGui::TextDisabled("  Range from ATR: still here, in Fallback below -- it only ever set the fallback width.");
+
+    // --- Fallback: only when the brain is off or has no trained file.
+    ImGui::Spacing();
+    withFont(boldFont_, [] {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Fallback -- only when the brain is off or has no trained file");
+    });
+    ImGui::TextDisabled("These settings only run when the brain is off or has no trained file. With a trained "
+                        "brain loaded, the brain's gap, levels and exit decide.");
     if (ImGui::BeginTable("settings", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 1.1f);
         ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        LiveSettings& s = editSettings_;
 
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
@@ -1730,16 +1997,6 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
                               &e.rangeMaxWidth, 0.5, "%.2f", &settingsDirty_);
                 e.rangeMaxWidth = std::clamp(e.rangeMaxWidth, std::max(0.1, s.rangeWidth), 1000.0);
             }
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Smart ranges (chart)");
-        ImGui::SetItemTooltip("On: each new range sits on the market's own recent high/low (ranging) or its "
-                              "Bollinger band (calm), read from the last one-minute bars, instead of centered on "
-                              "the live price. The width stays the brain's gap / the configured width; the chart "
-                              "decides where the range sits. The trend filter does not apply while this is on.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("On##regimeranges", &s.regimeRanges)) settingsDirty_ = true;
         settingInt("Shift range after N fills (0 = off)",
                    "After this many fills the range steps out around the same center, the gap widening by the step below (at most the widest shifted range) -- the bot stops trading the same trapped range and opens fewer, wider cycles. 2 = after every 2nd fill.",
                    &s.shiftAfterFills, &settingsDirty_);
@@ -1750,62 +2007,17 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
         settingDouble("  widest shifted range ($)", "A shifted range never gets wider than this, even as it keeps stepping out.",
                       &s.shiftMaxGap, 0.5, "%.2f", &settingsDirty_);
         s.shiftMaxGap = std::clamp(s.shiftMaxGap, std::max(0.1, s.rangeWidth), 1000.0);
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Target move = half the range");
-            ImGui::SetItemTooltip("With the last-lot target: the price move it asks for is half the range width (a "
-                                  "wider range, a bigger target) instead of the fixed move.");
-            ImGui::TableNextColumn();
-            if (ImGui::Checkbox("On##halfrange", &e.targetHalfRange)) settingsDirty_ = true;
-            bool trendOn = e.trendMin > 0.0;
-            double trendK = trendOn ? e.trendMin : 1.0;
-            toggleWithValue("Trend filter",
-                            "On: a new range opens only while the price is going somewhere -- the fast average (EMA 8) "
-                            "is at least this many ATRs away from the slow one (EMA 21) -- not while it chops sideways, "
-                            "where baskets climb to deep levels. Fewer ranges, far fewer deep ones.",
-                            "trendmin", &trendOn, &trendK, 0.0, 1.0, 0.1, "%.1f x ATR");
-            e.trendMin = trendOn ? std::clamp(trendK, 0.1, 10.0) : 0.0;
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("First order with the trend");
-            ImGui::SetItemTooltip("On: a Buy Stop first when EMA 8 is above EMA 21, a Sell Stop first when below -- "
-                                  "instead of the fixed 'First order' side.");
-            ImGui::TableNextColumn();
-            if (ImGui::Checkbox("On##withtrend", &e.startWithTrend)) settingsDirty_ = true;
         }
-        ImGui::BeginDisabled(s.autoTarget);
         settingDouble("Profit target ($)", "Floating net profit at which the whole basket is booked and closed.",
                       &s.profitTarget, 0.25, "%.2f", &settingsDirty_);
-        ImGui::EndDisabled();
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("Auto profit target");
-        ImGui::SetItemTooltip("On: the target is this %% of what the open positions cost (commission open + close + "
-                              "spread) -- small for one 0.01 lot, bigger with every fill. Replaces the $ target.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("On##autotarget", &s.autoTarget)) settingsDirty_ = true;
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!s.autoTarget);
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        const char* levelItems[] = {"20  =  200% of cost", "40  =  240% of cost", "60  =  280% of cost",
-                                    "80  =  320% of cost", "100  =  360% of cost"};
-        int levelIndex = std::clamp(targetLevel(s.autoTargetPercent) / 20 - 1, 0, 4);
-        if (ImGui::Combo("##autopct", &levelIndex, levelItems, 5)) {
-            s.autoTargetPercent = levelPercent((levelIndex + 1) * 20);
-            settingsDirty_ = true;
-        }
-        ImGui::EndDisabled();
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Last-lot target");
         ImGui::SetItemTooltip("On: the target is what the last (deepest) lot opened earns on a price move of the amount "
                               "on the right. 1.00 lot x $1 = 100 (US cents on a cent account, $ on a standard one); "
-                              "0.01 lot = 1. It grows with every level, like the lots do. Replaces the fixed and the "
-                              "auto target; the break-even target from its level still lowers it.");
+                              "0.01 lot = 1. It grows with every level, like the lots do. Replaces the fixed "
+                              "target; the break-even target from its level still lowers it.");
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("On##lastlot", &s.lastLotTarget)) settingsDirty_ = true;
         ImGui::SameLine();
@@ -3674,7 +3886,7 @@ void DashboardWindow::renderAccountSection(bool running) {
 
 
 // ---------------------------------------------------------------------------
-// Market hours, news, auto target
+// Market hours, news, target bar
 
 MarketStatus DashboardWindow::currentMarket(LiveController& controller, const std::optional<LiveSnapshot>& snap,
                                             bool connected) {
@@ -4152,7 +4364,7 @@ void DashboardWindow::renderTargetBar(LiveController& /*controller*/, const Live
     const double net = floatingPnl(snap);
     const double target = snap.targetNow > 0.0 ? snap.targetNow : s.profitTarget;
     const bool haveStop = s.stopLoss > 0.0;
-    const double lossScale = haveStop ? s.stopLoss : (s.maxBasketLoss > 0.0 ? s.maxBasketLoss : std::max(target, 0.01));
+    const double lossScale = haveStop ? s.stopLoss : std::max(target, 0.01);
     const float h = ImGui::GetFrameHeight();
 
     // Row 1: gear, net, target.
@@ -4167,7 +4379,7 @@ void DashboardWindow::renderTargetBar(LiveController& /*controller*/, const Live
         targetPopupPos_ = below ? ImVec2(gearMin.x, gearMax.y + 4.0f) : ImVec2(gearMin.x, gearMin.y - 4.0f);
         targetPopupPivot_ = below ? ImVec2(0.0f, 0.0f) : ImVec2(0.0f, 1.0f);
     }
-    ImGui::SetItemTooltip("Profit target: fixed, or automatic from what the open positions cost.");
+    ImGui::SetItemTooltip("Profit target: fixed, or from the last lot's move.");
     ImGui::SameLine(0.0f, 8.0f);
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("NET");
@@ -4178,8 +4390,6 @@ void DashboardWindow::renderTargetBar(LiveController& /*controller*/, const Live
         (snap.escapeActive  ? "  (break-even escape, level " + std::to_string(snap.filledLevel) + ")"
          : s.lastLotTarget ? "  (last lot, level " + std::to_string(snap.filledLevel) + ", x $" +
                                  price(s.lastLotTargetMove) + ")"
-         : s.autoTarget    ? "  (level " + std::to_string(targetLevel(s.autoTargetPercent)) + " = " +
-                              std::to_string(s.autoTargetPercent) + "%)"
                            : "");
     ImGui::SameLine(0.0f, 12.0f);
     const float targetW = ImGui::CalcTextSize(targetText.c_str()).x;
@@ -4193,7 +4403,7 @@ void DashboardWindow::renderTargetBar(LiveController& /*controller*/, const Live
     ImGui::SetItemTooltip("Net P/L of the open positions (after commission and spread).\n"
                           "Right, green: towards the profit target. Left, red: towards %s.\n"
                           "The colour deepens as it grows; each move pulses green (up) or red (down).",
-                          haveStop ? "the stop loss" : (s.maxBasketLoss > 0.0 ? "the max basket loss" : "a loss the size of the target"));
+                          haveStop ? "the stop loss" : "a loss the size of the target"));
 
     // Row 3: the scale under it.
     {
@@ -4223,8 +4433,6 @@ void DashboardWindow::renderTargetBar(LiveController& /*controller*/, const Live
         } else if (s.lastLotTarget) {
             ImGui::Text("Last lot x $%.2f move: %s  (level %d)", s.lastLotTargetMove, money(target).c_str(),
                         snap.filledLevel);
-        } else if (s.autoTarget) {
-            ImGui::Text("Auto: %d%% of the open positions' cost = %s", s.autoTargetPercent, money(target).c_str());
         } else {
             ImGui::Text("Fixed: %s", money(s.profitTarget).c_str());
         }
@@ -4507,26 +4715,11 @@ void DashboardWindow::renderRiskCalculator(const std::optional<LiveSnapshot>& sn
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Lot growth");
-        ImGui::SetItemTooltip("How each next order's lot grows. Safe: first lot + increment (0.01, 0.02, 0.03...). "
-                              "Balanced: x1.5. Aggressive: x2 (0.01, 0.02, 0.04, 0.08...). The table shows what each "
-                              "can lose.");
+        ImGui::SetItemTooltip("How each next order's lot grows: the multiplier below (2 = double) or the increment. "
+                              "The old Safe / Balanced / Aggressive lot presets are gone -- risk is one knob now, "
+                              "in the Brain panel.");
         ImGui::TableNextColumn();
-        {
-            const float third = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
-            auto preset = [&](const char* label, double mult, ImVec4 color) {
-                const bool on = mult > 1.0 ? std::fabs(s.lotMultiplier - mult) < 0.01 : s.lotMultiplier <= 1.0;
-                if (glass::button(label, on ? color : glass::palette().neutral, ImVec2(third, 0))) {
-                    s.lotMultiplier = mult;
-                    if (mult <= 1.0 && s.lotIncrement <= 0.0) s.lotIncrement = 0.01;
-                    settingsDirty_ = true;
-                }
-            };
-            preset("Safe +", 1.0, kGreen);
-            ImGui::SameLine();
-            preset("Balanced x1.5", 1.5, kAmber);
-            ImGui::SameLine();
-            preset("Aggressive x2", 2.0, kRed);
-        }
+        ImGui::TextDisabled("Set by the multiplier / increment below; capped by the Brain panel's risk knob.");
         if (s.lotMultiplier > 1.0) {
             settingDouble("  multiplier", "Each next order's lot = the previous one x this (2 = double).",
                           &s.lotMultiplier, 0.1, "%.2f", &settingsDirty_);
@@ -4535,13 +4728,16 @@ void DashboardWindow::renderRiskCalculator(const std::optional<LiveSnapshot>& sn
                           &s.lotIncrement, 0.01, "%.2f", &settingsDirty_);
         }
         settingInt("Max orders",
-                   "No more orders are placed in a range beyond this many (the deepest level). 0 = no limit (on MT5 "
-                   "the broker's own order limit still applies).",
+                   "No more orders are placed in a range beyond this many (the deepest level). Capped at the risk "
+                   "knob's max levels (Cautious 4, Balanced / Aggressive 6).",
                    &s.maxOrders, &settingsDirty_);
+        s.maxOrders = std::clamp(s.maxOrders, 1,
+                                 muuk::ctrader_fix::riskPresetFor(s.riskAppetite).maxLevels);
         settingDouble("Max lot",
-                      "No single order bigger than this; the level that would need more is not placed. 0 = no limit "
-                      "(the broker's largest lot still applies).",
+                      "No single order bigger than this; the level that would need more is not placed. Hard cap "
+                      "1.00 (the broker's largest lot still applies).",
                       &s.maxLot, 0.10, "%.2f", &settingsDirty_);
+        s.maxLot = std::clamp(s.maxLot, 0.01, muuk::ctrader_fix::kHardMaxLot);
 
         // --- Loss limits.
         section("Loss limits", "0 = off; they apply at once");
@@ -4581,14 +4777,35 @@ void DashboardWindow::renderRiskCalculator(const std::optional<LiveSnapshot>& sn
                                     money(-eff).c_str());
             }
         }
-        settingDouble("Max basket loss",
-                      "Past this floating loss no new level is placed; the open positions stay and still close at "
-                      "the target (or the stop loss).",
-                      &s.maxBasketLoss, 10.0, "%.2f", &settingsDirty_);
-        settingDouble("Daily loss limit",
-                      "Once today's booked + floating net reaches minus this, the running range is closed and no new "
-                      "range opens until tomorrow (your computer's date).",
-                      &s.dailyLossLimit, 10.0, "%.2f", &settingsDirty_);
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Max basket loss is merged into the stop loss above (Step 4): a basket closes at "
+                                "the stop loss instead of only blocking new levels.");
+        }
+        {
+            // Daily loss limit: set as a % of the balance in the Brain panel; shown here in money.
+            const double bal = snap && snap->brokerAccountFresh ? snap->brokerAccount.balance : s.accountBalance;
+            const double dailyLimit =
+                muuk::ctrader_fix::effectiveDailyLossLimitMoney(s.dailyLossPercent, s.dailyLossLimit, bal);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Daily loss limit");
+            ImGui::SetItemTooltip("Once today's booked + floating net reaches minus this, the running range is "
+                                  "closed and no new range opens until tomorrow (your computer's date). Set it in "
+                                  "the Brain panel, as a % of the balance.");
+            ImGui::TableNextColumn();
+            if (dailyLimit > 0.0 && bal > 0.0) {
+                ImGui::TextDisabled("%s of %s (%.1f%% of the balance)", money(-dailyLimit).c_str(),
+                                    amount(bal).c_str(), s.dailyLossPercent);
+            } else if (dailyLimit > 0.0) {
+                ImGui::TextDisabled("%s (balance unknown -- connect the bot)", money(-dailyLimit).c_str());
+            } else {
+                ImGui::TextDisabled("Off -- set it in the Brain panel");
+            }
+        }
 
         // --- Break-even.
         section("Break-even", "a deep basket closes at the first bounce");

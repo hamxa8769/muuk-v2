@@ -87,6 +87,37 @@ nlohmann::json entryToJson(const EntryFilterConfig& e) {
 
 }  // namespace
 
+RiskPreset riskPresetFor(RiskAppetite appetite) {
+    // The research doc's numbers (Section 4.4 / D11) -- the user approved
+    // them "as planned" and may correct any of them later.
+    switch (appetite) {
+        case RiskAppetite::Cautious: return RiskPreset{75.0, 4, 1.0};
+        case RiskAppetite::Aggressive: return RiskPreset{300.0, 6, 3.0};
+        case RiskAppetite::Balanced:
+        default: return RiskPreset{150.0, 6, 2.0};
+    }
+}
+
+const char* riskAppetiteName(RiskAppetite appetite) {
+    switch (appetite) {
+        case RiskAppetite::Cautious: return "cautious";
+        case RiskAppetite::Aggressive: return "aggressive";
+        case RiskAppetite::Balanced:
+        default: return "balanced";
+    }
+}
+
+RiskAppetite riskAppetiteFromString(const std::string& name) {
+    if (name == "cautious") return RiskAppetite::Cautious;
+    if (name == "aggressive") return RiskAppetite::Aggressive;
+    return RiskAppetite::Balanced;  // "balanced" and anything unknown
+}
+
+double effectiveDailyLossLimitMoney(double dailyLossPercent, double dailyLossLimitMoney, double balance) {
+    if (dailyLossPercent > 0.0 && balance > 0.0) return balance * dailyLossPercent / 100.0;
+    return dailyLossLimitMoney > 0.0 ? dailyLossLimitMoney : 0.0;
+}
+
 LiveConfig loadLiveConfig(const std::filesystem::path& path) {
     std::ifstream file(path);
     if (!file) {
@@ -175,7 +206,51 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
         const auto& b = j.at("brain");
         cfg.brain.enabled = b.value("enabled", cfg.brain.enabled);
         cfg.brain.brainFile = b.value("brainFile", cfg.brain.brainFile);
+        cfg.brain.trainerHistory = b.value("trainerHistory", cfg.brain.trainerHistory);
         cfg.brain.allowRealAccount = b.value("allowRealAccount", cfg.brain.allowRealAccount);
+        cfg.brain.erMode = std::clamp(b.value("erMode", cfg.brain.erMode), 0, 3);
+    }
+    // Step 4 (research doc D8-D11): the risk knob. A file written before
+    // the knob has no "risk" section -- it migrates to Balanced, and the
+    // daily limit turns ON at 2% of the balance unless the file already
+    // sets a $ amount (kept as the fallback). A file with a section is
+    // taken as written.
+    if (j.contains("risk") && j.at("risk").is_object()) {
+        const auto& r = j.at("risk");
+        cfg.risk.appetite = riskAppetiteFromString(r.value("appetite", std::string("balanced")));
+        cfg.risk.dailyLossPercent = std::clamp(r.value("dailyLossPercent", 2.0), 0.0, 100.0);
+    } else {
+        cfg.risk.appetite = RiskAppetite::Balanced;
+        cfg.risk.dailyLossPercent = cfg.connection.dailyLossLimitMoney > 0.0 ? 0.0 : 2.0;
+        // D10 (Step 6b): the stop loss defaults to OFF -- Step 6 proved a
+        // $50 stop cuts the validated edge (held-out -$191.43 vs +$149.83
+        // without), so no stop is forced onto an old file. A max-basket-loss
+        // is still merged into it (D5) when the file sets one; a file with
+        // no stop at all stays off, and an explicit stop is kept as written.
+        if (cfg.strategy.basketStopLossMoney <= 0.0 &&
+            cfg.strategy.riskLimits.maxBasketLossMoney > 0.0) {
+            cfg.strategy.basketStopLossMoney = cfg.strategy.riskLimits.maxBasketLossMoney;
+        }
+    }
+    // Hard caps (D9, Section 4.2): no single lot above 1.00, no more levels
+    // than the knob allows -- whatever an old file (or a hand edit) says.
+    // The engine still enforces the configured values per order; this is
+    // the config layer refusing to carry a value above the cap.
+    const double maxLotNow = cfg.strategy.riskLimits.maxLot.toDouble(cfg.strategy.symbol);
+    if (maxLotNow <= 0.0 || maxLotNow > kHardMaxLot) {
+        cfg.strategy.riskLimits.maxLot = muuk::core::Volume::fromDouble(kHardMaxLot, cfg.strategy.symbol);
+    }
+    const int levelCap = riskPresetFor(cfg.risk.appetite).maxLevels;
+    if (cfg.strategy.riskLimits.maxOrders <= 0 || cfg.strategy.riskLimits.maxOrders > levelCap) {
+        cfg.strategy.riskLimits.maxOrders = levelCap;
+    }
+    cfg.strategy.riskLimits.maxBasketLossMoney = 0.0;  // D5: merged into the stop loss
+    cfg.strategy.autoProfitTarget = false;             // D4: removed (fixed $ or last-lot target only)
+    if (j.contains("keys") && j.at("keys").is_object()) {
+        const auto& k = j.at("keys");
+        cfg.keys.gemini = k.value("gemini", std::string());
+        cfg.keys.fred = k.value("fred", std::string());
+        cfg.keys.finnhub = k.value("finnhub", std::string());
     }
     // Auto-target levels 20..100 are 200..360 % of the cost.
     cfg.strategy.autoTargetPercent = std::clamp(cfg.strategy.autoTargetPercent, 200.0, 360.0);
@@ -199,7 +274,7 @@ LiveSettings settingsFromConfig(const LiveConfig& config) {
     s.lotMultiplier = config.strategy.lotProgression.multiplier;
     s.profitTarget = config.strategy.basketProfitTargetMoney;
     s.stopLoss = config.strategy.basketStopLossMoney;
-    s.autoTarget = config.strategy.autoProfitTarget;
+    s.autoTarget = false;      // D4: removed -- the fixed $ target (or the last-lot target) is the exit
     s.autoTargetPercent = static_cast<int>(std::lround(config.strategy.autoTargetPercent));
     s.lastLotTarget = config.strategy.lastLotTarget;
     s.lastLotTargetMove = config.strategy.lastLotTargetMove;
@@ -209,8 +284,13 @@ LiveSettings settingsFromConfig(const LiveConfig& config) {
     s.entryTimeoutSeconds = config.connection.entryTimeoutSeconds;
     s.maxOrders = config.strategy.riskLimits.maxOrders;
     s.maxLot = config.strategy.riskLimits.maxLot.toDouble(spec);
-    s.maxBasketLoss = config.strategy.riskLimits.maxBasketLossMoney;
+    s.maxBasketLoss = 0.0;     // D5: merged into stopLoss (the file's value migrated on load)
     s.dailyLossLimit = config.connection.dailyLossLimitMoney;
+    s.riskAppetite = config.risk.appetite;
+    s.dailyLossPercent = config.risk.dailyLossPercent;
+    s.erMode = config.brain.erMode;
+    s.brainFile = config.brain.brainFile;
+    s.trainerHistoryPath = config.brain.trainerHistory;
     s.lockAtLoss = config.connection.lockAtLossMoney;
     s.lockAtLossPercent = config.connection.lockAtLossPercent;
     s.closeLockedAfterSeconds = config.connection.closeLockedAfterSeconds;
@@ -223,11 +303,18 @@ LiveSettings settingsFromConfig(const LiveConfig& config) {
     s.recovery = config.connection.recovery;
     s.entry = config.connection.entry;
     s.regimeRanges = config.connection.regimeRanges;
+    s.keys = config.keys;
     s.commissionPerLot = config.strategy.costs.commissionPerLotRoundTurn;
     s.commissionPerMillion = config.strategy.costs.commissionPerMillionPerSide;
     s.autoContinue = config.connection.autoContinue;
     s.startSide = config.strategy.startSide;
     return s;
+}
+
+std::string maskApiKey(const std::string& key) {
+    if (key.empty()) return "Not set";
+    const std::string tail = key.size() <= 4 ? key : key.substr(key.size() - 4);
+    return "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" + tail;
 }
 
 void applySettingsToConfig(LiveConfig& config, const LiveSettings& s) {
@@ -247,14 +334,20 @@ void applySettingsToConfig(LiveConfig& config, const LiveSettings& s) {
                                               Volume::fromDouble(s.lotIncrement, spec), s.lotMultiplier};
     st.basketProfitTargetMoney = s.profitTarget;
     st.basketStopLossMoney = s.stopLoss;
-    st.autoProfitTarget = s.autoTarget;
+    st.autoProfitTarget = false;  // D4: removed
     st.autoTargetPercent = s.autoTargetPercent;
     st.lastLotTarget = s.lastLotTarget;
     st.lastLotTargetMove = std::clamp(s.lastLotTargetMove, 0.01, 100.0);
     config.market = s.market;
-    st.riskLimits.maxOrders = s.maxOrders;
-    st.riskLimits.maxLot = Volume::fromDouble(s.maxLot, spec);
-    st.riskLimits.maxBasketLossMoney = s.maxBasketLoss;
+    // Hard caps (D9, Section 4.2): the panel already clamps these, this is
+    // the second gate -- no settings object ever carries more.
+    st.riskLimits.maxOrders = std::clamp(s.maxOrders, 1, riskPresetFor(s.riskAppetite).maxLevels);
+    st.riskLimits.maxLot = Volume::fromDouble(std::clamp(s.maxLot, 0.01, kHardMaxLot), spec);
+    st.riskLimits.maxBasketLossMoney = 0.0;  // D5: merged into the stop loss
+    config.risk.appetite = s.riskAppetite;
+    config.risk.dailyLossPercent = std::clamp(s.dailyLossPercent, 0.0, 100.0);
+    config.brain.erMode = std::clamp(s.erMode, 0, 3);
+    config.brain.trainerHistory = s.trainerHistoryPath;
     config.connection.dailyLossLimitMoney = s.dailyLossLimit;
     config.connection.lockAtLossMoney = s.lockAtLoss;
     config.connection.lockAtLossPercent = std::clamp(s.lockAtLossPercent, 0.0, 100.0);
@@ -266,6 +359,7 @@ void applySettingsToConfig(LiveConfig& config, const LiveSettings& s) {
     config.connection.recovery = s.recovery;
     config.connection.entry = s.entry;
     config.connection.regimeRanges = s.regimeRanges;
+    config.keys = s.keys;
     st.escapeFromLevel = s.escapeFromLevel;
     st.escapeProfitMoney = s.escapeProfit;
     st.costs.commissionPerLotRoundTurn = s.commissionPerLot;
@@ -464,6 +558,13 @@ void saveLiveSettings(const std::filesystem::path& path, const LiveSettings& s) 
     conn["recovery"] = recoveryToJson(s.recovery);
     conn["entry"] = entryToJson(s.entry);
     conn["regimeRanges"] = s.regimeRanges;
+    j["risk"] = {{"appetite", riskAppetiteName(s.riskAppetite)}, {"dailyLossPercent", s.dailyLossPercent}};
+    if (!j.contains("brain") || !j.at("brain").is_object()) j["brain"] = nlohmann::json::object();
+    j["brain"]["erMode"] = s.erMode;
+    j["brain"]["trainerHistory"] = s.trainerHistoryPath;
+    // API keys live at the top level, next to "connection": only in this
+    // local config file, never in the repo, never logged.
+    j["keys"] = {{"gemini", s.keys.gemini}, {"fred", s.keys.fred}, {"finnhub", s.keys.finnhub}};
     j["strategy"]["breakEvenEscape"] = {{"fromLevel", s.escapeFromLevel}, {"profit", s.escapeProfit}};
 
     auto& st = j["strategy"];

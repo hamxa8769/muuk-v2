@@ -74,18 +74,27 @@ struct RecoveryConfig {
 struct EntryFilterConfig {
     // >0: range width = this x ATR(14) of the one-minute bars, never under
     // autoRangeWidthPoints and never over rangeMaxWidth. 0 = fixed width.
+    // Fallback only (Step 4, research doc D6): the brain's gap already is
+    // ATR-based, so this only ever sets the width of a fallback cycle.
     double rangeAtr = 0.0;
     double rangeMaxWidth = 15.0;
     // The last-lot target's price move = half the range width (it grows with
-    // a wider range) instead of the fixed lastLotTargetMove.
+    // a wider range) instead of the fixed lastLotTargetMove. Fallback only
+    // (Step 4, research doc D1): the brain's exit already asks for gap/2 x
+    // exitFactor, so the toggle is gone from the panel -- but an old file's
+    // value still works for a fallback cycle.
     bool targetHalfRange = false;
-    // >0: a new range opens only while |EMA8 - EMA21| >= this x ATR -- the
-    // price is going somewhere, not chopping sideways. 0 = off.
+    // DEPRECATED (Step 4, research doc D2): the standalone trend filter is
+    // gone -- the brain's gates decide when a cycle opens. Still read from
+    // old config files so they load, but never used for a decision any more.
     double trendMin = 0.0;
-    // The first order goes with the trend: a Buy Stop when EMA8 > EMA21, a
-    // Sell Stop when below (instead of the fixed "First order" side).
+    // DEPRECATED (Step 4, research doc D3): "first order with the trend"
+    // is gone -- the brain decides the first side (Both for the shipped
+    // brain), the fallback uses the fixed "First order" dropdown. Still
+    // read from old config files so they load, but never used any more.
     bool startWithTrend = false;
-    [[nodiscard]] bool anyOn() const { return rangeAtr > 0.0 || targetHalfRange || trendMin > 0.0 || startWithTrend; }
+    // Only what still does something: the ATR width and the half-range move.
+    [[nodiscard]] bool anyOn() const { return rangeAtr > 0.0 || targetHalfRange; }
 };
 
 struct LiveConnectionConfig {
@@ -234,20 +243,79 @@ struct LiveConnectionConfig {
 // "brain" section of the config file, all optional. The brain file is the
 // plain-text format of serializeBrainV2() (brain_v2.txt), not the v1
 // brain.json format.
+// API keys (Gemini / FRED / Finnhub) for the brain and data feeds.
+// Stored only in the local config file (my_account.local.json, gitignored
+// like the password), never in the repo, never logged. Empty = not set.
+struct ApiKeys {
+    std::string gemini;   // Gemini (the brain's news/event understanding, Phase 5)
+    std::string fred;     // FRED (macro data: real yields, dollar index)
+    std::string finnhub;  // Finnhub (news + economic calendar)
+};
+// What the operator sees instead of the key itself: "Not set", or four
+// bullets + the last 4 characters ("••••1234"). The full key never
+// leaves the config file.
+[[nodiscard]] std::string maskApiKey(const std::string& key);
+
+// Risk appetite -- the ONE knob (research doc D11, Section 4.4). One
+// preset is a set of caps; the brain picks its policies inside them, it
+// never breaks them. Default Balanced.
+enum class RiskAppetite { Cautious = 0, Balanced = 1, Aggressive = 2 };
+struct RiskPreset {
+    double maxLockCost;       // $ worst-case lock cost a brain policy may carry (replay units)
+    int maxLevels;            // hardest cap on levels, brain cycles and fallback alike
+    double dailyLossPercent;  // % of the balance: the day stops here
+};
+// Cautious {75, 4, 1%}, Balanced {150, 6, 2%}, Aggressive {300, 6, 3%} --
+// the research doc's numbers (Section 4.4 / D11).
+[[nodiscard]] RiskPreset riskPresetFor(RiskAppetite appetite);
+[[nodiscard]] const char* riskAppetiteName(RiskAppetite appetite);  // "cautious" / "balanced" / "aggressive"
+[[nodiscard]] RiskAppetite riskAppetiteFromString(const std::string& name);  // unknown -> Balanced
+
+// The largest single order, ever, in lots (research doc D9). The brain can
+// never place above it; the engine refuses any order that would need more.
+inline constexpr double kHardMaxLot = 1.0;
+
+// The hard caps the brain can never override (research doc D8-D10), as the
+// "risk" section of the config file. Files written before the knob existed
+// have no such section -- see loadLiveConfig's migration.
+struct RiskConfig {
+    RiskAppetite appetite = RiskAppetite::Balanced;
+    // % of the balance the day may lose; 0 = fall back to the $ amount in
+    // connection.dailyLossLimitMoney (old files that set one explicitly).
+    double dailyLossPercent = 2.0;
+};
+
+// The effective daily loss limit in account money: the knob's share of the
+// balance when a percent is set (and the balance is known), else the $
+// amount. 0 = off.
+[[nodiscard]] double effectiveDailyLossLimitMoney(double dailyLossPercent, double dailyLossLimitMoney, double balance);
+
 struct BrainConfig {
     // false: the brain is never consulted; every cycle uses the configured
     // strategy exactly as before.
     bool enabled = true;
-    // Where the trained brain lives. A relative path is resolved next to
-    // the state file (LiveRunner::setStateFile), or the working directory
-    // when there is none. Missing or untrained: the runner logs once and
-    // falls back to the configured strategy — it never blocks trading
-    // over a brain file that isn't there yet.
+    // Where the trained brain lives. A relative path is searched in
+    // order: next to the config file (where the packager and the updater
+    // put brain_v2.txt), next to the state file, then the working
+    // directory (see brainFileCandidates in live_state.hpp). Missing or
+    // untrained: the runner logs which paths it looked in and falls back
+    // to the configured strategy — it never blocks trading over a brain
+    // file that isn't there yet.
     std::string brainFile = "brain_v2.txt";
+    // Where the trainer reads its bars from (Step 5): a CSV file or a
+    // folder of them (an MT5 1-minute history export). Empty = the bars
+    // the bot collected itself (bars_live.csv next to the brain file).
+    std::string trainerHistory;
     // false (default): on a real-money account the brain never drives a
     // cycle — the configured strategy is used instead, and the refusal is
     // logged. Set true only deliberately, in a config file, never by code.
     bool allowRealAccount = false;
+    // Kaufman Efficiency Ratio gate (Step 1): 0 = off, the shipped
+    // behaviour exactly; 1 = block choppy cycles; 2 = 1 + a clean trend
+    // overrides the strong-trend block and the ATR breaker; 3 = 2 + the
+    // ATR percentile replaces the fixed ATR breaker. The trainer's Step 6
+    // candidate is 2; 0 stays the live default until then.
+    int erMode = 0;
 };
 
 struct LiveConfig {
@@ -255,6 +323,8 @@ struct LiveConfig {
     muuk::core::StrategyConfig strategy;
     MarketHoursConfig market;  // "market" in the file: sessions, pauses, news
     BrainConfig brain;         // "brain" in the file
+    RiskConfig risk;           // "risk" in the file: the appetite knob + daily-loss %
+    ApiKeys keys;              // "keys" in the file: gemini / fred / finnhub, all optional
 };
 
 // The operator-tunable subset of LiveConfig, in plain human units (lots,
@@ -270,7 +340,10 @@ struct LiveSettings {
     double lotIncrement = 0.01;
     double lotMultiplier = 1.0;  // > 1: each lot = previous x this (2 -> 0.01, 0.02, 0.04...); 1 = add lotIncrement
     double profitTarget = 1.0;   // basket net P/L ($) that books the basket
-    double stopLoss = 0.0;       // basket net loss ($) that closes the basket; 0 = off
+    double stopLoss = 0.0;       // basket net loss ($) that closes the basket; 0 = off (Step 6b: OFF by default -- Step 6 proved a $50 stop cuts the validated edge; the brain's $150 lock cap is the worst case)
+    // DEPRECATED (Step 4, D4): the auto profit target is removed -- the
+    // fixed $ target or the last-lot target is the exit. Kept so an old
+    // file still loads; always false after load, never written as true.
     bool autoTarget = false;     // target = autoTargetPercent % of the open positions' cost, instead of profitTarget
     int autoTargetPercent = 100; // 20 / 40 / 60 / 80 / 100
     bool lastLotTarget = false;     // target = the deepest filled lot x lastLotTargetMove (replaces the two above)
@@ -278,10 +351,18 @@ struct LiveSettings {
     int cooldownSeconds = 0;     // pause after a basket is fully flat
     int manualCloseCooldownSeconds = 15;  // pause after Close range before a new range opens; 0 = don't reopen
     int entryTimeoutSeconds = 120;  // entry order not triggered by then: the range moves to the live price; 0 = off
-    int maxOrders = 20;
-    double maxLot = 10.0;
+    int maxOrders = 6;         // capped by the knob's maxLevels (Cautious 4, Balanced/Aggressive 6)
+    double maxLot = 1.0;         // hard cap (D9): no single order above 1.00 lot, ever
+    // DEPRECATED (Step 4, D5): max basket loss is merged into stopLoss
+    // above (one rule). Kept so an old file still loads; always 0 after
+    // load, and its value migrates into stopLoss when the file sets no stop.
     double maxBasketLoss = 0.0;  // $; 0 = no limit
-    double dailyLossLimit = 0.0; // $; today's booked + floating net at minus this closes everything for the day; 0 = off
+    double dailyLossLimit = 0.0; // $ fallback; today's booked + floating net at minus this closes everything for the day; 0 = off (the % below rules when set)
+    RiskAppetite riskAppetite = RiskAppetite::Balanced;  // the ONE knob (D11)
+    double dailyLossPercent = 2.0;  // % of the balance the day may lose (D8); 0 = the $ amount above
+    int erMode = 0;                 // brain ER gate (Step 1): 0 off, 1 block chop, 2 + clean-trend override, 3 + ATR percentile
+    std::string brainFile = "brain_v2.txt";  // shown in the Brain panel (read-only there)
+    std::string trainerHistoryPath;  // Step 5: history CSV/folder for Train; empty = the bot's own bars
     double lockAtLoss = 0.0;     // $; basket net at minus this is locked (hedged) and the bot pauses; 0 = off
     double lockAtLossPercent = 0.0;  // % of the balance, the same; with both, the first reached; 0 = off
     int closeLockedAfterSeconds = 0; // a holding lock closes the whole basket this long after; 0 = waits for you
@@ -301,6 +382,7 @@ struct LiveSettings {
     EntryFilterConfig entry;  // smart entry: ATR width, trend filter, start with the trend
     bool regimeRanges = false;  // smart ranges (chart): place each new range on the market's own high/low.
     // Defaults OFF: both chart placements lost in backtest (see replayCycleV2), so the live bot stays centered.
+    ApiKeys keys;  // API keys: Gemini / FRED / Finnhub (local config only, shown masked)
     MarketHoursConfig market;
 };
 

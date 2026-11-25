@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,6 +54,21 @@ struct BrainRiskCaps {
     double maxSpread = 0.0;     // 0 = off: no new cycle while the spread is above this, in price
 };
 
+// Which stop a cycle opens with (Step 3, the brain's first order). The
+// live engine arms exactly this: Both = a Buy Stop and a Sell Stop at
+// once (the shipped behaviour); BuyFirst / SellFirst = one stop only,
+// the other follows the fill; TrendFirst = the trend side first (EMA8 vs
+// EMA21, the situation's trendDir): up -> Buy, down -> Sell, flat ->
+// Both. Stored as a plain int in the cell and the file: -1 SellFirst,
+// 0 Both, 1 BuyFirst, 2 TrendFirst. 0 is also the fallback for an
+// undecided cell and for a brain file written before Step 3.
+enum class BrainFirstSide : int { SellFirst = -1, Both = 0, BuyFirst = 1, TrendFirst = 2 };
+
+// How the trainer picks the first side: Learn = one per cell, from that
+// cell's own history (Step 3); the rest force one side everywhere, for
+// the experiment's controls (Both reproduces the Step 2 numbers).
+enum class BrainFirstSideMode : int { Learn = 0, Both = 1, BuyFirst = 2, SellFirst = 3, TrendFirst = 4 };
+
 struct BrainV2Config {
     BrainConfig base;  // v1 config: gaps, stepBars, maxCycleBars, minSamples, periods...
     double slippage = 0.05;    // $ per lot per fill, charged in the replay (was missing in v1)
@@ -70,8 +86,33 @@ struct BrainV2Config {
     // skips the cycles that were winning in the held-out. 2.0x stays.)
     // A circuit breaker for crashes: the Nov 2026 selloff's 1-min ATR runs 3-4x volHigh, and those cycles are
     // net-negative (37 of the baseline's 48 locks sit in the held-out crash).
+    // Kaufman Efficiency Ratio gate (the user's correction 2026-11-25: in a
+    // clean trend the range strategy earns MORE, not less -- the market breaks
+    // one side of the range and runs. The enemy is chop, not trend). ER is a
+    // *gate feature* on the situation, never a new cell dimension (81 x 3 ER
+    // buckets would starve the data). 0 = off: the shipped behaviour exactly.
+    // 1 = block choppy cycles (ER < erChopBlock). 2 = 1 + a clean trend
+    // (ER >= erTrendAllow) overrides the strong-trend block and the ATR
+    // breaker -- trade trend-wise. 3 = 2 + the ATR percentile replaces the
+    // fixed ATR breaker (block when atrPct > erAtrPctBlock, still overridable
+    // by a clean trend). Thresholds are the research note's starting points
+    // (ER > 0.5 trend, ER < 0.3 choppy); they are validated by the trainer,
+    // never tuned into overfitting.
+    int erMode = 0;
+    double erChopBlock = 0.3;   // below this the market whipsaws: no new cycle (modes 1-3)
+    double erTrendAllow = 0.5;  // at/above this the trend is clean: modes 2-3 trade trend-wise
+    double erAtrPctBlock = 90.0;  // mode 3: block when the ATR percentile is above this
     int onlineMaxSamples = 500;        // online tally: older outcomes fade past this
+    BrainFirstSideMode firstSideMode = BrainFirstSideMode::Learn;  // Step 3: Learn = one first side per cell, from
+    // history (default); Both/BuyFirst/SellFirst/TrendFirst force one side everywhere (experiment controls)
     BrainRiskCaps caps;
+    // Step 5: the live basket stop loss, in replay units (0 = off). When
+    // > 0 the replay closes a basket the first bar its net reaches
+    // -stopLoss, at the stop level, instead of running on to the lock --
+    // so the trainer validates the brain under the same stop the live
+    // basket closes at. 0 keeps every earlier experiment's numbers
+    // exactly (the CLI default, and the shipped brain's training).
+    double stopLoss = 0.0;
 };
 
 struct BrainV2Cell {
@@ -85,6 +126,8 @@ struct BrainV2Cell {
     double meanLockLoss = 0.0;  // average |pnl| of locked cycles, per 0.01 lot start
     double lockLossSum = 0.0;
     double score = 0.0;  // mean - 1 standard error
+    int firstSide = 0;  // Step 3: the first order this cell learned (-1 Sell, 0 Both/undecided, 1 Buy, 2 trend);
+    // the decision resolves 2 with the cycle's trendDir
 };
 
 struct BrainV2 {
@@ -96,6 +139,21 @@ struct BrainV2 {
     int trainedBars = 0;
     int64_t trainedUntilMs = 0;
     bool forced = false;  // put to use by hand, without passing the test
+    // The shift this brain was trained with (Step 2, decision D12): the
+    // live runner uses these instead of the config's shift while a brain
+    // with them loaded is driving the cycle. 0 = not recorded (a brain
+    // file written before Step 2): the config shift stays in use.
+    int shiftAfterFills = 0;  // fills per shift step, as trained
+    double stepAtr = 0.0;     // each step widens the gap by this x the cycle-start ATR
+    // Step 6: the gate mode and stop loss this brain trained under.
+    // erMode -1 = not recorded (a brain file written before Step 6): the
+    // live runner then falls back to the panel's erMode, as for the shift.
+    // A recorded erMode wins live (like the trained shift): the brain was
+    // validated under it. The stop loss is NOT overridden live -- it is a
+    // risk control the panel governs; the recorded value is the audit
+    // trail of what the brain trained under.
+    int erMode = -1;       // Kaufman ER gate mode (0 off, 1 chop-block, 2 + clean-trend override, 3 + ATR percentile)
+    double stopLoss = 0.0; // basket stop loss in replay units the brain trained under (0 = off / not recorded)
 };
 
 // The v1 situation, plus the context v2 gates on. recentOutcome and
@@ -110,12 +168,22 @@ struct SituationV2 {
     int volume = 1;       // 0 quiet (<0.7x ticks), 1 normal, 2 spike (>1.5x ticks)
     int recentOutcome = 0;  // -1 last basket lost or locked, 0 none yet, +1 last basket won
     double spreadPct = 0.0; // current spread / median spread in the window (0 = unknown)
+    double er = -1.0;       // Kaufman Efficiency Ratio on 5-min bars (n=20): ~1 clean trend, ~0 whipsaw, -1 unknown
+    double atrPct = -1.0;   // current 1-min ATR ranked against its own values over the window (0-100), -1 unknown
     bool known = false;
 };
 
+// Why a cycle was refused, for the audit: the shadow replay counts what
+// the strong-trend gate and the ATR breaker blocked, and whether those
+// blocked cycles would have won. None = the brain said trade (or the caps
+// let it through).
+enum class BrainBlockReason { None, NotTrained, TooFewBars, AtrBreaker, CellNotTradable, StrongTrend, RecentLoss, VolumeSpike, Spread, ErChop, Caps };
+
 struct BrainV2Decision {
     bool trade = false;
+    BrainBlockReason blockedBy = BrainBlockReason::None;
     double gap = 0.0;
+    int firstSide = 0;  // resolved first side for this cycle: -1 Sell Stop first, 0 both stops, +1 Buy Stop first
     BrainV2Policy policy;
     double lockRisk = 0.0;          // estimated P(lock) for this policy in this state
     double estimatedLockCost = 0.0; // worst-case lock cost, per 0.01 lot start
@@ -150,8 +218,20 @@ struct BrainV2Training {
     int brainPeriodsUp = 0;
     bool better = false;      // v1 adoption rule: profit, better than fixed and v1, no deeper drawdown than fixed
     bool gatesPassed = false; // the stricter v2 gates: drawdown <= 50% of v1, locks <= 50% of v1, >=5 periods up
+    bool ddGate = false;      // brain drawdown <= 50% of v1's (Step 5: reported per gate, so a failed run says why)
+    bool lockGate = false;    // brain locks <= half of v1's
     std::string report;
 };
+
+// Kaufman Efficiency Ratio over the last n closes (oldest first):
+// |close - close[n]| / sum(|change|). 1 = a straight move, 0 = pure whipsaw,
+// -1 when there are too few bars. Computed on 5-min bars (see situationAtV2):
+// 1-min ER is too noisy.
+[[nodiscard]] double kaufmanEr(const std::deque<Bar>& bars, int n);
+
+// The current Wilder ATR(period) ranked against its own values over the
+// window (0-100). -1 when too few bars to rank.
+[[nodiscard]] double atrPercentile(const std::deque<Bar>& bars, int period);
 
 [[nodiscard]] SituationV2 situationAtV2(const std::deque<Bar>& oneMinuteBars, const BrainV2& brain, int recentOutcome = 0,
                                          double spread = 0.0, double medianSpread = 0.0);
@@ -162,13 +242,24 @@ struct BrainV2Training {
 // lock, both starting sides, the worse one. Per 0.01 lot start.
 [[nodiscard]] double estimatedLockCost(double gap, const BrainV2Policy& policy);
 
+// The lock cost the caps actually bound (Step 6): with a stop loss the
+// basket closes at -stopLoss before it can lock, so the worst case is the
+// stop, not the no-stop lock cost. Without a stop it is the estimate.
+[[nodiscard]] double effectiveLockCost(double gap, const BrainV2Policy& policy, const BrainV2Config& config);
+
 // A decision after the hard caps: downgraded (fewer levels / smaller lots)
 // or refused. The brain's policy is never raised, only lowered.
 [[nodiscard]] BrainV2Decision applyRiskCaps(BrainV2Decision decision, const BrainV2Config& config,
                                             const BrainAccountState& account);
 
+// The first side a cell's stored value means for THIS cycle: TrendFirst
+// (2) follows the cycle's trendDir (up -> +1, down -> -1, flat -> 0);
+// BuyFirst (+1) / SellFirst (-1) / Both (0) pass through.
+[[nodiscard]] int resolveFirstSide(int firstSide, int trendDir);
+
 [[nodiscard]] ReplayCycleV2 replayCycleV2(const std::vector<Bar>& bars, const std::vector<double>& spreads, int start, double gap,
-                                           double atr, const BrainV2Policy& policy, const BrainV2Config& config);
+                                           double atr, const BrainV2Policy& policy, const BrainV2Config& config,
+                                           int firstSide = 0);
 
 [[nodiscard]] BrainV2 learnBrainV2(const std::vector<Bar>& bars, const std::vector<double>& spreads, int end,
                                     const BrainV2Config& config);
@@ -178,15 +269,53 @@ struct BrainV2Training {
 [[nodiscard]] ReplayResult replayRulesV2(const std::vector<Bar>& bars, const std::vector<double>& spreads, int from,
                                          const BrainV2* brain, double fixedGapAtr, const BrainV2Config& config);
 
+// Progress of a training run, for a UI to show while the background
+// thread works: which stage ("walk-forward", "fixed", "v1", "held-out",
+// "final") and how many of its periods are done. Null = no reporting.
+using BrainTrainingProgress = std::function<void(const char* stage, int done, int total)>;
+
 [[nodiscard]] BrainV2Training trainBrainV2(const std::vector<Bar>& bars, const std::vector<double>& spreads,
-                                            const BrainV2& current, const BrainV2Config& config);
+                                            const BrainV2& current, const BrainV2Config& config,
+                                            BrainTrainingProgress progress = nullptr);
+
+// One line for a failed run: which strict gate failed, with the numbers
+// ("locks 14 > 10 (v1 20); held-out -12.34 <= 0"). "gates PASSED" when
+// they passed. The gate definitions live in trainBrainV2; this only
+// reports them.
+[[nodiscard]] std::string gatesFailureSummary(const BrainV2Training& t);
+
+// One shift combo tried by the trainer's shift search (Step 2): the walk-
+// forward result for that (shiftAfterFills, stepAtr), and whether it passed
+// the strict gates. The held-out is the crash proxy, so its locks outrank
+// the total when ranking.
+struct ShiftSearchCandidate {
+    int shiftAfterFills = 0;
+    double stepAtr = 0.0;
+    bool gatesPassed = false;
+    double totalPnl = 0.0;
+    int locks = 0;
+    double heldOutPnl = 0.0;
+    int heldOutLocks = 0;
+    int periodsUp = 0;
+};
+
+// Ranks one shift-search candidate ahead of another: gates-passing first,
+// then fewest held-out locks, best held-out PnL, fewest walk-forward locks,
+// best total.
+[[nodiscard]] bool shiftComboBetter(const ShiftSearchCandidate& a, const ShiftSearchCandidate& b);
+
+// Best gates-passing candidate, or nothing when no combo passed the gates
+// (the shipped shift then stays -- the search never invents a pass).
+[[nodiscard]] std::optional<ShiftSearchCandidate> pickBestShiftCombo(const std::vector<ShiftSearchCandidate>& candidates);
 
 // Plain-text file format (no JSON dependency in core), one brain per file:
 //   muuk-brain-v2 1
-//   volLow <v> volHigh <v> trainedBars <n> trainedUntilMs <ms> forced <0|1>
+//   volLow <v> volHigh <v> trainedBars <n> trainedUntilMs <ms> forced <0|1> shiftAfterFills <n> stepAtr <x>
+//   erMode <n> stopLoss <x>   (same header line, Step 6; an old file ends after stepAtr)
 //   gapAtrChoices <a> <b> ...
 //   cells <81 lines: idx samples gapChoice lotMultiplier maxLevels exitFactor
-//                    meanPnl sumPnl sumSquares locks lockRate meanLockLoss lockLossSum score>
+//                    meanPnl sumPnl sumSquares locks lockRate meanLockLoss lockLossSum score firstSide>
+//   firstSide: -1 Sell first, 0 both stops (or undecided / an old file), 1 Buy first, 2 trend first
 [[nodiscard]] std::string serializeBrainV2(const BrainV2& brain);
 [[nodiscard]] std::optional<BrainV2> parseBrainV2(const std::string& text);
 

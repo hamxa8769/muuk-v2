@@ -46,10 +46,11 @@ void glfwErrorCallback(int error, const char* description) {
 
 bool g_smallFontAtlas = false;  // software renderer: 1x oversampling -- a far smaller font texture
 
-ImFont* tryAddFont(const char* path, float size, const ImWchar* ranges) {
+ImFont* tryAddFont(const char* path, float size, const ImWchar* ranges, bool merge = false) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) return nullptr;
     ImFontConfig cfg;
+    cfg.MergeMode = merge;  // merge into the previously added font
     cfg.OversampleH = g_smallFontAtlas ? 1 : 3;  // smoother glyph edges at small sizes
     cfg.OversampleV = g_smallFontAtlas ? 1 : 2;
     return ImGui::GetIO().Fonts->AddFontFromFileTTF(path, size, &cfg, ranges);
@@ -378,19 +379,30 @@ int main(int argc, char** argv) {
     // log lines). Added after the renderer is up but before the first
     // frame, which is when the backend builds the font texture.
     static const ImWchar kGlyphRanges[] = {0x0020, 0x00FF, 0x2000, 0x206F, 0};
+    // The update button's check mark (U+2713) and up arrow (U+2B06), and the
+    // brain refresh arrow (U+21BB), live in Segoe UI Symbol, not Segoe UI:
+    // merge just those glyphs into each font below, so the labels render
+    // instead of showing empty boxes. A missing Symbol file is skipped
+    // silently (the words still read).
+    static const ImWchar kSymbolRanges[] = {0x21BB, 0x21BB, 0x2713, 0x2713, 0x2B06, 0x2B06, 0};
     float xscale = 1.0f;
     float yscale = 1.0f;
     glfwGetWindowContentScale(window, &xscale, &yscale);
     const float base = 16.0f * std::max(1.0f, xscale);
-    ImFont* regular = tryAddFont("C:/Windows/Fonts/segoeui.ttf", base, kGlyphRanges);
+    const auto loadFont = [&](const char* path, float size) {
+        ImFont* font = tryAddFont(path, size, kGlyphRanges);
+        if (font) tryAddFont("C:/Windows/Fonts/seguisym.ttf", size, kSymbolRanges, true);
+        return font;
+    };
+    ImFont* regular = loadFont("C:/Windows/Fonts/segoeui.ttf", base);
     if (!regular) io.Fonts->AddFontDefault();
-    ImFont* bold = tryAddFont("C:/Windows/Fonts/seguisb.ttf", base, kGlyphRanges);  // Segoe UI Semibold
-    if (!bold) bold = tryAddFont("C:/Windows/Fonts/segoeuib.ttf", base, kGlyphRanges);
-    ImFont* large = tryAddFont("C:/Windows/Fonts/segoeuib.ttf", base * 1.45f, kGlyphRanges);
+    ImFont* bold = loadFont("C:/Windows/Fonts/seguisb.ttf", base);  // Segoe UI Semibold
+    if (!bold) bold = loadFont("C:/Windows/Fonts/segoeuib.ttf", base);
+    ImFont* large = loadFont("C:/Windows/Fonts/segoeuib.ttf", base * 1.45f);
     // Bahnschrift (Windows 10+) for the big KPI numbers -- a clean, modern
     // figure style; Segoe UI Semibold if it's missing.
-    ImFont* numbers = tryAddFont("C:/Windows/Fonts/bahnschrift.ttf", base * 1.55f, kGlyphRanges);
-    if (!numbers) numbers = tryAddFont("C:/Windows/Fonts/seguisb.ttf", base * 1.45f, kGlyphRanges);
+    ImFont* numbers = loadFont("C:/Windows/Fonts/bahnschrift.ttf", base * 1.55f);
+    if (!numbers) numbers = loadFont("C:/Windows/Fonts/seguisb.ttf", base * 1.45f);
 
     muuk::desktop::LiveController controller;
     muuk::desktop::DashboardWindow dashboard;

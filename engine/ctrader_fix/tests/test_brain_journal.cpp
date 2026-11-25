@@ -76,6 +76,7 @@ TEST_CASE("Brain journal: a closed cycle formats to one JSON line with its cell 
     REQUIRE(j["lotMultiplier"].get<double>() == Catch::Approx(2.0));
     REQUIRE(j["maxLevels"].get<int>() == 4);
     REQUIRE(j["exitFactor"].get<double>() == Catch::Approx(1.0));
+    REQUIRE(j["firstSide"].get<int>() == 0);
     REQUIRE(j["net_replay"].get<double>() == Catch::Approx(12.5));
     REQUIRE(j["locked"].get<bool>() == false);
     REQUIRE(j["legs"].get<int>() == 3);

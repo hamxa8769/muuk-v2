@@ -99,6 +99,167 @@ TEST_CASE("keepFileOnUpdate never overwrites the user's own configs") {
     REQUIRE(keepFileOnUpdate("brain_v2.txt.bak"));        // only the exact name counts
 }
 
+namespace {
+// A brain file whose header line 2 is exactly `header2` (line 1 is always
+// "muuk-brain-v2 1").
+std::filesystem::path writeBrainFile(const std::filesystem::path& dir, const std::string& name,
+                                     const std::string& header2) {
+    const std::filesystem::path p = dir / name;
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out << "muuk-brain-v2 1\n" << header2 << "\n";
+    return p;
+}
+
+std::filesystem::path freshBrainDir(const std::string& tag) {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("muuk_brain_rule_" + tag);
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root);
+    return root;
+}
+}  // namespace
+
+// The v0.2.6 brain header, verbatim from the shipped file (backup at
+// trainer/brain_v015_shipped_backup.txt): same trainedUntilMs as the new
+// brain, no erMode field.
+const char* kOldBrainHeader2 =
+    "volLow 0.516437 volHigh 1.14914 trainedBars 1500000 trainedUntilMs 1793818980000 forced 0";
+// The v0.2.7 brain header, verbatim from the repo-root brain_v2.txt.
+const char* kNewBrainHeader2 =
+    "volLow 0.516437 volHigh 1.14914 trainedBars 1500000 trainedUntilMs 1793818980000 forced 0 "
+    "shiftAfterFills 3 stepAtr 2 erMode 2 stopLoss 0";
+
+TEST_CASE("shouldInstallReleaseBrain installs the release brain over the v0.2.6 brain") {
+    const auto root = freshBrainDir("old");
+    const auto installed = writeBrainFile(root, "installed.txt", kOldBrainHeader2);
+    const auto release = writeBrainFile(root, "release.txt", kNewBrainHeader2);
+    // Same trainedUntilMs (both trained on the same 1.5M bars); the old
+    // brain records no ER mode, so the release brain wins the tie.
+    REQUIRE(shouldInstallReleaseBrain(installed, release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("shouldInstallReleaseBrain installs when the PC has no brain") {
+    const auto root = freshBrainDir("missing");
+    const auto release = writeBrainFile(root, "release.txt", kNewBrainHeader2);
+    REQUIRE(shouldInstallReleaseBrain(root / "does-not-exist.txt", release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("shouldInstallReleaseBrain installs over an unparseable brain") {
+    const auto root = freshBrainDir("garbage");
+    const auto installed = root / "installed.txt";
+    {
+        std::ofstream out(installed, std::ios::binary | std::ios::trunc);
+        out << "this is not a brain file\n";
+    }
+    const auto release = writeBrainFile(root, "release.txt", kNewBrainHeader2);
+    REQUIRE(shouldInstallReleaseBrain(installed, release));
+    // A file with the right magic but no trainedUntilMs is unparseable too.
+    const auto noUntil = writeBrainFile(root, "no-until.txt", "volLow 0.5 volHigh 1.1 forced 0");
+    REQUIRE(shouldInstallReleaseBrain(noUntil, release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("shouldInstallReleaseBrain installs over an older brain") {
+    const auto root = freshBrainDir("older");
+    const auto installed = writeBrainFile(
+        root, "installed.txt",
+        "volLow 0.516437 volHigh 1.14914 trainedBars 1500000 trainedUntilMs 1700000000000 forced 0 "
+        "shiftAfterFills 3 stepAtr 2 erMode 2 stopLoss 0");
+    const auto release = writeBrainFile(root, "release.txt", kNewBrainHeader2);
+    REQUIRE(shouldInstallReleaseBrain(installed, release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("shouldInstallReleaseBrain keeps a newer locally-trained brain") {
+    const auto root = freshBrainDir("newer");
+    // The in-app trainer trained on bars past the release history: a
+    // larger trainedUntilMs, with a recorded ER mode.
+    const auto installed = writeBrainFile(
+        root, "installed.txt",
+        "volLow 0.516437 volHigh 1.14914 trainedBars 1600000 trainedUntilMs 1793905380000 forced 0 "
+        "shiftAfterFills 3 stepAtr 2 erMode 2 stopLoss 0");
+    const auto release = writeBrainFile(root, "release.txt", kNewBrainHeader2);
+    REQUIRE_FALSE(shouldInstallReleaseBrain(installed, release));
+    // Newer wins even without a recorded ER mode.
+    const auto installedNoEr = writeBrainFile(
+        root, "installed-no-er.txt",
+        "volLow 0.516437 volHigh 1.14914 trainedBars 1600000 trainedUntilMs 1793905380000 forced 0");
+    REQUIRE_FALSE(shouldInstallReleaseBrain(installedNoEr, release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("shouldInstallReleaseBrain keeps a same-age brain with a recorded ER mode") {
+    const auto root = freshBrainDir("tie-recorded");
+    // Same header as the release brain: local training wins the tie.
+    const auto installed = writeBrainFile(root, "installed.txt", kNewBrainHeader2);
+    const auto release = writeBrainFile(root, "release.txt", kNewBrainHeader2);
+    REQUIRE_FALSE(shouldInstallReleaseBrain(installed, release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("shouldInstallReleaseBrain never installs an unparseable release brain") {
+    const auto root = freshBrainDir("bad-release");
+    const auto release = root / "release.txt";
+    {
+        std::ofstream out(release, std::ios::binary | std::ios::trunc);
+        out << "garbage\n";
+    }
+    // Even with no usable brain on the PC, a release brain we cannot
+    // validate is not installed.
+    REQUIRE_FALSE(shouldInstallReleaseBrain(root / "does-not-exist.txt", release));
+    const auto installed = writeBrainFile(root, "installed.txt", kOldBrainHeader2);
+    REQUIRE_FALSE(shouldInstallReleaseBrain(installed, release));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("readBrainHeader reads only the header and tolerates CRLF") {
+    const auto root = freshBrainDir("crlf");
+    const auto p = root / "brain.txt";
+    {
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out << "muuk-brain-v2 1\r\n" << kNewBrainHeader2 << "\r\n";
+        out << "54 559 0.81 1 1 4 1.5 6 0.5 0\n";  // a cell line: never read
+    }
+    const auto header = readBrainHeader(p);
+    REQUIRE(header.has_value());
+    REQUIRE(header->valid);
+    REQUIRE(header->trainedUntilMs == 1793818980000LL);
+    REQUIRE(header->erMode == 2);
+    const auto old = readBrainHeader(writeBrainFile(root, "old.txt", kOldBrainHeader2));
+    REQUIRE(old.has_value());
+    REQUIRE(old->erMode == -1);
+    REQUIRE_FALSE(readBrainHeader(root / "does-not-exist.txt").has_value());
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("buildUpdateBatch installs the release brain only when told to") {
+    const std::string withBrain = buildUpdateBatch("C:\\Muuk", "C:\\Temp\\MuukUpdate\\extracted", true);
+    // The unconditional copy is its own line (starts right after a CRLF).
+    REQUIRE(withBrain.find("\r\ncopy /Y \"%SRC_DIR%\\brain_v2.txt\"") != std::string::npos);
+    REQUIRE(withBrain.find("if not exist \"%APP_DIR%\\brain_v2.txt\" copy") == std::string::npos);
+    // The bulk copy still never carries the brain blindly.
+    REQUIRE(withBrain.find("/XF *.local.json brain_v2.txt") != std::string::npos);
+    const std::string withoutBrain = buildUpdateBatch("C:\\Muuk", "C:\\Temp\\MuukUpdate\\extracted", false);
+    REQUIRE(withoutBrain.find("if not exist \"%APP_DIR%\\brain_v2.txt\" copy /Y \"%SRC_DIR%\\brain_v2.txt\"") !=
+            std::string::npos);
+    REQUIRE(withoutBrain.find("\r\ncopy /Y \"%SRC_DIR%\\brain_v2.txt\"") == std::string::npos);
+    // The default (two arguments) is the old copy-if-missing behaviour.
+    const std::string def = buildUpdateBatch("C:\\Muuk", "C:\\Temp\\MuukUpdate\\extracted");
+    REQUIRE(def.find("if not exist \"%APP_DIR%\\brain_v2.txt\" copy") != std::string::npos);
+    REQUIRE(def.find("\r\ncopy /Y \"%SRC_DIR%\\brain_v2.txt\"") == std::string::npos);
+}
+
 TEST_CASE("parseLatestRelease finds the Windows zip asset") {
     const std::string json = R"({
         "tag_name": "v2.0.1",
@@ -131,22 +292,47 @@ TEST_CASE("Updater background check settles harmlessly") {
     updater.startBackgroundCheck();
     // The worker finishes on its own; give it a moment, then it must
     // have settled -- never stuck in Checking. Off Windows there is no
-    // network, so it settles to Idle. On Windows it really asks GitHub,
-    // and a failed check (no network, or the unauthenticated API rate
-    // limit on a shared IP) legitimately settles to Failed instead --
-    // the check is best-effort by design, and Failed is a terminal
-    // state that offers no update, exactly like Idle. Either way no
-    // release may be reported, since nothing newer was found.
+    // network, so a clean check with nothing newer settles to UpToDate.
+    // On Windows it really asks GitHub, and a failed check (no network,
+    // or the unauthenticated API rate limit on a shared IP) legitimately
+    // settles to Failed instead -- the check is best-effort by design.
+    // Either way no release may be reported, since nothing newer was found.
     for (int i = 0; i < 2000 && updater.state() == Updater::State::Checking; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     const auto settled = updater.state();
-    REQUIRE((settled == Updater::State::Idle || settled == Updater::State::Failed));
+    REQUIRE((settled == Updater::State::UpToDate || settled == Updater::State::Failed));
     REQUIRE(updater.latestTag().empty());
     // beginInstall without an Available release is ignored, never a crash,
     // and leaves the settled state unchanged.
     updater.beginInstall();
     REQUIRE(updater.state() == settled);
+}
+
+TEST_CASE("a settled up-to-date check is not repeated, but a manual check re-runs") {
+    Updater updater("0.2.1");
+    updater.startBackgroundCheck();
+    for (int i = 0; i < 2000 && updater.state() == Updater::State::Checking; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    // On Windows an offline first check settles to Failed instead; the
+    // no-repeat rule below only applies to a known up-to-date answer.
+    if (updater.state() != Updater::State::UpToDate) {
+        REQUIRE(updater.state() == Updater::State::Failed);
+        return;
+    }
+    // The auto-check does not run twice in one run.
+    updater.startBackgroundCheck();
+    REQUIRE(updater.state() == Updater::State::UpToDate);
+    // The manual button does re-check, and settles again (UpToDate here,
+    // Failed on Windows when the network is gone).
+    updater.checkNow();
+    for (int i = 0; i < 2000 && updater.state() == Updater::State::Checking; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto resettled = updater.state();
+    REQUIRE((resettled == Updater::State::UpToDate || resettled == Updater::State::Failed));
+    REQUIRE(updater.latestTag().empty());
 }
 
 TEST_CASE("buildUpdateBatch never sleeps with timeout (v0.2.1 regression)") {

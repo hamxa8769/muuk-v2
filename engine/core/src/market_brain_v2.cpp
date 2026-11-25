@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <sstream>
+#include <vector>
 
 #include "muuk/core/regime_range.hpp"
 
@@ -84,6 +85,70 @@ double estimatedLockCost(double gap, const BrainV2Policy& policy) {
     return worst < 0.0 ? -worst : 0.0;
 }
 
+// Step 6: the lock cost the caps bound. With a stop the worst case per cycle
+// IS the stop, not the no-stop lock cost -- the stop is a hard, enforced,
+// audited live cap (the engine closes the basket at the stop, and the
+// audit force-closes if a target/stop was reached but the basket is still
+// open), and the replay models it exactly (closes at -stopLoss, checked
+// before the target). The $150 no-stop estimate is then not "conservative",
+// it is a wrong bound: it downgrades policies the live basket would never
+// lose $150 on, and leaves their edge (bigger targets at more levels, same
+// -$50 worst case) on the table. Without a stop the estimate stands.
+// (Step 6b: the stop defaults to OFF -- Step 6 proved it cuts the validated
+// edge -- so the shipped brain trains with the no-stop estimate; the
+// stop-aware bound still applies whenever a stop IS set.)
+double effectiveLockCost(double gap, const BrainV2Policy& policy, const BrainV2Config& config) {
+    const double worstCase = estimatedLockCost(gap, policy);
+    return config.stopLoss > 0.0 ? std::min(worstCase, config.stopLoss) : worstCase;
+}
+
+// Kaufman Efficiency Ratio over the last n closes (oldest first):
+// |close - close[n]| / sum(|change|). 1 = a straight move, 0 = pure whipsaw,
+// -1 when there are too few bars.
+double kaufmanEr(const std::deque<Bar>& bars, int n) {
+    if (n <= 0 || static_cast<int>(bars.size()) < n + 1) return -1.0;
+    const std::size_t last = bars.size() - 1;
+    const std::size_t first = last - static_cast<std::size_t>(n);
+    double path = 0.0;
+    for (std::size_t i = first + 1; i <= last; ++i) path += std::fabs(bars[i].close - bars[i - 1].close);
+    if (path <= 0.0) return -1.0;
+    return std::fabs(bars[last].close - bars[first].close) / path;
+}
+
+// The current Wilder ATR(period) ranked against its own values over the
+// window (0-100): the last value's share of ATRs at or below it. -1 when
+// too few bars to rank. One pass: Wilder's smoothing is a running average.
+double atrPercentile(const std::deque<Bar>& bars, int period) {
+    if (period <= 0 || bars.size() < static_cast<std::size_t>(period) + 30) return -1.0;
+    std::vector<double> atrs;
+    atrs.reserve(bars.size());
+    double sum = 0.0;
+    double avg = 0.0;
+    bool seeded = false;
+    for (std::size_t i = 1; i < bars.size(); ++i) {
+        const double tr = std::max({bars[i].high - bars[i].low, std::fabs(bars[i].high - bars[i - 1].close),
+                                    std::fabs(bars[i].low - bars[i - 1].close)});
+        if (!seeded) {
+            sum += tr;
+            if (i == static_cast<std::size_t>(period)) {
+                avg = sum / period;
+                atrs.push_back(avg);
+                seeded = true;
+            }
+        } else {
+            avg = (avg * (period - 1) + tr) / period;
+            atrs.push_back(avg);
+        }
+    }
+    if (atrs.size() < 30) return -1.0;
+    const double last = atrs.back();
+    std::size_t below = 0;
+    for (const double v : atrs) {
+        if (v <= last) ++below;
+    }
+    return 100.0 * static_cast<double>(below) / static_cast<double>(atrs.size());
+}
+
 SituationV2 situationAtV2(const std::deque<Bar>& oneMinuteBars, const BrainV2& brain, int recentOutcome, double spread,
                            double medianSpread) {
     SituationV2 out;
@@ -113,6 +178,12 @@ SituationV2 situationAtV2(const std::deque<Bar>& oneMinuteBars, const BrainV2& b
     const double close = oneMinuteBars.back().close;
     out.bollingerPos = close > read.bollingerUpper ? 2 : (close < read.bollingerLower ? 0 : 1);
     out.volume = read.volumeRatio < 0.7 ? 0 : (read.volumeRatio > 1.5 ? 2 : 1);
+    // Kaufman ER on 5-minute bars: 1-min ER is too noisy, and ADX /
+    // Choppiness already read 5-min (see the research doc). n=20 five-min
+    // bars = 100 minutes. ATR percentile on the 1-minute window: the
+    // current ATR ranked against its own last ~4 hours.
+    out.er = kaufmanEr(aggregateBars(oneMinuteBars, 5), 20);
+    out.atrPct = atrPercentile(oneMinuteBars, 14);
     return out;
 }
 
@@ -121,6 +192,7 @@ BrainV2Decision applyRiskCaps(BrainV2Decision decision, const BrainV2Config& con
     if (!decision.trade) return decision;
     auto refuse = [&](const char* reason) {
         decision.trade = false;
+        decision.blockedBy = BrainBlockReason::Caps;
         decision.why += std::string("; refused: ") + reason;
         return decision;
     };
@@ -149,24 +221,24 @@ BrainV2Decision applyRiskCaps(BrainV2Decision decision, const BrainV2Config& con
         lockCap = lockCap > 0.0 ? std::min(lockCap, pctCap) : pctCap;
     }
     if (lockCap > 0.0) {
-        while (estimatedLockCost(decision.gap, p) > lockCap && p.maxLevels > 2) {
+        while (effectiveLockCost(decision.gap, p, config) > lockCap && p.maxLevels > 2) {
             --p.maxLevels;
             downgraded = true;
         }
-        if (estimatedLockCost(decision.gap, p) > lockCap && p.lotMultiplier > 1.0) {
+        if (effectiveLockCost(decision.gap, p, config) > lockCap && p.lotMultiplier > 1.0) {
             p.lotMultiplier = 1.0;
             downgraded = true;
         }
-        if (estimatedLockCost(decision.gap, p) > lockCap) {
+        if (effectiveLockCost(decision.gap, p, config) > lockCap) {
             char buf[160];
             std::snprintf(buf, sizeof(buf), "lock cost %.2f over the cap %.2f even at 1.0x / 2 levels",
-                          estimatedLockCost(decision.gap, p), lockCap);
+                          effectiveLockCost(decision.gap, p, config), lockCap);
             return refuse(buf);
         }
     }
     if (downgraded) {
         decision.policy = p;
-        decision.estimatedLockCost = estimatedLockCost(decision.gap, p);
+        decision.estimatedLockCost = effectiveLockCost(decision.gap, p, config);
         char buf[160];
         std::snprintf(buf, sizeof(buf), "; caps downgraded the policy to %.2fx / %d levels (lock cost %.2f)", p.lotMultiplier,
                       p.maxLevels, decision.estimatedLockCost);
@@ -175,22 +247,55 @@ BrainV2Decision applyRiskCaps(BrainV2Decision decision, const BrainV2Config& con
     return decision;
 }
 
+int resolveFirstSide(int firstSide, int trendDir) {
+    if (firstSide == static_cast<int>(BrainFirstSide::TrendFirst)) {
+        return trendDir > 0 ? 1 : (trendDir < 0 ? -1 : 0);
+    }
+    if (firstSide == static_cast<int>(BrainFirstSide::BuyFirst)) return 1;
+    if (firstSide == static_cast<int>(BrainFirstSide::SellFirst)) return -1;
+    return 0;  // Both, undecided, or an unknown value: arm both stops
+}
+
 BrainV2Decision decideWithBrainV2(const BrainV2& brain, const SituationV2& situation, const BrainV2Config& config,
                                    const BrainAccountState& account) {
     BrainV2Decision d;
     if (!brain.trained || brain.cells.size() != kCells) {
         d.why = "the v2 brain isn't trained";
+        d.blockedBy = BrainBlockReason::NotTrained;
         return d;
     }
     if (!situation.known) {
         d.why = "too few bars to read this market";
+        d.blockedBy = BrainBlockReason::TooFewBars;
         return d;
     }
-    if (config.maxAtrVolMultiple > 0.0 && brain.volHigh > 0.0 && situation.base.atr > config.maxAtrVolMultiple * brain.volHigh) {
+    // A clean trend (high ER) overrides the volatility breaker: the range
+    // strategy earns on a trend that breaks one side and runs. Only a choppy
+    // extreme-volatility move is blocked. Modes 0-1 keep the shipped breaker.
+    const bool cleanTrend = config.erMode >= 2 && situation.er >= config.erTrendAllow;
+    bool overrodeBreaker = false;
+    bool overrodeTrend = false;
+    if (config.erMode != 3 && config.maxAtrVolMultiple > 0.0 && brain.volHigh > 0.0 &&
+        situation.base.atr > config.maxAtrVolMultiple * brain.volHigh) {
+        if (!cleanTrend) {
+            char buf[300];
+            std::snprintf(buf, sizeof(buf), "ATR %.2f is %.1fx the training high-vol threshold %.2f -- extreme volatility, no new cycle",
+                          situation.base.atr, situation.base.atr / brain.volHigh, brain.volHigh);
+            d.why = buf;
+            d.blockedBy = BrainBlockReason::AtrBreaker;
+            return d;
+        }
+        overrodeBreaker = true;
+    }
+    // Mode 3: the ATR percentile replaces the fixed breaker -- block only
+    // when the ATR is in its own top decile over the window. A clean trend
+    // still overrides it.
+    if (config.erMode == 3 && situation.atrPct >= config.erAtrPctBlock && !cleanTrend) {
         char buf[300];
-        std::snprintf(buf, sizeof(buf), "ATR %.2f is %.1fx the training high-vol threshold %.2f -- extreme volatility, no new cycle",
-                      situation.base.atr, situation.base.atr / brain.volHigh, brain.volHigh);
+        std::snprintf(buf, sizeof(buf), "ATR percentile %.0f over %.0f -- extreme volatility for this window, no new cycle",
+                      situation.atrPct, config.erAtrPctBlock);
         d.why = buf;
+        d.blockedBy = BrainBlockReason::AtrBreaker;
         return d;
     }
     static constexpr const char* kLevels[] = {"low", "mid", "high"};
@@ -204,49 +309,76 @@ BrainV2Decision decideWithBrainV2(const BrainV2& brain, const SituationV2& situa
         char buf[260];
         std::snprintf(buf, sizeof(buf), "%s: history shows no policy worth trading here (%d samples)", where, cell.samples);
         d.why = buf;
+        d.blockedBy = BrainBlockReason::CellNotTradable;
         return d;
     }
     // Context gates: the extra features v2 sees.
-    if (config.noTradeInStrongTrend && situation.base.trend == 2 && situation.trendDir != 0) {
-        d.why = std::string(where) + ": strong trend, no new range cycle";
+    // ER chop-block (modes 1-3): a whipsaw market (low ER) fills both sides
+    // and locks. It only fires when the cell would otherwise trade.
+    if (config.erMode >= 1 && situation.er >= 0.0 && situation.er < config.erChopBlock) {
+        char buf[400];
+        std::snprintf(buf, sizeof(buf), "%s: choppy market (Kaufman ER %.2f under %.2f), no new cycle", where, situation.er,
+                      config.erChopBlock);
+        d.why = buf;
+        d.blockedBy = BrainBlockReason::ErChop;
         return d;
+    }
+    if (config.noTradeInStrongTrend && situation.base.trend == 2 && situation.trendDir != 0) {
+        if (!cleanTrend) {
+            d.why = std::string(where) + ": strong trend, no new range cycle";
+            d.blockedBy = BrainBlockReason::StrongTrend;
+            return d;
+        }
+        overrodeTrend = true;
     }
     if (situation.recentOutcome < 0 && cell.score < config.recentLossScore) {
         char buf[400];
         std::snprintf(buf, sizeof(buf), "%s: last basket lost or locked, and this state's score is only %.2f", where, cell.score);
         d.why = buf;
+        d.blockedBy = BrainBlockReason::RecentLoss;
         return d;
     }
     if (situation.volume == 2 && cell.score < config.highVolumeScore) {
         char buf[400];
         std::snprintf(buf, sizeof(buf), "%s: tick-volume spike, and this state's score is only %.2f", where, cell.score);
         d.why = buf;
+        d.blockedBy = BrainBlockReason::VolumeSpike;
         return d;
     }
     if (config.maxSpreadMultiple > 0.0 && situation.spreadPct > config.maxSpreadMultiple) {
         char buf[400];
         std::snprintf(buf, sizeof(buf), "%s: spread %.1fx its median, too wide to trade", where, situation.spreadPct);
         d.why = buf;
+        d.blockedBy = BrainBlockReason::Spread;
         return d;
     }
     d.trade = true;
     d.policy = cell.best;
     d.gap = clampedGap(brain.gapAtrChoices[cell.best.gapChoice], situation.base.atr, config.base);
+    d.firstSide = resolveFirstSide(cell.firstSide, situation.trendDir);
     d.lockRisk = cell.lockRate;
-    d.estimatedLockCost = estimatedLockCost(d.gap, d.policy);
+    d.estimatedLockCost = effectiveLockCost(d.gap, d.policy, config);
     char buf[320];
     std::snprintf(buf, sizeof(buf),
                   "%s: gap %.2f (%.1f x ATR %.2f), %.2fx / %d levels, exit x%.2f, %d samples, mean %+.2f, lock rate %.1f%%, "
-                  "lock cost %.2f",
+                  "lock cost %.2f, first %s",
                   where, d.gap, brain.gapAtrChoices[cell.best.gapChoice], situation.base.atr, d.policy.lotMultiplier,
                   d.policy.maxLevels, d.policy.exitFactor, cell.samples, cell.meanPnl, 100.0 * cell.lockRate,
-                  d.estimatedLockCost);
+                  d.estimatedLockCost, d.firstSide > 0 ? "Buy" : (d.firstSide < 0 ? "Sell" : "both"));
     d.why = buf;
+    if (overrodeBreaker || overrodeTrend) {
+        const char* what = overrodeBreaker && overrodeTrend ? "ATR breaker + strong-trend gate"
+                           : overrodeBreaker                 ? "ATR breaker"
+                                                             : "strong-trend gate";
+        char note[160];
+        std::snprintf(note, sizeof(note), "; clean trend (ER %.2f) overrode the %s", situation.er, what);
+        d.why += note;
+    }
     return applyRiskCaps(d, config, account);
 }
 
 ReplayCycleV2 replayCycleV2(const std::vector<Bar>& bars, const std::vector<double>& spreads, int start, double gap, double atr,
-                             const BrainV2Policy& policy, const BrainV2Config& config) {
+                             const BrainV2Policy& policy, const BrainV2Config& config, int firstSide) {
     struct Leg {
         bool buy;
         double price;
@@ -275,8 +407,14 @@ ReplayCycleV2 replayCycleV2(const std::vector<Bar>& bars, const std::vector<doub
         const double spread = static_cast<std::size_t>(j) < spreads.size() ? spreads[j] : 0.0;
         int fillsThisBar = 0;
         while (fillsThisBar < 2) {
-            const bool buyHit = (legs.empty() || nextBuy) && bar.high >= buyLine;
-            const bool sellHit = (legs.empty() || !nextBuy) && bar.low <= sellLine;
+            // Step 3: the first order. Both (0) arms both stops, as
+            // before; Buy (+1) arms only the Buy Stop and Sell (-1) only
+            // the Sell Stop until the first fill, when the opposite side
+            // arms (the engine's StartSide rule). A Trend value (2) must
+            // be resolved by the caller (see resolveFirstSide); here any
+            // positive value reads as Buy-first, any negative as Sell-first.
+            const bool buyHit = (legs.empty() ? firstSide >= 0 : nextBuy) && bar.high >= buyLine;
+            const bool sellHit = (legs.empty() ? firstSide <= 0 : !nextBuy) && bar.low <= sellLine;
             if (!buyHit && !sellHit) break;
             const bool buy = buyHit && (!sellHit || bar.close >= mid);
             if (static_cast<int>(legs.size()) >= policy.maxLevels) {
@@ -303,6 +441,21 @@ ReplayCycleV2 replayCycleV2(const std::vector<Bar>& bars, const std::vector<doub
             }
         }
         if (legs.empty()) continue;
+        // Step 5: the live basket stop loss. The first bar the basket's
+        // worst net reaches -stopLoss, the basket stops out at the stop
+        // level instead of running on to the lock (a stop close, not a
+        // lock). Checked before the target: on a bar that touches both,
+        // the loss is taken -- the conservative reading, since a 1-minute
+        // bar does not say which level was touched first. 0 = off.
+        if (config.stopLoss > 0.0) {
+            const double worst = std::min(netAt(bar.high), netAt(bar.low));
+            if (worst <= -config.stopLoss) {
+                out.pnl = -config.stopLoss;
+                out.endBar = j;
+                out.fills = static_cast<int>(legs.size());
+                return out;
+            }
+        }
         const double target = legs.back().lot * gap / 2.0 * policy.exitFactor;
         const double best = std::max(netAt(bar.high), netAt(bar.low));
         if (fillsThisBar == 0 && best >= target) {
@@ -429,9 +582,99 @@ BrainV2 learnBrainV2(const std::vector<Bar>& bars, const std::vector<double>& sp
             }
         }
     }
+    // Stage C (Step 3): the first order, per cell. For every tradable
+    // cell, replay its cycles four ways -- both stops armed (Both), only
+    // the Buy Stop first, only the Sell Stop first, and the trend side
+    // first (the direction the cycle's own EMA8/EMA21 points, so the
+    // first side is trend-wise, not a fixed Buy/Sell the bull market
+    // would have taught it). A single side must beat Both by more than
+    // 0.05 -- the same margin stage B demands of a riskier policy -- or
+    // Both stays: in a range the first fill is whichever line the price
+    // touches first, and waiting for one side is only worth it when the
+    // history says so. Forced modes (the experiment's controls) skip the
+    // tallies and stamp the forced side on every tradable cell, so the
+    // walk-forward and the saved brain trade exactly what was validated.
+    if (config.firstSideMode == BrainFirstSideMode::Learn) {
+        constexpr std::size_t kFirstSides = 4;  // 0 Both, 1 Buy, 2 Sell, 3 Trend
+        std::vector<Tally> tallyC(kCells * kFirstSides);
+        for (int i = kWindowBars; i + 1 < end; i += config.base.stepBars) {
+            const Situation s = situationAt(windowEndingAt(bars, i), tmp);
+            if (!s.known) continue;
+            const int cell = cellIndex(s);
+            const BrainV2Cell& chosen = brain.cells[cell];
+            if (chosen.best.gapChoice < 0) continue;
+            BrainV2Config bounded = config;
+            bounded.base.maxCycleBars = std::min(config.base.maxCycleBars, end - 1 - i);
+            const double gap = clampedGap(config.base.gapAtrChoices[chosen.best.gapChoice], s.atr, config.base);
+            const SituationV2 s2 = situationAtV2(windowEndingAt(bars, i), brain, 0, 0.0, 0.0);
+            const int trendSide = s2.trendDir > 0 ? 1 : (s2.trendDir < 0 ? -1 : 0);
+            // Three replays; Trend reuses one of them (it IS that side
+            // when the trend is clear, and Both when it is flat).
+            const ReplayCycleV2 rBoth = replayCycleV2(bars, spreads, i, gap, s.atr, chosen.best, bounded, 0);
+            const ReplayCycleV2 rBuy = replayCycleV2(bars, spreads, i, gap, s.atr, chosen.best, bounded, 1);
+            const ReplayCycleV2 rSell = replayCycleV2(bars, spreads, i, gap, s.atr, chosen.best, bounded, -1);
+            const ReplayCycleV2* results[kFirstSides] = {&rBoth, &rBuy, &rSell,
+                                                          trendSide > 0 ? &rBuy : (trendSide < 0 ? &rSell : &rBoth)};
+            for (std::size_t v = 0; v < kFirstSides; ++v) {
+                Tally& t = tallyC[cell * kFirstSides + v];
+                ++t.n;
+                t.sum += results[v]->pnl;
+                t.squares += results[v]->pnl * results[v]->pnl;
+                if (results[v]->locked) {
+                    ++t.locks;
+                    t.lockLossSum += std::fabs(results[v]->pnl);
+                }
+            }
+        }
+        for (int cell = 0; cell < kCells; ++cell) {
+            BrainV2Cell& out = brain.cells[cell];
+            if (out.best.gapChoice < 0) continue;
+            const Tally& both = tallyC[cell * kFirstSides + 0];
+            const double bothScore = scoreOf(both);
+            int bestVariant = 0;
+            double bestScore = bothScore;
+            for (std::size_t v = 1; v < kFirstSides; ++v) {
+                const Tally& t = tallyC[cell * kFirstSides + v];
+                if (t.n < config.base.minSamples) continue;
+                const double shrunkLockRate = (t.locks + 1.0) / (t.n + 10.0);
+                if (shrunkLockRate > config.maxLockRate) continue;
+                const double score = scoreOf(t);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestVariant = static_cast<int>(v);
+                }
+            }
+            if (bestVariant != 0 && bestScore > bothScore + 0.05) {
+                out.firstSide = bestVariant == 1 ? static_cast<int>(BrainFirstSide::BuyFirst)
+                                : bestVariant == 2 ? static_cast<int>(BrainFirstSide::SellFirst)
+                                                   : static_cast<int>(BrainFirstSide::TrendFirst);
+            }
+        }
+    } else {
+        const int forced = config.firstSideMode == BrainFirstSideMode::BuyFirst
+                               ? static_cast<int>(BrainFirstSide::BuyFirst)
+                           : config.firstSideMode == BrainFirstSideMode::SellFirst
+                               ? static_cast<int>(BrainFirstSide::SellFirst)
+                           : config.firstSideMode == BrainFirstSideMode::TrendFirst
+                               ? static_cast<int>(BrainFirstSide::TrendFirst)
+                               : static_cast<int>(BrainFirstSide::Both);
+        for (BrainV2Cell& out : brain.cells) {
+            if (out.best.gapChoice >= 0) out.firstSide = forced;
+        }
+    }
     brain.trained = true;
     brain.trainedBars = end;
     brain.trainedUntilMs = bars[end - 1].startMs;
+    // Step 2 (decision D12): the shift this brain was trained with goes
+    // into the file, so the live runner trades the validated shift, not
+    // whatever the operator's config happens to say.
+    brain.shiftAfterFills = config.base.shiftAfterFills;
+    brain.stepAtr = config.base.stepAtr;
+    // Step 6: the same for the ER gate mode and the stop loss -- the live
+    // runner uses the brain's recorded erMode (see BrainKeeperV2), and the
+    // recorded stop loss is the audit trail of what it trained under.
+    brain.erMode = config.erMode;
+    brain.stopLoss = config.stopLoss;
     return brain;
 }
 
@@ -454,6 +697,7 @@ ReplayResult replayRulesV2(const std::vector<Bar>& bars, const std::vector<doubl
         double gap = 0.0;
         double atr = 0.0;
         BrainV2Policy policy;
+        int firstSide = 0;  // Step 3: the brain's first order for this cycle; the fixed path stays Both
         if (fixedGapAtr > 0.0) {
             atr = atrOf(window, 14);
             gap = atr > 0.0 ? clampedGap(fixedGapAtr, atr, config.base) : 0.0;
@@ -473,6 +717,38 @@ ReplayResult replayRulesV2(const std::vector<Bar>& bars, const std::vector<doubl
                 gap = d.gap;
                 atr = s.base.atr;
                 policy = d.policy;
+                firstSide = d.firstSide;
+            }
+            if (!d.trade &&
+                (d.blockedBy == BrainBlockReason::StrongTrend || d.blockedBy == BrainBlockReason::AtrBreaker)) {
+                // Shadow audit: what the cell would have traded, replayed
+                // for the record only. Never counted in the totals, never
+                // moves the loop: the real walk steps on by stepBars below.
+                const BrainV2Cell& cell = brain->cells[cellIndex(s.base)];
+                if (cell.best.gapChoice >= 0 && cell.best.gapChoice < static_cast<int>(brain->gapAtrChoices.size())) {
+                    BrainV2Decision shadow;
+                    shadow.trade = true;
+                    shadow.gap = clampedGap(brain->gapAtrChoices[cell.best.gapChoice], s.base.atr, config.base);
+                    shadow.policy = cell.best;
+                    shadow = applyRiskCaps(shadow, config, account);
+                    if (shadow.trade) {
+                        BrainV2Config bounded = config;
+                        bounded.base.maxCycleBars = std::min(config.base.maxCycleBars, last - i);
+                        const ReplayCycleV2 r = replayCycleV2(bars, spreads, i, shadow.gap, s.base.atr, shadow.policy,
+                                                              bounded, resolveFirstSide(cell.firstSide, s.trendDir));
+                        if (d.blockedBy == BrainBlockReason::StrongTrend) {
+                            ++out.shadowTrendBlocked;
+                            out.shadowTrendPnl += r.pnl;
+                            if (r.pnl > 0.0) ++out.shadowTrendWins;
+                            if (r.locked) ++out.shadowTrendLocks;
+                        } else {
+                            ++out.shadowBreakerBlocked;
+                            out.shadowBreakerPnl += r.pnl;
+                            if (r.pnl > 0.0) ++out.shadowBreakerWins;
+                            if (r.locked) ++out.shadowBreakerLocks;
+                        }
+                    }
+                }
             }
         }
         if (gap <= 0.0) {
@@ -482,7 +758,7 @@ ReplayResult replayRulesV2(const std::vector<Bar>& bars, const std::vector<doubl
         }
         BrainV2Config bounded = config;
         bounded.base.maxCycleBars = std::min(config.base.maxCycleBars, last - i);
-        const ReplayCycleV2 r = replayCycleV2(bars, spreads, i, gap, atr, policy, bounded);
+        const ReplayCycleV2 r = replayCycleV2(bars, spreads, i, gap, atr, policy, bounded, firstSide);
         ++out.cycles;
         if (r.pnl > 0.0) ++out.wins;
         if (r.locked) ++out.locks;
@@ -501,7 +777,8 @@ ReplayResult replayRulesV2(const std::vector<Bar>& bars, const std::vector<doubl
 namespace {
 
 WalkForwardResult walkForwardV2Impl(const std::vector<Bar>& bars, const std::vector<double>& spreads, const BrainV2* brain,
-                                    bool learnEachPeriod, const BrainV2Config& config) {
+                                    bool learnEachPeriod, const BrainV2Config& config, const char* stage = "walk-forward",
+                                    const BrainTrainingProgress& progress = nullptr) {
     WalkForwardResult out;
     const int total = static_cast<int>(bars.size());
     const int first = std::max(kWindowBars * 2, static_cast<int>(total * config.base.firstLearnShare));
@@ -521,10 +798,19 @@ WalkForwardResult walkForwardV2Impl(const std::vector<Bar>& bars, const std::vec
             r = replayRulesV2(upTo, spreadsUpTo, from, brain, brain ? 0.0 : 3.0, config);
         }
         ++out.periods;
+        if (progress) progress(stage, out.periods, config.base.periods);
         out.periodsUp += r.totalPnl > 0.0 ? 1 : 0;
         out.total.cycles += r.cycles;
         out.total.wins += r.wins;
         out.total.locks += r.locks;
+        out.total.shadowTrendBlocked += r.shadowTrendBlocked;
+        out.total.shadowTrendPnl += r.shadowTrendPnl;
+        out.total.shadowTrendWins += r.shadowTrendWins;
+        out.total.shadowTrendLocks += r.shadowTrendLocks;
+        out.total.shadowBreakerBlocked += r.shadowBreakerBlocked;
+        out.total.shadowBreakerPnl += r.shadowBreakerPnl;
+        out.total.shadowBreakerWins += r.shadowBreakerWins;
+        out.total.shadowBreakerLocks += r.shadowBreakerLocks;
         out.total.worstCycle = std::min(out.total.worstCycle, r.worstCycle);
         out.total.maxDrawdown = std::max(out.total.maxDrawdown, peak - equity + r.maxDrawdown);
         equity += r.totalPnl;
@@ -537,7 +823,7 @@ WalkForwardResult walkForwardV2Impl(const std::vector<Bar>& bars, const std::vec
 }  // namespace
 
 BrainV2Training trainBrainV2(const std::vector<Bar>& bars, const std::vector<double>& spreads, const BrainV2& current,
-                              const BrainV2Config& config) {
+                              const BrainV2Config& config, BrainTrainingProgress progress) {
     BrainV2Training t;
     const int total = static_cast<int>(bars.size());
     const int first = static_cast<int>(total * config.base.firstLearnShare);
@@ -550,8 +836,8 @@ BrainV2Training trainBrainV2(const std::vector<Bar>& bars, const std::vector<dou
         t.report = "too few bars to learn from: " + std::to_string(total) + "\n";
         return t;
     }
-    const WalkForwardResult v2 = walkForwardV2Impl(bars, spreads, nullptr, true, config);
-    const WalkForwardResult fixed = walkForwardV2Impl(bars, spreads, nullptr, false, config);
+    const WalkForwardResult v2 = walkForwardV2Impl(bars, spreads, nullptr, true, config, "walk-forward", progress);
+    const WalkForwardResult fixed = walkForwardV2Impl(bars, spreads, nullptr, false, config, "fixed", progress);
     const WalkForwardResult v1 = walkForward(bars, spreads, nullptr, true, config.base);
     t.brainTest = v2.total;
     t.fixedTest = fixed.total;
@@ -568,14 +854,19 @@ BrainV2Training trainBrainV2(const std::vector<Bar>& bars, const std::vector<dou
         const MarketBrain heldV1 = learnBrain(bars, spreads, heldFrom, config.base);
         if (heldV1.trained) t.heldOutV1 = replayRules(bars, spreads, heldFrom, &heldV1, 0.0, config.base);
     }
+    if (progress) progress("held-out", 1, 1);
 
     t.better = t.brainTest.cycles > 0 && t.brainTest.totalPnl > 0.0 && t.brainTest.totalPnl > t.fixedTest.totalPnl &&
                t.brainTest.totalPnl > t.v1Test.totalPnl && t.brainTest.maxDrawdown <= t.fixedTest.maxDrawdown;
-    const bool ddGate = t.v1Test.maxDrawdown <= 0.0 ? t.brainTest.maxDrawdown <= 0.0
-                                                    : t.brainTest.maxDrawdown <= 0.5 * t.v1Test.maxDrawdown;
-    const bool lockGate = t.v1Test.locks <= 0 ? t.brainTest.locks <= 0 : t.brainTest.locks <= t.v1Test.locks / 2;
-    t.gatesPassed = t.better && ddGate && lockGate && t.brainPeriodsUp >= 5 && t.heldOutV2.totalPnl > 0.0;
-    if (t.better) t.brain = learnBrainV2(bars, spreads, total, config);
+    t.ddGate = t.v1Test.maxDrawdown <= 0.0 ? t.brainTest.maxDrawdown <= 0.0
+                                           : t.brainTest.maxDrawdown <= 0.5 * t.v1Test.maxDrawdown;
+    t.lockGate = t.v1Test.locks <= 0 ? t.brainTest.locks <= 0 : t.brainTest.locks <= t.v1Test.locks / 2;
+    t.gatesPassed = t.better && t.ddGate && t.lockGate && t.brainPeriodsUp >= 5 && t.heldOutV2.totalPnl > 0.0;
+    if (t.better) {
+        if (progress) progress("final", 0, 1);
+        t.brain = learnBrainV2(bars, spreads, total, config);
+        if (progress) progress("final", 1, 1);
+    }
 
     char head[240];
     std::snprintf(head, sizeof(head),
@@ -584,6 +875,21 @@ BrainV2Training trainBrainV2(const std::vector<Bar>& bars, const std::vector<dou
                   total, v2.periods, first, v2.periodsUp);
     t.report = head + lineOf("v2 brain", t.brainTest) + lineOf("fixed 3 x ATR", t.fixedTest) + lineOf("v1 brain", t.v1Test) +
                lineOf("held-out v2", t.heldOutV2) + lineOf("held-out fixed", t.heldOutFixed) + lineOf("held-out v1", t.heldOutV1);
+    {
+        char shadow[800];
+        std::snprintf(shadow, sizeof(shadow),
+                      "shadow audit (blocked cycles replayed anyway, NOT counted above):\n"
+                      "  strong-trend gate blocked %d cycles: shadow total %+10.2f, %d wins, %d locks\n"
+                      "  ATR breaker blocked %d cycles: shadow total %+10.2f, %d wins, %d locks\n"
+                      "  held-out: trend gate %d (shadow %+10.2f, %d wins, %d locks), breaker %d (shadow %+10.2f, %d wins, %d locks)\n",
+                      t.brainTest.shadowTrendBlocked, t.brainTest.shadowTrendPnl, t.brainTest.shadowTrendWins,
+                      t.brainTest.shadowTrendLocks, t.brainTest.shadowBreakerBlocked, t.brainTest.shadowBreakerPnl,
+                      t.brainTest.shadowBreakerWins, t.brainTest.shadowBreakerLocks, t.heldOutV2.shadowTrendBlocked,
+                      t.heldOutV2.shadowTrendPnl, t.heldOutV2.shadowTrendWins, t.heldOutV2.shadowTrendLocks,
+                      t.heldOutV2.shadowBreakerBlocked, t.heldOutV2.shadowBreakerPnl, t.heldOutV2.shadowBreakerWins,
+                      t.heldOutV2.shadowBreakerLocks);
+        t.report += shadow;
+    }
     t.report += t.better ? "result: better walking forward -- adopted\n" : "result: not better -- not adopted\n";
     t.report += t.gatesPassed ? "gates: PASSED (drawdown <= 50% of v1, locks <= 50% of v1, >=5 periods up, held-out > 0)\n"
                               : "gates: NOT PASSED\n";
@@ -591,11 +897,68 @@ BrainV2Training trainBrainV2(const std::vector<Bar>& bars, const std::vector<dou
     return t;
 }
 
+std::string gatesFailureSummary(const BrainV2Training& t) {
+    if (t.gatesPassed) return "gates PASSED";
+    std::vector<std::string> failed;
+    if (!t.better) {
+        char buf[220];
+        std::snprintf(buf, sizeof(buf), "walk-forward not better (v2 %+.2f / %d cycles vs fixed %+.2f, v1 %+.2f)",
+                      t.brainTest.totalPnl, t.brainTest.cycles, t.fixedTest.totalPnl, t.v1Test.totalPnl);
+        failed.push_back(buf);
+    }
+    if (!t.ddGate) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "drawdown %.2f over 50%% of v1's %.2f", t.brainTest.maxDrawdown,
+                      t.v1Test.maxDrawdown);
+        failed.push_back(buf);
+    }
+    if (!t.lockGate) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "locks %d over half of v1's %d", t.brainTest.locks, t.v1Test.locks);
+        failed.push_back(buf);
+    }
+    if (t.brainPeriodsUp < 5) {
+        char buf[120];
+        std::snprintf(buf, sizeof(buf), "up in %d of %d periods (< 5)", t.brainPeriodsUp, t.periods);
+        failed.push_back(buf);
+    }
+    if (t.heldOutV2.totalPnl <= 0.0) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "held-out %+.2f / %d locks (must be > 0)", t.heldOutV2.totalPnl,
+                      t.heldOutV2.locks);
+        failed.push_back(buf);
+    }
+    std::string out = "gates NOT PASSED: ";
+    for (std::size_t i = 0; i < failed.size(); ++i) {
+        if (i > 0) out += "; ";
+        out += failed[i];
+    }
+    return out;
+}
+
+bool shiftComboBetter(const ShiftSearchCandidate& a, const ShiftSearchCandidate& b) {
+    if (a.gatesPassed != b.gatesPassed) return a.gatesPassed;
+    if (a.heldOutLocks != b.heldOutLocks) return a.heldOutLocks < b.heldOutLocks;
+    if (a.heldOutPnl != b.heldOutPnl) return a.heldOutPnl > b.heldOutPnl;
+    if (a.locks != b.locks) return a.locks < b.locks;
+    return a.totalPnl > b.totalPnl;
+}
+
+std::optional<ShiftSearchCandidate> pickBestShiftCombo(const std::vector<ShiftSearchCandidate>& candidates) {
+    std::optional<ShiftSearchCandidate> best;
+    for (const ShiftSearchCandidate& c : candidates) {
+        if (!c.gatesPassed) continue;
+        if (!best.has_value() || shiftComboBetter(c, *best)) best = c;
+    }
+    return best;
+}
+
 std::string serializeBrainV2(const BrainV2& brain) {
     std::ostringstream out;
     out << "muuk-brain-v2 1\n";
     out << "volLow " << brain.volLow << " volHigh " << brain.volHigh << " trainedBars " << brain.trainedBars << " trainedUntilMs "
-        << brain.trainedUntilMs << " forced " << (brain.forced ? 1 : 0) << "\n";
+        << brain.trainedUntilMs << " forced " << (brain.forced ? 1 : 0) << " shiftAfterFills " << brain.shiftAfterFills
+        << " stepAtr " << brain.stepAtr << " erMode " << brain.erMode << " stopLoss " << brain.stopLoss << "\n";
     out << "gapAtrChoices";
     for (const double g : brain.gapAtrChoices) out << ' ' << g;
     out << "\n";
@@ -603,7 +966,7 @@ std::string serializeBrainV2(const BrainV2& brain) {
         const BrainV2Cell& c = brain.cells[i];
         out << i << ' ' << c.samples << ' ' << c.best.gapChoice << ' ' << c.best.lotMultiplier << ' ' << c.best.maxLevels << ' '
             << c.best.exitFactor << ' ' << c.meanPnl << ' ' << c.sumPnl << ' ' << c.sumSquares << ' ' << c.locks << ' '
-            << c.lockRate << ' ' << c.meanLockLoss << ' ' << c.lockLossSum << ' ' << c.score << "\n";
+            << c.lockRate << ' ' << c.meanLockLoss << ' ' << c.lockLossSum << ' ' << c.score << ' ' << c.firstSide << "\n";
     }
     return out.str();
 }
@@ -621,6 +984,33 @@ std::optional<BrainV2> parseBrainV2(const std::string& text) {
     int forced = 0;
     if (!(in >> forced)) return std::nullopt;
     brain.forced = forced != 0;
+    // Step 2: optional trailing fields on the header line -- shiftAfterFills
+    // <n> stepAtr <x>. An old file ends the line after forced; the rest is
+    // empty and the brain keeps shift 0 (config shift as the fallback).
+    {
+        std::string rest;
+        std::getline(in, rest);
+        std::istringstream fields(rest);
+        std::string field;
+        while (fields >> field) {
+            if (field == "shiftAfterFills") {
+                int s = 0;
+                if (fields >> s) brain.shiftAfterFills = s;
+            } else if (field == "stepAtr") {
+                double s = 0.0;
+                if (fields >> s) brain.stepAtr = s;
+            } else if (field == "erMode") {
+                int e = 0;
+                if (fields >> e) brain.erMode = e;
+            } else if (field == "stopLoss") {
+                double s = 0.0;
+                if (fields >> s) brain.stopLoss = s;
+            } else {
+                std::string skip;
+                fields >> skip;  // unknown field: skip its value, stay tolerant
+            }
+        }
+    }
     if (!(in >> key)) return std::nullopt;  // gapAtrChoices
     std::string line;
     std::getline(in, line);
@@ -630,13 +1020,25 @@ std::optional<BrainV2> parseBrainV2(const std::string& text) {
     if (brain.gapAtrChoices.empty()) return std::nullopt;
     brain.cells.assign(kCells, BrainV2Cell{});
     for (int i = 0; i < kCells; ++i) {
+        // One line per cell, so the trailing firstSide (Step 3) can be
+        // told apart from the next cell's index: an old file ends the
+        // line after score, and the cell keeps firstSide 0 (Both /
+        // the config first order as the fallback).
+        std::string cellLine;
+        if (!std::getline(in, cellLine)) return std::nullopt;
+        std::istringstream cellIn(cellLine);
         int idx = -1;
         BrainV2Cell c;
-        if (!(in >> idx >> c.samples >> c.best.gapChoice >> c.best.lotMultiplier >> c.best.maxLevels >> c.best.exitFactor >>
-              c.meanPnl >> c.sumPnl >> c.sumSquares >> c.locks >> c.lockRate >> c.meanLockLoss >> c.lockLossSum >> c.score)) {
+        if (!(cellIn >> idx >> c.samples >> c.best.gapChoice >> c.best.lotMultiplier >> c.best.maxLevels >>
+              c.best.exitFactor >> c.meanPnl >> c.sumPnl >> c.sumSquares >> c.locks >> c.lockRate >> c.meanLockLoss >>
+              c.lockLossSum >> c.score)) {
             return std::nullopt;
         }
         if (idx < 0 || idx >= kCells) return std::nullopt;
+        int firstSide = 0;
+        if (cellIn >> firstSide && (firstSide == -1 || firstSide == 0 || firstSide == 1 || firstSide == 2)) {
+            c.firstSide = firstSide;
+        }
         brain.cells[idx] = c;
     }
     brain.trained = true;

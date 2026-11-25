@@ -5,10 +5,14 @@
 // What it does: holds the v2 brain the runner asks, keeps every finished
 // bar the bot sees in bars_live.csv next to the brain file, and after each
 // 1,440 new bars re-trains on a low-priority background thread. A new brain
-// replaces the one in use only if trainBrainV2 says it is better walking
-// forward — never by force, never from one basket. After each closed basket
-// the runner calls observeBasket() so the brain's online learning can veto
-// a cell that just lost badly; online learning can never invent a policy.
+// replaces the one in use only when the strict gates pass (better than fixed
+// and v1 walking forward, drawdown and locks capped, >=5 periods up,
+// held-out positive) -- never by force, never from one basket, never on a
+// walk-forward-only "better". The dashboard Train button (Step 5) starts the
+// same run on demand through trainNow(), on the bars the bot collected or on
+// a history CSV the user points at. After each closed basket the runner
+// calls observeBasket() so the brain's online learning can veto a cell that
+// just lost badly; online learning can never invent a policy.
 //
 // Wired into LiveRunner (live_runner.cpp): the runner calls
 // decideForCycle() before a new cycle opens and observeBasket() when one
@@ -21,6 +25,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,6 +52,25 @@ struct BrainV2Cycle {
     muuk::core::SituationV2 situation;
 };
 
+// Live progress of a training run, for the Brain panel. stage is "" when
+// idle; while running it is one of "loading", "walk-forward", "fixed",
+// "held-out", "final" (the stage names trainBrainV2 reports).
+struct BrainTrainingProgress {
+    std::string stage;
+    int done = 0;
+    int total = 0;
+    std::size_t bars = 0;  // bars the run is training on
+};
+
+// The outcome of the last finished training run (automatic or manual).
+struct BrainTrainingResult {
+    bool ran = false;          // a run finished (false until the first one)
+    bool adopted = false;      // the new brain passed the gates and was saved + adopted
+    bool gatesPassed = false;  // the strict gates (see trainBrainV2)
+    std::size_t bars = 0;      // bars the run trained on
+    std::string summary;       // one line with the numbers + gates verdict, for the panel
+};
+
 class BrainKeeperV2 {
 public:
     using Log = std::function<void(const std::string&)>;
@@ -67,6 +91,39 @@ public:
                                               double spread, double medianSpread,
                                               const muuk::core::BrainAccountState& account = {}) const;
     [[nodiscard]] bool trained() const;
+    // Replace the config the next decision (and the next basket
+    // observation) uses -- the risk knob and the ER mode, applied from the
+    // settings without restarting. The loaded brain and its live vetoes
+    // are untouched. Step 4: the runner calls this from applySettings.
+    void setConfig(muuk::core::BrainV2Config config);
+    // True while the background re-training thread is running: the runner
+    // must not replace (and so join) this keeper until it stops.
+    [[nodiscard]] bool learning() const { return learning_.load(); }
+    // Train now, in the background, on the bars in `history` (a CSV file or
+    // a folder of them) or -- when empty -- on the bars the bot collected in
+    // the brain folder (bars_live.csv). The same run the automatic
+    // re-training does, under the same config, with the same strict-gates
+    // adoption rule. No-op while a run is already going; never throws.
+    // A fresh install has almost no bars yet: the run then refuses with a
+    // "too few bars" result instead of training on nothing.
+    void trainNow(std::optional<std::filesystem::path> history = std::nullopt);
+    // Live progress of the run in progress (stage "" when idle).
+    [[nodiscard]] BrainTrainingProgress trainingProgress() const;
+    // The outcome of the last finished run (automatic or manual).
+    [[nodiscard]] BrainTrainingResult lastTraining() const;
+    // What the loaded brain learned from -- so a re-read can tell a new
+    // brain file from the same one written again.
+    [[nodiscard]] int64_t trainedBars() const;
+    [[nodiscard]] int64_t trainedUntilMs() const;
+    // The shift the loaded brain was trained with (Step 2, decision D12):
+    // {fills per step, step in ATR multiples}. Nothing when the brain is
+    // not trained or its file predates Step 2 (no shift fields) -- the
+    // runner then keeps the config shift.
+    [[nodiscard]] std::optional<std::pair<int, double>> trainedShift() const;
+
+    // Step 6: the ER gate mode the loaded brain trained under, when it
+    // recorded one (see decideForCycle). Nothing for an old brain file.
+    [[nodiscard]] std::optional<int> trainedErMode() const;
     // One line for the operator: what it learned from, how its last try went.
     [[nodiscard]] std::string status() const;
     // A basket just closed: let the online learning see it (veto only).
@@ -75,7 +132,10 @@ public:
     void addBars(const std::deque<muuk::core::Bar>& oneMinuteBars, double spread);
 
 private:
-    void learnInBackground();
+    // The one thread body for the automatic re-train (after 1,440 new bars)
+    // and the manual trainNow(): loads the bars, guards the minimum,
+    // trains with progress, and adopts only on the strict gates.
+    void startTraining(std::optional<std::filesystem::path> history);
 
     std::filesystem::path file_;
     muuk::core::BrainV2Config config_;
@@ -85,6 +145,8 @@ private:
     int64_t lastSavedBarMs_ = 0;
     int newBars_ = 0;
     std::string lastTry_;
+    BrainTrainingProgress progress_;
+    BrainTrainingResult lastTraining_;
     std::atomic<bool> learning_{false};
     std::thread thread_;
 };

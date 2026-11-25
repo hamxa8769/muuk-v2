@@ -1094,15 +1094,335 @@ TEST_CASE("saveLiveSettings rewrites only the tunable fields and round-trips thr
     REQUIRE(back.lotIncrement == Catch::Approx(0.02));
     REQUIRE(back.profitTarget == Catch::Approx(1.5));
     REQUIRE(back.cooldownSeconds == 45);
-    REQUIRE(back.maxOrders == 12);
+    // Step 4 (D5, Section 4.2): maxOrders is capped by the knob's
+    // maxLevels (Balanced: 6). Step 6b: the stop defaults to OFF, so it
+    // reads back 0 -- the saved maxBasketLoss never migrates here (the
+    // saved file has a risk section, so the no-risk-section migration does
+    // not run) and the field itself reads back 0.
+    REQUIRE(back.maxOrders == 6);
     REQUIRE(back.maxLot == Catch::Approx(1.0));
-    REQUIRE(back.maxBasketLoss == Catch::Approx(200.0));
+    REQUIRE(back.stopLoss == Catch::Approx(0.0));
+    REQUIRE(back.maxBasketLoss == Catch::Approx(0.0));
     REQUIRE_FALSE(back.autoContinue);
     REQUIRE(back.startSide == StartSide::BuyOnly);
     REQUIRE(back.commissionPerLot == Catch::Approx(7.0));
     REQUIRE(back.commissionPerMillion == Catch::Approx(30.0));
     REQUIRE(reloaded.strategy.costs.commissionPerMillionPerSide == Catch::Approx(30.0));
 
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("API keys round-trip through saveLiveSettings and loadLiveConfig, and maskApiKey hides them") {
+    const auto path = std::filesystem::temp_directory_path() / "muuk_test_keys.local.json";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << R"({
+  "connection": {
+    "quote": { "host": "q.example", "port": "5201" },
+    "trade": { "host": "t.example", "port": "5202" },
+    "brokerUid": "broker", "traderLogin": "123", "password": "secret",
+    "symbolName": "XAUUSD", "symbolId": "41"
+  },
+  "strategy": {
+    "symbol": { "name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0, "contractSize": 100.0,
+                "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0 },
+    "range": { "lower": 4292.35, "upper": 4292.55 },
+    "lotProgression": { "initialLot": 0.01, "lotIncrement": 0.01 },
+    "basketProfitTargetMoney": 5.0
+  }
+})";
+    }
+
+    LiveSettings s;
+    s.keys.gemini = "AIzaSyTestGeminiKey1234";
+    s.keys.fred = "fredkey5678";
+    s.keys.finnhub = "finnhubkey90";
+    saveLiveSettings(path, s);
+
+    const LiveConfig reloaded = loadLiveConfig(path);
+    REQUIRE(reloaded.keys.gemini == "AIzaSyTestGeminiKey1234");
+    REQUIRE(reloaded.keys.fred == "fredkey5678");
+    REQUIRE(reloaded.keys.finnhub == "finnhubkey90");
+    REQUIRE(reloaded.connection.password == "secret");  // credentials untouched
+    const LiveSettings back = settingsFromConfig(reloaded);
+    REQUIRE(back.keys.gemini == "AIzaSyTestGeminiKey1234");
+    // Masking: "Not set" when empty, four bullets + the last 4 characters otherwise.
+    REQUIRE(maskApiKey("") == "Not set");
+    REQUIRE(maskApiKey(back.keys.gemini) == "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" "1234");
+    REQUIRE(maskApiKey(back.keys.fred) == "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" "5678");
+    REQUIRE(maskApiKey("ab") == "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" "ab");
+    // A second save keeps the keys (the settings form round-trips them).
+    saveLiveSettings(path, back);
+    REQUIRE(loadLiveConfig(path).keys.finnhub == "finnhubkey90");
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("trainer history path round-trips through saveLiveSettings and loadLiveConfig") {
+    const auto path = std::filesystem::temp_directory_path() / "muuk_test_trainer_history.local.json";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << R"({
+  "connection": {
+    "quote": { "host": "q.example", "port": "5201" },
+    "trade": { "host": "t.example", "port": "5202" },
+    "brokerUid": "broker", "traderLogin": "123", "password": "secret",
+    "symbolName": "XAUUSD", "symbolId": "41"
+  },
+  "strategy": {
+    "symbol": { "name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0, "contractSize": 100.0,
+                "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0 },
+    "range": { "lower": 4292.35, "upper": 4292.55 },
+    "lotProgression": { "initialLot": 0.01, "lotIncrement": 0.01 },
+    "basketProfitTargetMoney": 5.0
+  }
+})";
+    }
+
+    LiveSettings s;
+    s.trainerHistoryPath = "C:\\Users\\test\\Documents\\MuukHistory";
+    saveLiveSettings(path, s);
+
+    const LiveConfig reloaded = loadLiveConfig(path);
+    REQUIRE(reloaded.brain.trainerHistory == "C:\\Users\\test\\Documents\\MuukHistory");
+    const LiveSettings back = settingsFromConfig(reloaded);
+    REQUIRE(back.trainerHistoryPath == "C:\\Users\\test\\Documents\\MuukHistory");
+    // Empty stays empty (the default: the bot's own bars).
+    LiveSettings cleared;
+    saveLiveSettings(path, cleared);
+    REQUIRE(loadLiveConfig(path).brain.trainerHistory.empty());
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Risk appetite presets map to the research doc's numbers") {
+    // Section 4.4 / D11: Cautious {75, 4, 1%}, Balanced {150, 6, 2%},
+    // Aggressive {300, 6, 3%}.
+    const RiskPreset cautious = riskPresetFor(RiskAppetite::Cautious);
+    REQUIRE(cautious.maxLockCost == Catch::Approx(75.0));
+    REQUIRE(cautious.maxLevels == 4);
+    REQUIRE(cautious.dailyLossPercent == Catch::Approx(1.0));
+    const RiskPreset balanced = riskPresetFor(RiskAppetite::Balanced);
+    REQUIRE(balanced.maxLockCost == Catch::Approx(150.0));
+    REQUIRE(balanced.maxLevels == 6);
+    REQUIRE(balanced.dailyLossPercent == Catch::Approx(2.0));
+    const RiskPreset aggressive = riskPresetFor(RiskAppetite::Aggressive);
+    REQUIRE(aggressive.maxLockCost == Catch::Approx(300.0));
+    REQUIRE(aggressive.maxLevels == 6);
+    REQUIRE(aggressive.dailyLossPercent == Catch::Approx(3.0));
+    REQUIRE(std::string(riskAppetiteName(RiskAppetite::Cautious)) == "cautious");
+    REQUIRE(std::string(riskAppetiteName(RiskAppetite::Balanced)) == "balanced");
+    REQUIRE(std::string(riskAppetiteName(RiskAppetite::Aggressive)) == "aggressive");
+    REQUIRE(riskAppetiteFromString("cautious") == RiskAppetite::Cautious);
+    REQUIRE(riskAppetiteFromString("aggressive") == RiskAppetite::Aggressive);
+    REQUIRE(riskAppetiteFromString("balanced") == RiskAppetite::Balanced);
+    REQUIRE(riskAppetiteFromString("nope") == RiskAppetite::Balanced);  // unknown -> Balanced
+}
+
+TEST_CASE("effectiveDailyLossLimitMoney: the knob's share, else the $ amount, else off") {
+    REQUIRE(effectiveDailyLossLimitMoney(2.0, 0.0, 500000.0) == Catch::Approx(10000.0));  // 2% of the balance
+    REQUIRE(effectiveDailyLossLimitMoney(0.0, 500.0, 10000.0) == Catch::Approx(500.0));   // old $ amount kept
+    REQUIRE(effectiveDailyLossLimitMoney(0.0, 0.0, 10000.0) == Catch::Approx(0.0));       // off
+    REQUIRE(effectiveDailyLossLimitMoney(2.0, 500.0, 0.0) == Catch::Approx(500.0));       // balance unknown -> $
+    REQUIRE(effectiveDailyLossLimitMoney(2.0, 0.0, 0.0) == Catch::Approx(0.0));           // neither known -> off
+}
+
+TEST_CASE("brainV2ConfigFor maps the knob and the ER mode onto the brain's config") {
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.risk.appetite = RiskAppetite::Cautious;
+    cfg.brain.erMode = 2;
+    const muuk::core::BrainV2Config cautious = brainV2ConfigFor(cfg);
+    REQUIRE(cautious.erMode == 2);
+    REQUIRE(cautious.caps.maxLockCost == Catch::Approx(75.0));
+    REQUIRE(cautious.caps.maxLevelsHard == 4);
+    cfg.risk.appetite = RiskAppetite::Balanced;
+    cfg.brain.erMode = 0;
+    const muuk::core::BrainV2Config balanced = brainV2ConfigFor(cfg);
+    REQUIRE(balanced.erMode == 0);
+    REQUIRE(balanced.caps.maxLockCost == Catch::Approx(150.0));  // the trainer's defaults exactly
+    REQUIRE(balanced.caps.maxLevelsHard == 6);
+    cfg.risk.appetite = RiskAppetite::Aggressive;
+    const muuk::core::BrainV2Config aggressive = brainV2ConfigFor(cfg);
+    REQUIRE(aggressive.caps.maxLockCost == Catch::Approx(300.0));
+    REQUIRE(aggressive.caps.maxLevelsHard == 6);
+    // Step 5: the panel's basket stop loss is mapped into replay units, so
+    // the trainer validates the brain under the cap it will trade under.
+    cfg.strategy.basketStopLossMoney = 50.0;
+    REQUIRE(brainV2ConfigFor(cfg).stopLoss == Catch::Approx(50.0));  // test symbol: 1.0 per 0.01 tick -> scale 1.0
+    cfg.strategy.basketStopLossMoney = 0.0;
+    REQUIRE(brainV2ConfigFor(cfg).stopLoss == Catch::Approx(0.0));  // off stays off
+    // A ProCent-style symbol (100 USC per 0.01 tick) counts 100 USC of P/L
+    // as $1 replay: the $50 stop becomes 0.5 replay units.
+    cfg.strategy.symbol.tickValue = 100.0;
+    cfg.strategy.basketStopLossMoney = 50.0;
+    REQUIRE(brainV2ConfigFor(cfg).stopLoss == Catch::Approx(0.5));
+}
+
+TEST_CASE("applySettingsToConfig clamps maxLot and maxOrders to the hard caps") {
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    LiveSettings s;
+    s.maxLot = 10.0;     // an old file's no-limit-ish value
+    s.maxOrders = 298;   // the user's old value
+    s.riskAppetite = RiskAppetite::Balanced;
+    applySettingsToConfig(cfg, s);
+    REQUIRE(cfg.strategy.riskLimits.maxLot.toDouble(cfg.strategy.symbol) == Catch::Approx(1.0));
+    REQUIRE(cfg.strategy.riskLimits.maxOrders == 6);
+    s.riskAppetite = RiskAppetite::Cautious;
+    applySettingsToConfig(cfg, s);
+    REQUIRE(cfg.strategy.riskLimits.maxOrders == 4);
+}
+
+TEST_CASE("An old config file loads and migrates to the Step 4 defaults") {
+    // Everything the old file had: the 7 removed options, no stop loss,
+    // no daily limit, a 298 max orders, a 10.0 max lot, a $200 max basket
+    // loss, and no "risk" section at all.
+    const auto path = std::filesystem::temp_directory_path() / "muuk_test_old_settings.local.json";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << R"({
+  "connection": {
+    "quote": { "host": "q.example", "port": "5201" },
+    "trade": { "host": "t.example", "port": "5202" },
+    "brokerUid": "broker", "traderLogin": "123", "password": "secret",
+    "symbolName": "XAUUSD", "symbolId": "41",
+    "dailyLossLimitMoney": 0.0,
+    "entry": {"rangeAtr": 2.0, "rangeMaxWidth": 15.0, "targetHalfRange": true, "trendMin": 1.0, "startWithTrend": true}
+  },
+  "strategy": {
+    "symbol": { "name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0, "contractSize": 100.0,
+                "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0 },
+    "range": { "lower": 4292.35, "upper": 4292.55 },
+    "lotProgression": { "initialLot": 0.01, "lotIncrement": 0.01 },
+    "basketProfitTargetMoney": 5.0,
+    "basketStopLossMoney": 0.0,
+    "autoProfitTarget": {"enabled": true, "percent": 60},
+    "riskLimits": {"maxOrders": 298, "maxLot": 10.0, "maxBasketLossMoney": 200.0}
+  }
+})";
+    }
+    const LiveConfig cfg = loadLiveConfig(path);  // must not throw
+    REQUIRE(cfg.risk.appetite == RiskAppetite::Balanced);
+    REQUIRE(cfg.risk.dailyLossPercent == Catch::Approx(2.0));  // the daily limit turns ON
+    REQUIRE(cfg.strategy.basketStopLossMoney == Catch::Approx(200.0));  // D5: merged from max basket loss
+    REQUIRE(cfg.strategy.riskLimits.maxBasketLossMoney == Catch::Approx(0.0));
+    REQUIRE(cfg.strategy.riskLimits.maxOrders == 6);           // the knob's cap
+    REQUIRE(cfg.strategy.riskLimits.maxLot.toDouble(cfg.strategy.symbol) == Catch::Approx(1.0));  // D9
+    REQUIRE_FALSE(cfg.strategy.autoProfitTarget);               // D4: removed
+    // The removed options are still read (old files load), just never used.
+    REQUIRE(cfg.connection.entry.trendMin == Catch::Approx(1.0));
+    REQUIRE(cfg.connection.entry.startWithTrend);
+    REQUIRE(cfg.connection.entry.targetHalfRange);
+    const LiveSettings back = settingsFromConfig(cfg);
+    REQUIRE(back.stopLoss == Catch::Approx(200.0));
+    REQUIRE(back.maxBasketLoss == Catch::Approx(0.0));
+    REQUIRE_FALSE(back.autoTarget);
+    REQUIRE(back.riskAppetite == RiskAppetite::Balanced);
+    REQUIRE(back.dailyLossPercent == Catch::Approx(2.0));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("An old config file with no stop and no max basket loss stays off (Step 6b)") {
+    // Step 6b removed the $50 stop default: an old file that never set a
+    // stop (and never set a max basket loss either) must load with the stop
+    // OFF, not with $50 forced onto it.
+    const auto path = std::filesystem::temp_directory_path() / "muuk_test_old_no_stop.local.json";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << R"({
+  "connection": {
+    "quote": { "host": "q.example", "port": "5201" },
+    "trade": { "host": "t.example", "port": "5202" },
+    "brokerUid": "broker", "traderLogin": "123", "password": "secret",
+    "symbolName": "XAUUSD"
+  },
+  "strategy": {
+    "symbol": { "name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0, "contractSize": 100.0,
+                "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0 },
+    "range": { "lower": 4292.35, "upper": 4292.55 },
+    "lotProgression": { "initialLot": 0.01, "lotIncrement": 0.01 },
+    "basketProfitTargetMoney": 5.0
+  }
+})";
+    }
+    const LiveConfig cfg = loadLiveConfig(path);
+    REQUIRE(cfg.strategy.basketStopLossMoney == Catch::Approx(0.0));
+    const LiveSettings back = settingsFromConfig(cfg);
+    REQUIRE(back.stopLoss == Catch::Approx(0.0));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("An old config file with a $ daily loss limit keeps it as the fallback") {
+    const auto path = std::filesystem::temp_directory_path() / "muuk_test_old_daily.local.json";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << R"({
+  "connection": {
+    "quote": { "host": "q.example", "port": "5201" },
+    "trade": { "host": "t.example", "port": "5202" },
+    "brokerUid": "broker", "traderLogin": "123", "password": "secret",
+    "symbolName": "XAUUSD", "dailyLossLimitMoney": 500.0
+  },
+  "strategy": {
+    "symbol": { "name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0, "contractSize": 100.0,
+                "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0 },
+    "range": { "lower": 4292.35, "upper": 4292.55 },
+    "lotProgression": { "initialLot": 0.01, "lotIncrement": 0.01 },
+    "basketProfitTargetMoney": 5.0, "basketStopLossMoney": 50.0
+  }
+})";
+    }
+    const LiveConfig cfg = loadLiveConfig(path);
+    REQUIRE(cfg.risk.dailyLossPercent == Catch::Approx(0.0));  // the $ amount stays the rule
+    REQUIRE(cfg.connection.dailyLossLimitMoney == Catch::Approx(500.0));
+    REQUIRE(effectiveDailyLossLimitMoney(cfg.risk.dailyLossPercent, cfg.connection.dailyLossLimitMoney, 10000.0) ==
+            Catch::Approx(500.0));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("The Step 4 risk settings round-trip through saveLiveSettings and loadLiveConfig") {
+    const auto path = std::filesystem::temp_directory_path() / "muuk_test_risk.local.json";
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << R"({
+  "connection": {
+    "quote": { "host": "q.example", "port": "5201" },
+    "trade": { "host": "t.example", "port": "5202" },
+    "brokerUid": "broker", "traderLogin": "123", "password": "secret",
+    "symbolName": "XAUUSD"
+  },
+  "strategy": {
+    "symbol": { "name": "XAUUSD", "digits": 2, "tickSize": 0.01, "tickValue": 1.0, "contractSize": 100.0,
+                "volumeStep": 0.01, "volumeMin": 0.01, "volumeMax": 100.0 },
+    "range": { "lower": 4292.35, "upper": 4292.55 },
+    "lotProgression": { "initialLot": 0.01, "lotIncrement": 0.01 },
+    "basketProfitTargetMoney": 5.0
+  }
+})";
+    }
+    LiveSettings s;
+    s.riskAppetite = RiskAppetite::Aggressive;
+    s.dailyLossPercent = 3.0;
+    s.erMode = 2;
+    s.maxLot = 1.0;
+    s.maxOrders = 6;
+    s.stopLoss = 50.0;
+    saveLiveSettings(path, s);
+    const LiveConfig reloaded = loadLiveConfig(path);
+    REQUIRE(reloaded.risk.appetite == RiskAppetite::Aggressive);
+    REQUIRE(reloaded.risk.dailyLossPercent == Catch::Approx(3.0));
+    REQUIRE(reloaded.brain.erMode == 2);
+    REQUIRE(reloaded.strategy.riskLimits.maxLot.toDouble(reloaded.strategy.symbol) == Catch::Approx(1.0));
+    REQUIRE(reloaded.strategy.riskLimits.maxOrders == 6);
+    REQUIRE(reloaded.strategy.basketStopLossMoney == Catch::Approx(50.0));
+    const LiveSettings back = settingsFromConfig(reloaded);
+    REQUIRE(back.riskAppetite == RiskAppetite::Aggressive);
+    REQUIRE(back.dailyLossPercent == Catch::Approx(3.0));
+    REQUIRE(back.erMode == 2);
+    REQUIRE(back.maxLot == Catch::Approx(1.0));
+    REQUIRE(back.maxOrders == 6);
+    REQUIRE(back.stopLoss == Catch::Approx(50.0));
     std::filesystem::remove(path);
 }
 
@@ -1545,16 +1865,19 @@ namespace {
 // 1.5x lots, 4 levels, exit 0.5 — unless `tradable` is false, in which
 // case every cell is no-trade. Written under a fresh temp directory;
 // the caller removes it after the runner is gone.
-std::filesystem::path writeTestBrainV2(bool tradable) {
+std::filesystem::path writeTestBrainV2(bool tradable, int shiftFills = 0, double shiftStep = 0.0, int firstSide = 0) {
     muuk::core::BrainV2 brain;
     brain.trained = true;
     brain.volLow = 0.5;
     brain.volHigh = 1.5;
     brain.gapAtrChoices = {2.0, 3.0, 4.0, 6.0, 8.0};
     brain.trainedBars = 1500;
+    brain.shiftAfterFills = shiftFills;  // Step 2: 0 = an old file, no shift recorded
+    brain.stepAtr = shiftStep;
     brain.cells.assign(81, muuk::core::BrainV2Cell{});
     for (auto& c : brain.cells) {
         c.samples = 100;
+        c.firstSide = firstSide;  // Step 3: every cell learns the same first side in this test
         if (tradable) {
             c.best.gapChoice = 2;
             c.best.lotMultiplier = 1.5;
@@ -1579,6 +1902,22 @@ std::vector<muuk::core::Bar> flatBars() {
     const int64_t base = 1767607200000LL;  // 2026-01-05 10:00 UTC
     for (int i = 0; i < 240; ++i) {
         bars.push_back(Bar{base + i * 60'000LL, 4336.50, 4337.00, 4336.00, 4336.50, 20.0});
+    }
+    return bars;
+}
+
+// 240 whipsaw one-minute bars (closes alternate $2, ATR ~2.5, no trend):
+// the Kaufman ER over 100 minutes is ~0, so a brain that records erMode 2
+// must block the cycle while a brain that records erMode 0 trades it.
+// Same Monday 2026-01-05 10:00 UTC base as flatBars().
+std::vector<muuk::core::Bar> whipsawBars() {
+    std::vector<muuk::core::Bar> bars;
+    const int64_t base = 1767607200000LL;  // 2026-01-05 10:00 UTC
+    double prev = 4336.50;
+    for (int i = 0; i < 240; ++i) {
+        const double c = (i % 2 == 0) ? 4335.50 : 4337.50;
+        bars.push_back(Bar{base + i * 60'000LL, prev, std::max(prev, c) + 0.25, std::min(prev, c) - 0.25, c, 20.0});
+        prev = c;
     }
     return bars;
 }
@@ -1687,6 +2026,106 @@ TEST_CASE("LiveRunner with Brain v2 opens the first range at the brain's gap and
     std::filesystem::remove_all(brainFile.parent_path(), ec);
 }
 
+// Drives one brain cycle to its third order: quote, both boundary orders,
+// both fills, then the re-armed buy. The config shift is off unless the
+// caller sets it; the expected third-order price proves which shift ran.
+void driveBrainShiftCycle(MockFixServer& server, const std::filesystem::path& brainFile, int configShiftFills,
+                          double configShiftStep, double expectedThirdBuy, bool expectShiftText,
+                          const std::string& expectedShiftLog) {
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;  // wait for a live quote to center on
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    cfg.strategy.shiftAfterFills = configShiftFills;
+    cfg.strategy.shiftStepPoints = configShiftStep;
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::mutex logMutex;
+    std::vector<std::string> logLines;
+    runner.setLogHandler([&](const std::string& line) {
+        std::scoped_lock lock(logMutex);
+        logLines.push_back(line);
+    });
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    // Mid 4336.51; the brain's gap is 4.00 (4x ATR 1.00).
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 1);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    const std::string order1ClOrdId = order1.getString(tag::ClOrdID);
+    const FixMessage order2 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn);
+    REQUIRE(order2.getInt(tag::Side) == 2);
+    REQUIRE(order2.getDouble(tag::StopPx) == Catch::Approx(4334.51));
+    const std::string order2ClOrdId = order2.getString(tag::ClOrdID);
+
+    server.sendToClient(kTradeConn, fillMessage(order1ClOrdId, "9001", "4338.51", "0.01", 3));
+    for (int i = 0; i < 50; ++i) {
+        if (runner.snapshot().activeOrderCount == 1) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(runner.snapshot().activeOrderCount == 1);
+
+    // The second fill is the one that triggers the shift.
+    server.sendToClient(kTradeConn, fillMessage(order2ClOrdId, "9002", "4334.51", "0.02", 4));
+    const FixMessage order3 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order3.getInt(tag::Side) == 1);
+    REQUIRE(order3.getDouble(tag::StopPx) == Catch::Approx(expectedThirdBuy));
+
+    const std::string detail = runner.snapshot().brainDetail;
+    if (expectShiftText) {
+        REQUIRE(detail.find("shift ") != std::string::npos);
+    } else {
+        REQUIRE(detail.find("shift ") == std::string::npos);
+    }
+    {
+        std::scoped_lock lock(logMutex);
+        const bool sawShiftLog =
+            std::any_of(logLines.begin(), logLines.end(), [&](const std::string& l) {
+                return l.find(expectedShiftLog) != std::string::npos;
+            });
+        REQUIRE(sawShiftLog);
+    }
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+TEST_CASE("LiveRunner with Brain v2 uses the brain file's shift for the cycle") {
+    // Brain shift 2 fills x 2.0 ATR; the flat bars' ATR is 1.00, so the
+    // step is $2.00: after the 2nd fill the 4.00 gap widens to 6.00 around
+    // the same center 4336.51, and the re-armed buy sits at 4339.51.
+    // The config shift is off (testConfig) -- any widening is the brain's.
+    const std::filesystem::path brainFile = writeTestBrainV2(true, 2, 2.0);
+    MockFixServer server;
+    driveBrainShiftCycle(server, brainFile, 0, 1.0, 4339.51, true, "[brain v2] shift from brain: 2 fills x 2.0 ATR");
+}
+
+TEST_CASE("LiveRunner with Brain v2 falls back to the config shift when the brain file has none") {
+    // An old brain file (no shift fields) with the config shift on: 2 fills
+    // x $1.50 widens the 4.00 gap to 5.50, so the re-armed buy sits at
+    // 4336.51 + 2.75 = 4339.26 -- and the Brain line shows no shift.
+    // ($1.50, not $0.50: the engine floors every widening at $1.00.)
+    const std::filesystem::path brainFile = writeTestBrainV2(true);
+    MockFixServer server;
+    driveBrainShiftCycle(server, brainFile, 2, 1.5, 4339.26, false, "[brain v2] cycle:");
+}
+
 TEST_CASE("LiveRunner with Brain v2 opens no range when the brain says no-trade") {
     const std::filesystem::path brainFile = writeTestBrainV2(false);
     MockFixServer server;
@@ -1734,6 +2173,402 @@ TEST_CASE("LiveRunner with Brain v2 opens no range when the brain says no-trade"
     if (runnerException) std::rethrow_exception(runnerException);
     std::error_code ec;
     std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+// --- Brain file search, retry and reload (the "no trained brain" fix) ---
+
+// Writes a trained v2 brain file at `file`: every cell tradable at gap
+// choice 2 (4x ATR), 1.5x lots, 4 levels, exit 0.5 when `tradable`,
+// no-trade otherwise; `trainedBars` is stamped on the header so a
+// re-read can be told apart from the file it replaces.
+void writeBrainAt(const std::filesystem::path& file, bool tradable, int64_t trainedBars, int erMode = -1,
+                  double stopLoss = 0.0) {
+    muuk::core::BrainV2 brain;
+    brain.trained = true;
+    brain.volLow = 0.5;
+    brain.volHigh = 1.5;
+    brain.gapAtrChoices = {2.0, 3.0, 4.0, 6.0, 8.0};
+    brain.trainedBars = trainedBars;
+    brain.erMode = erMode;
+    brain.stopLoss = stopLoss;
+    brain.cells.assign(81, muuk::core::BrainV2Cell{});
+    for (auto& c : brain.cells) {
+        c.samples = 100;
+        if (tradable) {
+            c.best.gapChoice = 2;
+            c.best.lotMultiplier = 1.5;
+            c.best.maxLevels = 4;
+            c.best.exitFactor = 0.5;
+            c.meanPnl = 5.0;
+            c.score = 5.0;
+        }
+    }
+    std::filesystem::create_directories(file.parent_path());
+    std::ofstream out(file, std::ios::trunc);
+    out << muuk::core::serializeBrainV2(brain);
+}
+
+// A runner over a temp config folder: the relative brain file, the state
+// file under muuk_state/, flat bars, and the runner thread already
+// running. The caller drives the mock server (connectRunner +
+// sendTestQuote) and stops the thread with finish(); the destructor
+// stops it too, so a failed REQUIRE never leaves the thread running.
+struct BrainPathRunner {
+    MockFixServer& server;
+    LiveRunner runner;
+    std::thread thread_;
+    std::exception_ptr error_;
+
+    BrainPathRunner(MockFixServer& s, LiveConfig cfg, const std::filesystem::path& configFile,
+                    const std::filesystem::path& stateFile, LiveRunner::LogHandler logHandler = nullptr,
+                    std::vector<muuk::core::Bar> bars = {})
+        : server(s), runner(std::move(cfg)) {
+        runner.setConfigFile(configFile);
+        runner.setStateFile(stateFile);
+        runner.addHistoryBars(bars.empty() ? flatBars() : bars);
+        if (logHandler) runner.setLogHandler(std::move(logHandler));
+        thread_ = std::thread([this] {
+            try {
+                runner.run();
+            } catch (...) {
+                error_ = std::current_exception();
+            }
+        });
+    }
+    ~BrainPathRunner() { finish(); }
+    BrainPathRunner(const BrainPathRunner&) = delete;
+    BrainPathRunner& operator=(const BrainPathRunner&) = delete;
+    void finish() {
+        runner.stop();
+        if (thread_.joinable()) thread_.join();
+    }
+    void rethrow() {
+        if (error_) std::rethrow_exception(error_);
+    }
+};
+
+TEST_CASE("brainFileCandidates searches next to the config file first, then the state file, then the working directory") {
+    const auto paths = brainFileCandidates("/tmp/muuk-test-acct/my_account.local.json",
+                                           "/tmp/muuk-test-acct/muuk_state/my_account.state.json", "brain_v2.txt");
+    REQUIRE(paths.size() == 3);
+    REQUIRE(paths[0] == std::filesystem::path("/tmp/muuk-test-acct/brain_v2.txt"));
+    REQUIRE(paths[1] == std::filesystem::path("/tmp/muuk-test-acct/muuk_state/brain_v2.txt"));
+    REQUIRE(paths[2] == std::filesystem::path("brain_v2.txt"));
+    // An absolute brainFile is used as-is, alone.
+    const auto absolute = brainFileCandidates("/tmp/muuk-test-acct/my_account.local.json",
+                                              "/tmp/muuk-test-acct/muuk_state/my_account.state.json",
+                                              "/elsewhere/custom.txt");
+    REQUIRE(absolute.size() == 1);
+    REQUIRE(absolute[0] == std::filesystem::path("/elsewhere/custom.txt"));
+    REQUIRE(brainFileCandidates("/tmp/x/c.json", "/tmp/x/muuk_state/c.state.json", "").empty());
+    // Config in the working directory: the config-dir and working-directory
+    // candidates are the same file, so it appears once.
+    const auto deduped =
+        brainFileCandidates("my_account.local.json", "muuk_state/my_account.state.json", "brain_v2.txt");
+    REQUIRE(deduped.size() == 2);
+    REQUIRE(deduped[0] == std::filesystem::current_path() / "brain_v2.txt");
+    REQUIRE(deduped[1] == std::filesystem::path("muuk_state/brain_v2.txt"));
+}
+
+TEST_CASE("LiveRunner finds the trained brain next to the config file") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-path-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    writeBrainAt(dir / "brain_v2.txt", true, 1500);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json");
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    // The brain's gap is 4.00 (4x ATR 1.00): the range is [4334.51, 4338.51].
+    const FixMessage order1 = bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(bot.runner.snapshot().brainStatus.find("passed its test") != std::string::npos);
+    REQUIRE(bot.runner.snapshot().brainStatus.find("1500 bars") != std::string::npos);
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner uses the brain file's recorded erMode even when the panel says off") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-ermode-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    // The brain trained under erMode 2 (chop-block + clean-trend override);
+    // the panel still says off (erMode 0): the brain's mode must win, like
+    // its trained shift. The brain sits next to the config file only --
+    // no muuk_state copy -- so this also re-proves the config-dir-first load.
+    writeBrainAt(dir / "brain_v2.txt", true, 1500, 2, 50.0);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.erMode = 0;
+    cfg.brain.brainFile = "brain_v2.txt";
+    std::mutex logMutex;
+    std::vector<std::string> logLines;
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json",
+                        [&](const std::string& line) {
+                            std::scoped_lock lock(logMutex);
+                            logLines.push_back(line);
+                        },
+                        whipsawBars());
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    // Choppy bars (ER ~ 0): the recorded erMode 2 blocks the cycle, so no
+    // boundary order ever goes out (waitForMessage throws on timeout).
+    REQUIRE_THROWS(bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 2s));
+    REQUIRE(bot.runner.snapshot().status == EngineStatus::Idle);
+    {
+        std::scoped_lock lock(logMutex);
+        const bool sawChop = std::any_of(logLines.begin(), logLines.end(), [](const std::string& l) {
+            return l.find("choppy market") != std::string::npos;
+        });
+        REQUIRE(sawChop);
+    }
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner with a brain that records erMode 0 trades the same choppy bars") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-ermode0-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    // The same whipsaw bars, but the brain records erMode 0: no chop-block,
+    // so the range opens (gap 4 x ATR ~2.5 = 10.00 around the live mid
+    // 4336.51, so one stop is 4341.51 and the other 4331.51).
+    writeBrainAt(dir / "brain_v2.txt", true, 1500, 0, 50.0);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.erMode = 0;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json", nullptr, whipsawBars());
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    const FixMessage order1 = bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    const double px = order1.getDouble(tag::StopPx);
+    REQUIRE((px == Catch::Approx(4341.51) || px == Catch::Approx(4331.51)));
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner shows the brain file's recorded erMode on the Brain line") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-ermode-line-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    writeBrainAt(dir / "brain_v2.txt", true, 1500, 2, 50.0);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.erMode = 0;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json");
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    const FixMessage order1 = bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    bool sawErMode = false;
+    for (int i = 0; i < 40 && !sawErMode; ++i) {
+        sawErMode = bot.runner.snapshot().brainDetail.find("erMode 2") != std::string::npos;
+        if (!sawErMode) std::this_thread::sleep_for(50ms);
+    }
+    REQUIRE(sawErMode);
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner still finds the trained brain next to the state file") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-state-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    writeBrainAt(dir / "muuk_state" / "brain_v2.txt", true, 1500);  // only here, not next to the config
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json");
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    const FixMessage order1 = bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(bot.runner.snapshot().brainStatus.find("passed its test") != std::string::npos);
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner reports every searched path when no trained brain exists") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-nofile-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = "brain_v2.txt";
+    std::mutex logMutex;
+    std::vector<std::string> logLines;
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json", [&](const std::string& line) {
+                            std::scoped_lock lock(logMutex);
+                            logLines.push_back(line);
+                        });
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    bool sawSearch = false;
+    for (int i = 0; i < 40 && !sawSearch; ++i) {
+        std::this_thread::sleep_for(50ms);
+        std::scoped_lock lock(logMutex);
+        sawSearch = std::any_of(logLines.begin(), logLines.end(), [&](const std::string& l) {
+            return l.find("no trained brain -- looked in") != std::string::npos &&
+                   l.find("muuk_state") != std::string::npos;
+        });
+    }
+    REQUIRE(sawSearch);
+    REQUIRE(bot.runner.snapshot().brainStatus == "no trained brain");
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("refreshBrainFile picks up a brain file dropped in after start") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-refresh-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json");
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+    REQUIRE(bot.runner.snapshot().brainStatus == "no trained brain");
+
+    // The brain file arrives after start: the manual refresh picks it up.
+    // (The auto-refresh may win the race and load it on its own tick
+    // first -- then the manual refresh reports "already loaded" instead
+    // of "reloaded". Either way the brain is loaded without a restart,
+    // and the manual re-read happened.)
+    writeBrainAt(dir / "brain_v2.txt", true, 1500);
+    bot.runner.refreshBrainFile();
+    REQUIRE(bot.runner.snapshot().brainStatus.find("passed its test") != std::string::npos);
+    REQUIRE(bot.runner.snapshot().brainRefreshNote.find("1500 bars") != std::string::npos);
+    // A second refresh with the same file does not rebuild the keeper.
+    bot.runner.refreshBrainFile();
+    REQUIRE(bot.runner.snapshot().brainRefreshNote.find("already loaded") != std::string::npos);
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner trainBrainNow: a run on too few bars reports it and keeps 'no trained brain'") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-train-now-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json");
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    // A tiny history file: 100 flat bars -- far below the 2000-bar guard.
+    {
+        std::ofstream out(dir / "tiny.csv");
+        out << "# point=0.01,gmtOffset=0\n";
+        for (int i = 0; i < 100; ++i) {
+            out << (1700000000 + i * 60) << ",4336.50,4336.52,4336.48,4336.50,20,0\n";
+        }
+    }
+    bot.runner.trainBrainNow(dir / "tiny.csv");
+    // The run finishes on its own thread: poll the snapshot until it shows
+    // the outcome and the progress line has cleared.
+    LiveSnapshot snap;
+    bool sawResult = false;
+    for (int i = 0; i < 200 && !sawResult; ++i) {
+        std::this_thread::sleep_for(50ms);
+        snap = bot.runner.snapshot();
+        sawResult = snap.brainTrainingResult.find("too few bars") != std::string::npos && snap.brainTraining.empty();
+    }
+    REQUIRE(sawResult);
+    REQUIRE(snap.brainStatus == "no trained brain");
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("LiveRunner reloads the brain when its file changes, without a restart") {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "muuk-brain-reload-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    writeBrainAt(dir / "brain_v2.txt", false, 1500);  // no-trade brain first
+
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = "brain_v2.txt";
+    BrainPathRunner bot(server, std::move(cfg), dir / "my_account.local.json",
+                        dir / "muuk_state" / "my_account.state.json");
+    connectRunner(bot.server);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+
+    // The no-trade brain vetoes the first cycle: no boundary order goes out.
+    REQUIRE_THROWS(bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 2s));
+    REQUIRE(bot.runner.snapshot().brainStatus.find("1500 bars") != std::string::npos);
+
+    // The brain file is replaced by a tradable one: the next quote reloads it.
+    writeBrainAt(dir / "brain_v2.txt", true, 2500);
+    sendTestQuote(bot.server, "4336.50", "4336.52");
+    const FixMessage order1 = bot.server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(bot.runner.snapshot().brainStatus.find("2500 bars") != std::string::npos);
+
+    bot.finish();
+    bot.rethrow();
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST_CASE("loadLiveConfig reads the brain section, with safe defaults when it is missing") {
@@ -1893,4 +2728,121 @@ TEST_CASE("LiveRunner on MT5 ignores a stale stored symbol id and resolves by na
     const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn);
     REQUIRE(order1.getString(tag::Symbol) == "1");
     if (runnerException) std::rethrow_exception(runnerException);
+}
+
+TEST_CASE("LiveRunner with Brain v2 arms only the brain's first side (Sell first)") {
+    // The brain says Sell first, so only the Sell Stop arms -- no Buy Stop
+    // follows, and the Brain line says so. The config default would arm
+    // the Buy Stop first, so this proves the brain overrides it.
+    const std::filesystem::path brainFile = writeTestBrainV2(true, 0, 0.0, -1);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;  // wait for a live quote to center on
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+
+    // Mid 4336.51; the brain's gap is 4.00, so the range is [4334.51, 4338.51].
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 2);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4334.51));
+    REQUIRE_THROWS_AS(server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 800ms), std::runtime_error);
+    REQUIRE(runner.snapshot().brainDetail.find("first Sell") != std::string::npos);
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+TEST_CASE("LiveRunner with Brain v2 arms only the brain's first side (Buy first)") {
+    const std::filesystem::path brainFile = writeTestBrainV2(true, 0, 0.0, 1);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 1);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE_THROWS_AS(server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 800ms), std::runtime_error);
+    REQUIRE(runner.snapshot().brainDetail.find("first Buy") != std::string::npos);
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+TEST_CASE("LiveRunner with Brain v2 is not blocked by the trend filter") {
+    // A trained brain decides its own cycles: with trendMin set and flat
+    // bars (no trend at all), the standalone trend filter would hold a
+    // config cycle -- but the brain cycle still opens. Without a brain the
+    // filter still holds (see the Smart entry test in test_live_resume.cpp).
+    const std::filesystem::path brainFile = writeTestBrainV2(true);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.connection.entry.trendMin = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 1);
+    REQUIRE(order1.getDouble(tag::StopPx) == Catch::Approx(4338.51));
+    REQUIRE(runner.snapshot().entryWait.empty());
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
 }

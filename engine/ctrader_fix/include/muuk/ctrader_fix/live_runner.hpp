@@ -30,6 +30,15 @@
 
 namespace muuk::ctrader_fix {
 
+// The BrainV2Config a LiveConfig drives with (Step 4): the ER gate mode
+// from the Brain settings, and the risk caps from the appetite knob
+// (maxLockCost / maxLevelsHard). Balanced is exactly the trainer's
+// defaults, so the shipped brain behaves as it was trained. The brain's
+// own maxSingleLot stays at its default (16x): the 1.00-lot hard cap is
+// enforced by the engine's riskLimits.maxLot instead, so the live brain
+// and the trainer never disagree about a policy.
+[[nodiscard]] muuk::core::BrainV2Config brainV2ConfigFor(const LiveConfig& config);
+
 // One currently open (filled) position, for a UI to list individually --
 // see LiveRunner's OpenLeg comment for why this can't just be a net figure.
 // Money breakdown for one position or a whole set of them, using the same
@@ -259,6 +268,9 @@ struct LiveSnapshot {
     int marketScore = 0;                  // -4..+4
     std::string brainStatus;              // Brain v2: keeper status line, "off" when disabled
     std::string brainDetail;              // Brain v2: the running cycle's cell + policy, "" when no brain cycle runs
+    std::string brainRefreshNote;         // Brain v2: outcome of the last brain refresh (manual or auto), "" = none yet
+    std::string brainTraining;            // Brain v2: live progress of a training run ("Training... walk-forward 4/11, N bars"), "" when idle
+    std::string brainTrainingResult;      // Brain v2: outcome of the last finished training run (gates verdict + numbers), "" = none yet
     int brainCyclesToday = 0;             // brain-driven baskets closed today (wins/locks below)
     int brainWinsToday = 0;               // of those, closed with net > 0
     int brainLocksToday = 0;              // of those, locked
@@ -336,6 +348,29 @@ public:
     // positions are listed, and nothing new opens until they're closed.
     // Needs connection.syncPositionsOnConnect (the default).
     void setStateFile(std::filesystem::path file) { stateFile_ = std::move(file); }
+
+    // The account config file itself (the runner gets it from
+    // LiveController::startRunner): a relative brain file is searched
+    // next to it first (see brainFileCandidates).
+    void setConfigFile(std::filesystem::path file) { configFile_ = std::move(file); }
+
+    // Re-reads the brain file now (the manual refresh, next to the Brain
+    // line): a new or replaced brain_v2.txt is picked up without
+    // restarting, and the outcome lands in the snapshot's brainRefreshNote.
+    // Thread-safe (takes engineMutex_); never throws, and never touches a
+    // running basket -- the next cycle decides on it.
+    void refreshBrainFile();
+
+    // Trains a new brain now, in the background (the Train button next to
+    // the Brain line): on the bars in `history` (a CSV file or a folder of
+    // them) or -- when empty -- on the bars the bot collected
+    // (bars_live.csv next to the brain file). The live runner keeps trading
+    // its current brain while the run goes; a new brain is adopted only
+    // when the strict gates pass, for the next cycle (never mid-basket).
+    // Progress lands in the snapshot's brainTraining, the outcome in
+    // brainTrainingResult. Thread-safe (takes engineMutex_); never throws;
+    // no-op while a run is already going or the brain is off.
+    void trainBrainNow(std::optional<std::filesystem::path> history = std::nullopt);
 
     // Where the brain's cycle journal goes (brain_journal.jsonl next to the
     // account config, via brainJournalFileFor). Empty = journaling off.
@@ -580,18 +615,38 @@ private:
     // the brain again.
     bool prepareNextCycle(bool recenter);
     // Brain v2 (see docs/brain-v2.md). maybeInitBrainLocked: loads the
-    // trained brain file once (resolved next to the state file); a missing
-    // or untrained brain leaves brain_ null and the runner uses the
-    // configured strategy. decideBrainCycleLocked: the brain's say on the
-    // cycle about to open -- true = open it (brainCycleActive_ set when
-    // the brain chose the policy), false = the brain vetoed it.
+    // trained brain file -- searched in order next to the config file,
+    // next to the state file, then the working directory (see
+    // brainFileCandidates) -- and retries on every cycle decision while
+    // none is loaded, so a brain file dropped in later is picked up
+    // without a restart. A loaded brain is re-read when its own file
+    // changes. Step 5: when no trained brain exists yet, the keeper is
+    // still built at the first candidate path (untrained) -- so the bars
+    // the bot sees accumulate into bars_live.csv from the first connect,
+    // and the Train button always has a keeper to train with. The snapshot
+    // still reports "no trained brain" until one passes its test.
+    // decideBrainCycleLocked: the brain's say on the cycle about to open
+    // -- true = open it (brainCycleActive_ set when the brain chose the
+    // policy), false = the brain vetoed it.
     void maybeInitBrainLocked();
     [[nodiscard]] bool decideBrainCycleLocked();
     // True while the MT5 account is known and its equity is $0 or less:
     // connected, but no order that would open new exposure may be sent.
     // (cTrader never sends account figures, so known stays false there.)
     [[nodiscard]] bool noFundsHoldLocked() const;
-    [[nodiscard]] std::filesystem::path resolveBrainFileLocked() const;
+    // The candidate brain files, in search order (see brainFileCandidates).
+    [[nodiscard]] std::vector<std::filesystem::path> brainCandidatePathsLocked() const;
+    // The first candidate that exists AND parses as trained, with its
+    // path; `tried` lists every candidate with what was wrong, for the
+    // log and the refresh note. Never throws.
+    [[nodiscard]] std::optional<std::pair<muuk::core::BrainV2, std::filesystem::path>> findTrainedBrainLocked(
+        std::string& tried) const;
+    // The combined signature of every candidate: any file appearing,
+    // vanishing or changing makes the next cycle decision retry the load.
+    [[nodiscard]] std::string brainCandidatesSignatureLocked() const;
+    // Swaps in a freshly found trained brain file (builds its keeper,
+    // records where it came from). Caller must hold engineMutex_.
+    void adoptBrainLocked(const std::filesystem::path& file);
     [[nodiscard]] double medianSpreadLocked() const;
     // Replay dollars per one unit of account money (see live_runner.cpp).
     [[nodiscard]] double brainMoneyScaleLocked() const;
@@ -693,11 +748,11 @@ private:
     void flagAnotherTraderLocked(const std::string& why);
 
     // Smart entry (connection.entry). The width a new range gets now (ATR x
-    // rangeAtr, clamped), whether the trend filter holds new ranges back
-    // (logs once per change, sets entryWait_), and config_.strategy with this
-    // range's own first side and target move -- what the engine runs on.
+    // rangeAtr, clamped) and config_.strategy with this range's own first
+    // side and target move -- what the engine runs on. (Step 4, D2: the
+    // standalone trend filter is gone -- the brain's gates decide whether
+    // a cycle opens, so there is no filter left to block one.)
     [[nodiscard]] double rangeWidthNowLocked();
-    bool entryFilterBlocksLocked();
     [[nodiscard]] muuk::core::StrategyConfig engineConfigLocked() const;
     void pickRangeShapeLocked();
     std::string entryWait_;
@@ -822,6 +877,10 @@ private:
     // The loss that locks the basket: lockAtLossMoney, or lockAtLossPercent
     // of the balance, whichever is smaller; 0 = no lock by loss.
     [[nodiscard]] double lockAtLossMoneyLocked() const;
+    // The day's loss limit in account money (Step 4, D8): the knob's share
+    // of the balance (the broker's when known, else the typed-in one), else
+    // the $ amount; 0 = off.
+    [[nodiscard]] double effectiveDailyLossLimitMoneyLocked() const;
     // Lock & pause: if the running basket's net has reached -lockAtLossMoney,
     // cancel its pending orders and freeze the loss with one opposite market
     // order for the net lots. Called on every quote.
@@ -964,8 +1023,11 @@ private:
     // Brain v2 — declared last so the keeper (whose background thread logs
     // through logHandler_) is destroyed before the log handler is.
     std::unique_ptr<BrainKeeperV2> brain_;
-    bool brainInitTried_ = false;     // the brain file was looked for once
-    bool brainFallbackLogged_ = false;  // "no trained brain, using the configured strategy"
+    std::filesystem::path configFile_;  // the account config (setConfigFile): the brain is searched next to it first
+    std::filesystem::path brainLoadedFile_;  // the file the loaded brain came from ("" = none loaded)
+    std::string brainLoadedSignature_;   // (size, mtime) of brainLoadedFile_ when it was loaded
+    std::string brainLastTriedSignature_;  // combined candidate signature at the last load attempt
+    std::string brainRefreshNote_;       // last manual/auto refresh outcome, shown in the snapshot
     bool brainRealRefusedLogged_ = false;  // the real-account refusal, logged once
     bool brainWaitLogged_ = false;    // the current veto, logged once
     bool brainCycleActive_ = false;   // the running cycle uses the brain's policy

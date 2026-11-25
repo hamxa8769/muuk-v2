@@ -71,6 +71,18 @@ struct ReplayResult {
     double totalPnl = 0.0;
     double worstCycle = 0.0;
     double maxDrawdown = 0.0;
+    // Shadow audit (brain path only): cycles the brain wanted -- the cell
+    // was tradable -- but a context gate blocked, replayed anyway for the
+    // record. Never counted in the totals above: this is the evidence for
+    // whether a gate blocks winners or losers.
+    int shadowTrendBlocked = 0;
+    double shadowTrendPnl = 0.0;
+    int shadowTrendWins = 0;
+    int shadowTrendLocks = 0;
+    int shadowBreakerBlocked = 0;
+    double shadowBreakerPnl = 0.0;
+    int shadowBreakerWins = 0;
+    int shadowBreakerLocks = 0;
 };
 
 // Walking forward over the periods. maxDrawdown: the deepest fall of the

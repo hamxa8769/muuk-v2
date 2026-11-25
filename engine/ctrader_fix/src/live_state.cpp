@@ -1,5 +1,6 @@
 #include "muuk/ctrader_fix/live_state.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -320,6 +321,28 @@ std::filesystem::path historyFileFor(const std::filesystem::path& configPath) {
 std::filesystem::path brainJournalFileFor(const std::filesystem::path& configPath) {
     const std::filesystem::path dir = dataDirectoryFor(configPath) / "muuk_history";
     return dir / (configStem(configPath) + ".brain_journal.jsonl");
+}
+
+std::vector<std::filesystem::path> brainFileCandidates(const std::filesystem::path& configPath,
+                                                       const std::filesystem::path& stateFile,
+                                                       const std::string& brainFile) {
+    const std::filesystem::path configured(brainFile);
+    if (configured.empty()) return {};
+    if (configured.is_absolute()) return {configured};
+    std::vector<std::filesystem::path> out;
+    std::vector<std::string> seen;  // absolute forms, so one file reached twice appears once
+    const auto add = [&](std::filesystem::path p) {
+        std::error_code ec;
+        const std::string abs = std::filesystem::absolute(p, ec).string();
+        if (ec) return;
+        if (std::find(seen.begin(), seen.end(), abs) != seen.end()) return;
+        seen.push_back(abs);
+        out.push_back(std::move(p));
+    };
+    if (!configPath.empty()) add(dataDirectoryFor(configPath) / configured);
+    if (!stateFile.empty() && stateFile.has_parent_path()) add(stateFile.parent_path() / configured);
+    add(configured);
+    return out;
 }
 
 std::filesystem::path defaultStateFile(const std::filesystem::path& configPath) {

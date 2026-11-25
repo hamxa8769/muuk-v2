@@ -1216,6 +1216,38 @@ TEST_CASE("Risk: the daily loss limit closes everything and no new range opens t
     bot.rethrow();
 }
 
+TEST_CASE("Risk: the daily loss limit as a share of the balance closes everything for the day") {
+    // Step 4 (D8): the limit is the knob's 2% of the balance -- here a $25
+    // balance, so the same $0.50 limit as the $ test above, but reached
+    // through the percent, not the amount.
+    MockFixServer server;
+    LiveConfig cfg = resumeConfig(server);
+    cfg.risk.dailyLossPercent = 2.0;
+    cfg.connection.dailyLossLimitMoney = 0.0;  // no $ amount: the % rules
+    cfg.connection.accountBalance = 25.0;
+    Bot bot(cfg, freshStateFile("daily_limit_percent"));
+    int seq = handshake(server, {}, {});
+    const FixMessage buy = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    sendFill(server, seq++, buy.getString(tag::ClOrdID), 4337.00, 1.0, "P1");
+    (void)server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);  // the Sell Stop
+    sendQuote(server, 2, 4336.00, 4336.10);  // net -$1.00, past the -$0.50 limit
+
+    const FixMessage close = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 4s);
+    REQUIRE(close.getString(tag::PosMaintRptID) == "P1");
+    sendFill(server, seq++, close.getString(tag::ClOrdID), 4336.00, 1.0, "P1");
+
+    REQUIRE(waitUntil([&] { return bot.runner().snapshot().baskets.size() == 1; }, 4s));
+    const LiveSnapshot s = bot.runner().snapshot();
+    REQUIRE(s.dailyLimitHit);
+    REQUIRE(s.baskets[0].outcome == "daily limit");
+    REQUIRE(s.dayRealized == Catch::Approx(-1.00));
+    REQUIRE_FALSE(bot.runner().openRange());
+    REQUIRE_THROWS_AS(server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 1500ms), std::runtime_error);
+
+    bot.finish();
+    bot.rethrow();
+}
+
 TEST_CASE("Lock & pause: at the loss limit the pending order is cancelled and one hedge freezes the loss") {
     MockFixServer server;
     LiveConfig cfg = resumeConfig(server);
@@ -1270,6 +1302,12 @@ TEST_CASE("Lock & pause at a share of the balance: 25% of $2 locks at -0.50, and
     cfg.connection.accountBalance = 2.0;
     cfg.connection.lockAtLossPercent = 25.0;  // -0.50
     cfg.connection.lockAtLossMoney = 5.0;     // further away: the share of the balance comes first
+    // Step 4: the daily loss limit (2% of the $2 balance = $0.04) would fire
+    // long before the lock and close the range mid-test -- this test measures
+    // the lock, not the day, so the daily limit stays off here (it has its
+    // own test above).
+    cfg.risk.dailyLossPercent = 0.0;
+    cfg.connection.dailyLossLimitMoney = 0.0;
     cfg.connection.manualCloseCooldownSeconds = 0;
     cfg.connection.recovery.guardLockMarginLevel = 0.0;  // the guards stay out of it
     cfg.connection.recovery.guardStopMarginLevel = 0.0;
@@ -1682,38 +1720,78 @@ TEST_CASE("Smart entry: the range is ATR x rangeAtr wide (never under the fixed 
     bot.rethrow();
 }
 
-TEST_CASE("Smart entry: the trend filter holds new ranges in a sideways market") {
+TEST_CASE("Step 4 (D2): the trend filter no longer holds a range back") {
+    // Step 4 removed the standalone trend filter (research doc D2): the
+    // brain's gates decide when a cycle opens. An old file's trendMin is
+    // still read, but a sideways market opens a range on the configured
+    // strategy instead of waiting for a trend that never comes.
     MockFixServer server;
     LiveConfig cfg = resumeConfig(server);
-    cfg.connection.regimeRanges = false;  // the trend filter is what this test exercises
+    cfg.connection.regimeRanges = false;
     cfg.connection.entry.trendMin = 1.0;
     Bot bot(cfg, freshStateFile("entry_chop"));
     (void)handshake(server, {}, {});
-    // No bars yet: it waits for them.
-    REQUIRE(waitUntil([&] { return bot.runner().snapshot().entryWait.find("waiting") != std::string::npos; }));
     bot.runner().addHistoryBars(historyBars(0));
     sendQuote(server, 2, 4336.20, 4336.30);
-    REQUIRE(waitUntil([&] { return bot.runner().snapshot().entryWait.find("no trend") != std::string::npos; }));
-    REQUIRE_THROWS_AS(server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 800ms), std::runtime_error);
+    const FixMessage first = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(first.getInt(tag::Side) == 1);  // the configured Buy Stop first
+    REQUIRE(bot.runner().snapshot().entryWait.empty());
 
     bot.finish();
     bot.rethrow();
 }
 
-TEST_CASE("Smart entry: in a down trend the range opens with a Sell Stop first") {
+TEST_CASE("Step 4 (D3): 'first order with the trend' no longer picks the side") {
+    // Step 4 removed startWithTrend (research doc D3): the brain decides
+    // the first side, and the fallback uses the fixed "First order"
+    // dropdown. An old file's startWithTrend is still read, but in a down
+    // trend the range still opens with the configured Buy Stop first.
     MockFixServer server;
     LiveConfig cfg = resumeConfig(server);  // configured: Buy Stop first
-    cfg.connection.regimeRanges = false;  // the trend filter is what this test exercises
+    cfg.connection.regimeRanges = false;
     cfg.connection.entry.trendMin = 1.0;
     cfg.connection.entry.startWithTrend = true;
     Bot bot(cfg, freshStateFile("entry_trend"));
     (void)handshake(server, {}, {});
-    REQUIRE(waitUntil([&] { return !bot.runner().snapshot().entryWait.empty(); }));
     bot.runner().addHistoryBars(historyBars(-1));
     sendQuote(server, 2, 4336.20, 4336.30);
     const FixMessage first = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
-    REQUIRE(first.getInt(tag::Side) == 2);
+    REQUIRE(first.getInt(tag::Side) == 1);
     REQUIRE(bot.runner().snapshot().entryWait.empty());
+
+    bot.finish();
+    bot.rethrow();
+}
+
+TEST_CASE("Step 4: a basket that started Sell-first is picked up even though the settings say Buy first") {
+    // The Step 3 follow-up: adoptBasketFromBrokerLocked matched the first
+    // leg against the config dropdown, so a mid-basket restart refused a
+    // basket whose start side came from startWithTrend (or a learned first
+    // side). The first leg IS the recorded start side now.
+    const auto stateFile = freshStateFile("adopt_basket_sell_first");
+    MockFixServer server;
+    Bot bot(resumeConfig(server), stateFile);  // range width $1.00, lots 0.01 + 0.01, Buy first
+    // SELL 0.01 anchored the range at 4336.00, then BUY 0.02 and SELL 0.03 -- and no pending order.
+    (void)handshake(server, {{"P1", false, 0.01, 4336.00}, {"P2", true, 0.02, 4337.02}, {"P3", false, 0.03, 4335.98}},
+                    {});
+    sendQuote(server, 2, 4336.50, 4336.60);
+
+    const FixMessage next = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(next.getInt(tag::OrdType) == 3);
+    REQUIRE(next.getInt(tag::Side) == 1);  // Buy Stop 0.04 @ 4337.00, opposite the last SELL fill
+    REQUIRE(next.getDouble(tag::StopPx) == Catch::Approx(4337.00));
+    REQUIRE(next.getDouble(tag::OrderQty) == Catch::Approx(4.0));  // 0.04 lot
+
+    REQUIRE(waitUntil([&] { return bot.runner().snapshot().pendingOrders.size() == 1; }));
+    const LiveSnapshot snap = bot.runner().snapshot();
+    REQUIRE(snap.status == EngineStatus::Active);
+    REQUIRE(snap.positions.size() == 3);
+    for (const auto& p : snap.positions) REQUIRE_FALSE(p.adopted);
+    REQUIRE(snap.rangeLower == Catch::Approx(4336.00));
+    REQUIRE(snap.rangeUpper == Catch::Approx(4337.00));
+    REQUIRE(snap.resumeNote.find("Picked up the basket") != std::string::npos);
+    REQUIRE(snap.currentBasket.has_value());
+    REQUIRE(snap.currentBasket->legs.size() == 3);
 
     bot.finish();
     bot.rethrow();

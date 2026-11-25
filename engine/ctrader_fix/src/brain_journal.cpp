@@ -48,6 +48,7 @@ nlohmann::json baseLine(const std::string& event, const muuk::core::SituationV2&
     j["lotMultiplier"] = decision.policy.lotMultiplier;
     j["maxLevels"] = decision.policy.maxLevels;
     j["exitFactor"] = decision.policy.exitFactor;
+    j["firstSide"] = decision.firstSide;  // Step 3: -1 Sell first, 0 both stops, +1 Buy first
     return j;
 }
 

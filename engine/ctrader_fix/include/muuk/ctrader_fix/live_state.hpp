@@ -116,4 +116,14 @@ void resetStateStatistics(const std::filesystem::path& file);
 // one JSON line per closed brain basket / vetoed cycle (Phase 1 memory).
 [[nodiscard]] std::filesystem::path brainJournalFileFor(const std::filesystem::path& configPath);
 
+// Where a relative brain file is looked for, in order (see
+// LiveRunner::maybeInitBrainLocked): next to the config file first --
+// that is where the packager and the updater put brain_v2.txt -- then
+// next to the state file (older installs put it there), then the working
+// directory. An absolute brainFile is used as-is. Duplicates (the same
+// file reached by two routes) appear once. Empty brainFile: no candidates.
+[[nodiscard]] std::vector<std::filesystem::path> brainFileCandidates(const std::filesystem::path& configPath,
+                                                                     const std::filesystem::path& stateFile,
+                                                                     const std::string& brainFile);
+
 }  // namespace muuk::ctrader_fix

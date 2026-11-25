@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -113,6 +114,63 @@ bool keepFileOnUpdate(std::string_view relativePath) {
     return !endsWith(lowered, ".local.json") && lowered != "brain_v2.txt";
 }
 
+// ---- trained-brain update rule (see updater.hpp) ----
+
+std::optional<BrainHeader> readBrainHeader(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) return std::nullopt;
+    std::string line1;
+    if (!std::getline(in, line1)) return std::nullopt;
+    std::string line2;
+    if (!std::getline(in, line2)) return std::nullopt;
+    // The shipped brain is CRLF in the zip: strip the carriage return or
+    // the last field's integer parse fails on the trailing '\r'.
+    if (!line1.empty() && line1.back() == '\r') line1.pop_back();
+    if (!line2.empty() && line2.back() == '\r') line2.pop_back();
+    std::istringstream first(line1);
+    std::string magic;
+    if (!(first >> magic) || magic != "muuk-brain-v2") return std::nullopt;
+    BrainHeader out;
+    std::istringstream fields(line2);
+    std::string key;
+    std::string value;
+    bool sawUntil = false;
+    while (fields >> key >> value) {
+        if (key == "trainedUntilMs") {
+            long long v = 0;
+            const auto res = std::from_chars(value.data(), value.data() + value.size(), v);
+            if (res.ec != std::errc() || res.ptr != value.data() + value.size()) return std::nullopt;
+            out.trainedUntilMs = v;
+            sawUntil = true;
+        } else if (key == "erMode") {
+            int v = 0;
+            const auto res = std::from_chars(value.data(), value.data() + value.size(), v);
+            if (res.ec != std::errc() || res.ptr != value.data() + value.size()) return std::nullopt;
+            out.erMode = v;
+        }
+    }
+    if (!sawUntil) return std::nullopt;
+    out.valid = true;
+    return out;
+}
+
+bool shouldInstallReleaseBrain(const std::filesystem::path& installedPath,
+                               const std::filesystem::path& releasePath) {
+    // A release brain we cannot validate as a brain is never installed,
+    // whatever is (or is not) on the PC.
+    const std::optional<BrainHeader> release = readBrainHeader(releasePath);
+    if (!release.has_value()) return false;
+    // Missing or unparseable on the PC: nothing usable to keep.
+    const std::optional<BrainHeader> installed = readBrainHeader(installedPath);
+    if (!installed.has_value()) return true;
+    if (installed->trainedUntilMs < release->trainedUntilMs) return true;
+    if (installed->trainedUntilMs > release->trainedUntilMs) return false;
+    // Same history: the release brain wins only when the installed one
+    // predates the Step 6 header (no recorded ER mode). A locally-trained
+    // brain of the same age wins the tie.
+    return installed->erMode == -1;
+}
+
 
 // The batch the app launches and then quits for: waits until the app has
 // exited, copies the new release over the app folder (never touching the
@@ -127,7 +185,7 @@ bool keepFileOnUpdate(std::string_view relativePath) {
 // fine, app closed, nothing copied, nothing restarted). The wait uses
 // `ping`, which sleeps fine with no console. Every step is logged to
 // update.log next to the batch.
-std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir) {
+std::string buildUpdateBatch(const std::string& appDir, const std::string& extractedDir, bool installBrain) {
     std::string bat;
     bat += "@echo off\r\n";
     bat += "rem Muuk self-update: copies the extracted release over the app folder, then\r\n";
@@ -159,8 +217,16 @@ std::string buildUpdateBatch(const std::string& appDir, const std::string& extra
     bat += "echo robocopy exit code: %RC% >> \"%LOG%\"\r\n";
     bat += "rem robocopy exit codes 0-7 mean success (copied, or nothing to do); 8+ is a failure.\r\n";
     bat += "if %RC% GEQ 8 goto give_up\r\n";
-    bat += "rem The trained brain is never overwritten: a later update only installs it when this PC has none yet (the keeper learns on it live).\r\n";
-    bat += "if not exist \"%APP_DIR%\\brain_v2.txt\" copy /Y \"%SRC_DIR%\\brain_v2.txt\" \"%APP_DIR%\\\" >> \"%LOG%\" 2>&1\r\n";
+    if (installBrain) {
+        bat += "rem The release brain is newer than the installed one (or the installed one predates the\r\n";
+        bat += "rem Step 6 header), so it is installed over it. A locally-trained brain that is newer than\r\n";
+        bat += "rem the release is never overwritten -- that decision is made by the app before this batch\r\n";
+        bat += "rem is written, never here.\r\n";
+        bat += "copy /Y \"%SRC_DIR%\\brain_v2.txt\" \"%APP_DIR%\\\" >> \"%LOG%\" 2>&1\r\n";
+    } else {
+        bat += "rem The trained brain is never overwritten: a later update only installs it when this PC has none yet (the keeper learns on it live).\r\n";
+        bat += "if not exist \"%APP_DIR%\\brain_v2.txt\" copy /Y \"%SRC_DIR%\\brain_v2.txt\" \"%APP_DIR%\\\" >> \"%LOG%\" 2>&1\r\n";
+    }
     bat += "echo Restarting %EXE_NAME%... >> \"%LOG%\"\r\n";
     bat += "if not exist \"%APP_DIR%\\%EXE_NAME%\" goto no_restart\r\n";
     bat += "start \"\" \"%APP_DIR%\\%EXE_NAME%\"\r\n";
@@ -258,8 +324,8 @@ void Updater::startBackgroundCheck() {
     {
         std::scoped_lock lock(mutex_);
         if (state_ == State::Checking || state_ == State::Downloading || state_ == State::Available ||
-            state_ == State::ReadyToInstall) {
-            return;  // already checking, downloading, or an update is already known
+            state_ == State::ReadyToInstall || state_ == State::UpToDate) {
+            return;  // already checking, downloading, up to date, or an update is already known
         }
         error_.clear();
         state_ = State::Checking;
@@ -270,7 +336,9 @@ void Updater::startBackgroundCheck() {
         checkWorker();
         {
             std::scoped_lock lock(mutex_);
-            if (state_ == State::Checking) state_ = State::Idle;  // check finished, nothing newer
+            // A failed check already set Failed in fail(); still Checking
+            // here means GitHub answered and nothing is newer.
+            if (state_ == State::Checking) state_ = State::UpToDate;
         }
         workerDone_ = true;
     });
@@ -280,7 +348,12 @@ void Updater::checkNow() {
     if (!workerDone_.load()) return;
     {
         std::scoped_lock lock(mutex_);
-        if (state_ == State::Checking || state_ == State::Downloading) return;
+        // Never re-check while an update is already known or an install is
+        // ready: a failed re-check must not hide the known update.
+        if (state_ == State::Checking || state_ == State::Downloading || state_ == State::Available ||
+            state_ == State::ReadyToInstall) {
+            return;
+        }
         error_.clear();
         state_ = State::Checking;
     }
@@ -290,7 +363,9 @@ void Updater::checkNow() {
         checkWorker();
         {
             std::scoped_lock lock(mutex_);
-            if (state_ == State::Checking) state_ = State::Idle;
+            // A failed check already set Failed in fail(); still Checking
+            // here means GitHub answered and nothing is newer.
+            if (state_ == State::Checking) state_ = State::UpToDate;
         }
         workerDone_ = true;
     });
@@ -594,6 +669,11 @@ void Updater::installWorker() {
         fail("the app folder could not be found -- nothing was changed");
         return;
     }
+    // The release brain installs only when the one on this PC is older
+    // (or predates the Step 6 header): a locally-trained brain that is
+    // newer is never clobbered. Decided here, while the app is alive;
+    // the batch only carries out the decision.
+    const bool installBrain = shouldInstallReleaseBrain(app / "brain_v2.txt", extracted / "brain_v2.txt");
     const std::filesystem::path batPath = dir / "update.bat";
     {
         std::ofstream bat(batPath, std::ios::binary | std::ios::trunc);
@@ -601,7 +681,7 @@ void Updater::installWorker() {
             fail("the update script could not be written -- nothing was changed");
             return;
         }
-        bat << buildUpdateBatch(app.string(), extracted.string());
+        bat << buildUpdateBatch(app.string(), extracted.string(), installBrain);
     }
     // Launch through the shell: it invokes cmd.exe with the quoting handled
     // for us, and the batch runs with no window. (A hand-built cmd.exe /c
