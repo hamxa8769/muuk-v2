@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,7 @@ struct MarketHoursConfig {
     bool newsGuard = true;
     bool newsHigh = true;       // red folder
     bool newsMedium = false;    // orange folder
+    bool newsHoliday = true;    // "Holiday" impact: bank holidays, CME closures
     std::string newsCurrencies = "USD";  // comma separated; gold moves on USD news
     std::vector<NewsEvent> news;         // added by hand
     int newsMinutesBefore = 15;
@@ -66,8 +68,42 @@ enum class MarketPhase {
     SessionPause,  // around a session's end
     NewsPause,     // around a news release
     OffHours,      // (no longer used: every session is traded)
+    Holiday,       // CME metals holiday: halt, early close, or closed all day
 };
 [[nodiscard]] const char* phaseName(MarketPhase p);
+
+// A CME metals holiday (Globex): a mid-day halt that reopens the same
+// evening, an early close with no evening session, or a day closed
+// outright. Times are minutes since midnight Eastern Time (ET = CT + 1h);
+// reopenMinuteET is on the reopen day, reopenDayOffset days after the
+// holiday date (0 = same day, 2 = Sunday for a Friday early close).
+enum class HolidayKind { Halt, EarlyClose, Closed };
+
+struct HolidayEvent {
+    std::string name;
+    int year = 0, month = 0, day = 0;  // New York date of the holiday
+    HolidayKind kind = HolidayKind::Halt;
+    int haltMinuteET = -1;             // minutes since midnight ET; -1 when Closed
+    int reopenMinuteET = 18 * 60;      // 18:00 ET on the reopen day
+    int reopenDayOffset = 0;           // days after the holiday date the reopen falls on
+};
+
+// The holiday whose New York date contains utcMs, if any.
+[[nodiscard]] std::optional<HolidayEvent> holidayAt(int64_t utcMs);
+// All CME metals holidays for `year` (>= 2026): computed from the rules
+// (MLK/Presidents/Memorial/Labor Day, Thanksgiving + Black Friday,
+// Juneteenth, Independence Day, Good Friday from Easter, Christmas and
+// New Year observance), with the verified 2026-2027 rows overriding on
+// any date conflict.
+[[nodiscard]] std::vector<HolidayEvent> holidaysForYear(int year);
+
+// True when the reopen after a halt moved more than `multiple` ATRs from
+// the pre-halt close -- the market gapped; wait for spreads to settle.
+// False when atr <= 0 (nothing to judge against).
+[[nodiscard]] bool reopenGapTooBig(double preHaltClose, double reopenPrice, double atr, double multiple = 2.0);
+// True when the spread has settled back near its median (or the median is
+// unknown, <= 0, so there is nothing to judge against).
+[[nodiscard]] bool spreadSettled(double spread, double medianSpread, double multiple = 1.5);
 
 struct MarketStatus {
     MarketPhase phase = MarketPhase::Open;
@@ -79,6 +115,10 @@ struct MarketStatus {
     std::string sessionLabel;       // "London + New York", or "Between sessions"
     int64_t nextChangeUtcMs = 0;    // when canOpenRange flips next (0 = not within a week)
     std::string nextChangeLabel;    // "London close pause" / "Trading resumes"
+    // The holiday in force now, if the market is closed for one.
+    std::string holidayName;
+    int64_t holidayReopenUtcMs = 0;  // when it reopens (18:00 ET on the reopen day)
+    bool pauseIsHoliday = false;     // this pause is the run-up to a holiday halt/close
     // The next guarded news release (or the one being guarded now).
     bool hasNextNews = false;
     NewsEvent nextNews;

@@ -14,6 +14,7 @@ add_library(muuk_ctrader_fix STATIC
     src/volume_stats.cpp
     src/pdf_writer.cpp
     src/session_report.cpp
+    src/gemini_client.cpp
 )
 
 target_include_directories(muuk_ctrader_fix PUBLIC
@@ -40,6 +41,7 @@ if(MUUK_BUILD_TESTS)
         tests/test_broker_account_info.cpp
         tests/test_reporting.cpp
         tests/test_market_hours.cpp
+        tests/test_gemini_client.cpp
     )
     target_link_libraries(muuk_ctrader_fix_tests PRIVATE muuk_ctrader_fix Catch2::Catch2WithMain)
     include(Catch)

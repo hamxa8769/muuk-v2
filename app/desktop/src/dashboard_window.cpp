@@ -5,7 +5,10 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -19,6 +22,9 @@
 #include "windows_startup.hpp"
 #include "muuk/core/risk_table.hpp"
 #include "muuk/ctrader_fix/basket_history.hpp"
+#include "muuk/ctrader_fix/brain_keeper_v2.hpp"
+#include "muuk/ctrader_fix/gemini_client.hpp"
+#include "muuk/ctrader_fix/live_state.hpp"
 
 namespace muuk::desktop {
 
@@ -36,6 +42,8 @@ using muuk::ctrader_fix::NewsEvent;
 using muuk::ctrader_fix::Session;
 using muuk::ctrader_fix::VolumeBucket;
 using muuk::ctrader_fix::VolumePeriod;
+using muuk::core::BrainBlockReason;
+using muuk::ctrader_fix::AssistantRole;
 using glass::kAmber;
 using glass::kBlue;
 using glass::kGreen;
@@ -59,6 +67,75 @@ ImVec4 pnlColor(double v) {
 
 
 // "2h 05m", "12m 30s", "45s", "3d 4h".
+// v0.4.0 design Section 4.6: the single enforcement point for
+// assistant-initiated writes. Owner: everything except ChangeKeys and
+// ChangeRole (the assistant never changes keys, and never its own role).
+// User: only Explain and RefreshBrain.
+bool assistantActionAllowed(AssistantRole role, AssistantAction action) {
+    if (action == AssistantAction::ChangeKeys || action == AssistantAction::ChangeRole) return false;
+    if (role == AssistantRole::Owner) return true;
+    return action == AssistantAction::Explain || action == AssistantAction::RefreshBrain;
+}
+
+// BrainBlockReason (market_brain_v2.hpp) as a short label for the veto line.
+const char* brainBlockedReasonName(int blockedBy) {
+    if (blockedBy < 0 || blockedBy > 10) return "Unknown";
+    switch (static_cast<BrainBlockReason>(blockedBy)) {
+        case BrainBlockReason::None: return "None";
+        case BrainBlockReason::NotTrained: return "NotTrained";
+        case BrainBlockReason::TooFewBars: return "TooFewBars";
+        case BrainBlockReason::AtrBreaker: return "AtrBreaker";
+        case BrainBlockReason::CellNotTradable: return "CellNotTradable";
+        case BrainBlockReason::StrongTrend: return "StrongTrend";
+        case BrainBlockReason::RecentLoss: return "RecentLoss";
+        case BrainBlockReason::VolumeSpike: return "VolumeSpike";
+        case BrainBlockReason::Spread: return "Spread";
+        case BrainBlockReason::ErChop: return "ErChop";
+        case BrainBlockReason::Caps: return "Caps";
+    }
+    return "Unknown";
+}
+
+// One cell's whole story, as the grid tooltip and the pinned detail card
+// both show it (Section 2.3). Numbers are replay units (per 0.01 lot
+// start) -- never converted to account money here.
+std::string brainCellSummary(const LiveSnapshot& snap, int idx, int liveCell) {
+    const auto& cell = snap.brainCells[static_cast<std::size_t>(idx)];
+    const int vol = idx / 27, trend = (idx / 9) % 3, chop = (idx / 3) % 3, se = idx % 3;
+    const char* volName = vol == 0 ? "low" : vol == 1 ? "mid" : "high";
+    const char* trendName = trend == 0 ? "weak" : trend == 1 ? "mid" : "strong";
+    const char* chopName = chop == 0 ? "smooth" : chop == 1 ? "mid" : "choppy";
+    const char* seName = se == 0 ? "Asia" : se == 1 ? "London" : "New York";
+    const char* sideName =
+        cell.firstSide < 0 ? "Sell" : cell.firstSide == 0 ? "Both" : cell.firstSide == 1 ? "Buy" : "Trend first";
+    char buf[512];
+    std::string out;
+    std::snprintf(buf, sizeof(buf), "Cell %d -- Vol %s | Trend %s | Chop %s | %s\n", idx, volName, trendName, chopName,
+                  seName);
+    out += buf;
+    if (cell.gapChoice < 0) {
+        out += "Policy: no trade in this state\n";
+    } else {
+        std::snprintf(buf, sizeof(buf), "Policy: gap %dx ATR | lot x%.1f | %d levels | exit x%.2f | first: %s\n",
+                      cell.gapChoice, cell.lotMultiplier, cell.maxLevels, cell.exitFactor, sideName);
+        out += buf;
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "Trained: %d samples | mean %+.2f | score %+.2f | locks %d (%.2f%%) | mean lock loss %.2f replay\n",
+                  cell.samples, cell.meanPnl, cell.score, cell.locks, cell.lockRate * 100.0, cell.meanLockLoss);
+    out += buf;
+    out += "Replay units (per 0.01 lot start), not account money.\n";
+    const auto& tally = snap.brainCellTally[static_cast<std::size_t>(idx)];
+    if (tally.cycles > 0) {
+        std::snprintf(buf, sizeof(buf), "Live today: %d cycles, %d wins, %d locks, net %+.1f replay\n", tally.cycles,
+                      tally.wins, tally.locks, tally.netReplay);
+        out += buf;
+    }
+    if (cell.vetoedLive) out += "Live vetoed (X): vetoed by score / lock-rate rule.\n";
+    if (idx == liveCell) out += "Live cell (amber border).\n";
+    return out;
+}
+
 std::string countdown(int64_t ms) {
     if (ms <= 0) return "now";
     const long long s = ms / 1000;
@@ -860,6 +937,8 @@ void DashboardWindow::render(LiveController& controller) {
         openConfirmRequested_ = false;
     }
     renderConfirmPopup(controller);
+    renderKeysPopup(controller, snap, connected);
+    renderMarketHoursPopup(controller, snap, connected);
     if (account_.platform == 1 && !controller.demo()) renderMt5AccountsPopup(controller);
 
     if (openExitRequested_) {
@@ -1197,12 +1276,15 @@ void DashboardWindow::renderPages(LiveController& controller, const std::optiona
         selectTab_ = Tab::None;
     }
     static constexpr Tab kOrder[] = {Tab::Positions, Tab::Orders, Tab::History,     Tab::Risk,     Tab::News,
-                                     Tab::Audit,     Tab::Volume, Tab::Performance, Tab::Settings, Tab::Log};
+                                     Tab::Audit,     Tab::Volume, Tab::Performance, Tab::Brain,    Tab::Assistant,
+                                     Tab::Settings,  Tab::Log};
     constexpr int kPages = static_cast<int>(sizeof(kOrder) / sizeof(kOrder[0]));
-    // Ctrl+1..9, Ctrl+0 jump straight to a page (not while typing into a field).
+    // Ctrl+1..9, Ctrl+0 jump straight to a page (the first ten pages only;
+    // the eleventh and twelfth have no shortcut -- Key_0 is already the
+    // tenth). Not while typing into a field.
     const ImGuiIO& io = ImGui::GetIO();
     if (io.KeyCtrl && !io.WantTextInput) {
-        for (int i = 0; i < kPages; ++i) {
+        for (int i = 0; i < kPages && i < 10; ++i) {
             const ImGuiKey key = static_cast<ImGuiKey>(i < 9 ? ImGuiKey_1 + i : ImGuiKey_0);
             if (ImGui::IsKeyPressed(key, false)) currentTab_ = kOrder[i];
         }
@@ -1239,6 +1321,9 @@ void DashboardWindow::renderPages(LiveController& controller, const std::optiona
          worst >= 2 ? kRed : worst == 1 ? kAmber : kGreen},
         {Tab::Volume, "Volume", "", kGrey},
         {Tab::Performance, "Performance", "", kGrey},
+        {Tab::Brain, "Brain",
+         snap ? (snap->brainStatus == "off" ? "off" : std::to_string(snap->brainCyclesToday)) : "", kViolet},
+        {Tab::Assistant, "Assistant", "", kViolet},
         {Tab::Settings, "Settings", settingsDirty_ ? "unsaved" : "", kAmber},
         {Tab::Log, "Log", "", kGrey},
     };
@@ -1300,6 +1385,12 @@ void DashboardWindow::renderPages(LiveController& controller, const std::optiona
             beginPage("performance_scroll");
             renderPerformanceTab(controller, snap);
             endPage();
+            break;
+        case Tab::Brain:
+            renderBrainTab(controller, snap, connected);
+            break;
+        case Tab::Assistant:
+            renderAssistantTab(controller, snap, connected);
             break;
         case Tab::Settings:
             renderSettingsPanel(controller, snap, connected);
@@ -1370,7 +1461,7 @@ void DashboardWindow::renderPages(LiveController& controller, const std::optiona
                 menuOpen_ = false;
                 menuSuppressed_ = true;  // closes now; opens again once the mouse has left and comes back
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+%d", (i + 1) % 10);
+            if (i < 10 && ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+%d", (i + 1) % 10);
             ImGui::EndChild();
         }
         ImGui::PopItemWidth();
@@ -1491,37 +1582,6 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
     } else if (snap && connected && snap->settings.entry.anyOn() && snap->rangeWidthNow > 0.0) {
         ImGui::TextDisabled("Smart entry: this range is $%.2f wide, target move $%.2f", snap->rangeWidthNow,
                             snap->targetMoveNow);
-    }
-    if (snap && connected && !snap->brainStatus.empty()) {
-        if (!snap->brainDetail.empty()) {
-            ImGui::TextDisabled("Brain: %s | %s", snap->brainStatus.c_str(), snap->brainDetail.c_str());
-        } else {
-            ImGui::TextDisabled("Brain: %s", snap->brainStatus.c_str());
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("\xE2\x86\xBB##brainrefresh")) controller.refreshBrain();
-        ImGui::SetItemTooltip("Re-read brain_v2.txt now -- picks up a new or replaced brain file without restarting.");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!snap->brainTraining.empty() || snap->brainStatus == "off");
-        if (ImGui::SmallButton("Train##braintrain")) controller.trainBrain(snap->settings.trainerHistoryPath);
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Train a new brain now, in the background, on the bars the bot collected (or the history path in Settings). The bot keeps trading its current brain; a new brain is adopted only when the strict gates pass.");
-        if (!snap->brainTraining.empty()) {
-            ImGui::TextDisabled("%s", snap->brainTraining.c_str());
-        }
-        if (!snap->brainTrainingResult.empty()) {
-            ImGui::TextDisabled("Last training: %s", snap->brainTrainingResult.c_str());
-        }
-        if (!snap->brainRefreshNote.empty()) {
-            ImGui::TextDisabled("Brain refresh: %s", snap->brainRefreshNote.c_str());
-        }
-        if (snap->brainStatus != "off") {
-            ImGui::TextDisabled("Brain today: %d cycles, %d wins, %d locks", snap->brainCyclesToday,
-                                snap->brainWinsToday, snap->brainLocksToday);
-        }
-    }
-    if (snap && connected && !snap->regimeStatus.empty()) {
-        ImGui::TextDisabled("Chart: %s", snap->regimeStatus.c_str());
     }
     if (snap && !snap->anotherTrader.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, kRed);
@@ -1718,20 +1778,12 @@ void DashboardWindow::renderRangePanel(LiveController& controller, const std::op
     glass::endCard();
 }
 
-void DashboardWindow::renderSettingsPanel(LiveController& controller, const std::optional<LiveSnapshot>& snap,
-                                          bool connected) {
-    beginPage("settings_scroll");
-    // Step 4: one Brain panel holds all of the bot's core settings. `s` lives
-    // at function scope so the Brain section, the Fallback table and the Keys
-    // below all edit the same settings.
+void DashboardWindow::renderBrainTab(LiveController& controller, const std::optional<LiveSnapshot>& snap,
+                                     bool connected) {
+    beginPage("brain_scroll");
+    // The brain is the bot's core settings. `s` lives at function scope so
+    // every editor below edits the same settings the SaveBar saves.
     LiveSettings& s = editSettings_;
-    renderAccountSection(controller.isRunning());
-    ImGui::Spacing();
-    renderThisPcSection();
-    ImGui::Spacing();
-    // --- Brain: the bot's core settings. Everything the bot does is driven
-    // from here; the Fallback table below only runs when the brain is off or
-    // has no trained file.
     withFont(boldFont_, [] {
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Brain");
@@ -1744,7 +1796,7 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
                         "Saved to your config file, so the app always opens with them.");
 
     ImGui::BeginDisabled(!settingsLoaded_);
-    // Live status (same lines as the Range panel) + the refresh icon.
+    // Live status + the refresh icon.
     if (snap && connected && !snap->brainStatus.empty()) {
         if (!snap->brainDetail.empty()) {
             ImGui::TextDisabled("Brain: %s | %s", snap->brainStatus.c_str(), snap->brainDetail.c_str());
@@ -1771,6 +1823,18 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
         if (snap->brainStatus != "off") {
             ImGui::TextDisabled("Brain today: %d cycles, %d wins, %d locks", snap->brainCyclesToday,
                                 snap->brainWinsToday, snap->brainLocksToday);
+            // v0.4.0 Section 2.6: today by cell, only cells that traded.
+            std::string byCell;
+            for (int i = 0; i < 81; ++i) {
+                const auto& t = snap->brainCellTally[static_cast<std::size_t>(i)];
+                if (t.cycles <= 0) continue;
+                if (!byCell.empty()) byCell += "  \xC2\xB7  ";
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "%d: %d cycles (%dW/%dL) %+.1f replay", i, t.cycles, t.wins, t.locks,
+                              t.netReplay);
+                byCell += buf;
+            }
+            if (!byCell.empty()) ImGui::TextDisabled("Today by cell: %s", byCell.c_str());
         }
     } else {
         ImGui::TextDisabled("Brain: not loaded yet -- connect the bot to see its status.");
@@ -1848,13 +1912,16 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
     if (ImGui::InputDouble("##brainstoploss", &s.stopLoss, 5.0, 25.0, "%.2f")) settingsDirty_ = true;
     s.stopLoss = std::max(0.0, s.stopLoss);
 
+    if (glass::button("Risk & capital...", kBlue)) selectTab_ = Tab::Risk;
+    ImGui::SetItemTooltip("Lot sizes, loss limits, lock, margin guards and escape live on the Risk & capital page.");
+
     // Brain ER gate (Step 1): Kaufman Efficiency Ratio. Mode 2 is the
     // tested winner -- the shipped brain records erMode 2 and the keeper
     // overrides the panel with it (Step 6b); Off is only the no-brain
     // fallback.
     ImGui::Spacing();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("Brain ER gate");
+    ImGui::TextUnformatted("Brain ER gate (fallback only)");
     ImGui::SetItemTooltip("Kaufman Efficiency Ratio: clean trend (high ER) trades trend-wise, choppy whipsaw "
                           "(low ER) is blocked. Off = no ER gate; a loaded brain that records an ER mode "
                           "overrides this (the shipped brain records mode 2).");
@@ -1889,6 +1956,9 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
         settingsDirty_ = true;
     }
 
+    if (glass::button("Keys...", kBlue)) ImGui::OpenPopup("API keys");
+    ImGui::SetItemTooltip("Gemini, FRED and Finnhub API keys -- stored only in this config file, never in the repo.");
+
     // Smart ranges (chart): kept, experimental (D7). Both chart placements
     // lost to centered ranges in backtest -- keep off unless testing it.
     ImGui::AlignTextToFramePadding();
@@ -1901,11 +1971,729 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
     ImGui::SameLine();
     if (ImGui::Checkbox("On##brainregimeranges", &s.regimeRanges)) settingsDirty_ = true;
 
-    // API keys (Gemini / FRED / Finnhub): stored only in this config file
-    // (my_account.local.json) -- never in the repo, never logged -- and
-    // shown masked. The Gemini key is what the brain's news/event
-    // understanding (Phase 5) will call with.
+    if (snap && connected && !snap->regimeStatus.empty()) {
+        ImGui::TextDisabled("Chart: %s", snap->regimeStatus.c_str());
+    }
+
+    // v0.4.0 Section 2/3 (display-only): the 81-cell grid, the trainer
+    // card, the brain layers and the smart switch. None of these changes
+    // a brain decision, a gate or a cap.
+    renderBrainGrid(snap);
+    renderTrainerCard(snap);
+    renderBrainLayers();
+    renderSmartSwitch(snap);
+    ImGui::EndDisabled();
+    clampSettings(s);
+    renderSaveBar(controller, snap, connected);
+    endPage();
+}
+
+
+// v0.4.0 Section 2.1-2.3: the trained brain as three session cubes
+// (Asia / London / New York), each a 3x3x3 of cells over vol (Z, up),
+// trend (X) and chop (Y, depth). Exact projection from the design doc:
+//   sx = ox + (t - c) * s;  sy = oy + (t + c) * h - v * s   (h = s * 0.5)
+// Draw order is back-to-front (c descending, t ascending, v ascending).
+// Display-only: colours come from snap->brainCells, the live cell and the
+// live veto from the snapshot; nothing here feeds a trading decision.
+//
+// NOTE (B1 nuance): vetoedLive comes from BrainKeeperV2::vetoedCells(),
+// the doc's literal rule (gapChoice >= 0 && (score <= 0 ||
+// lockRate > maxLockRate)). The live veto in observeBasketOutcome() uses
+// the SHRUNK lock rate (locks+1)/(samples+10) and sets gapChoice = -1 on
+// veto, so a cell truly vetoed live can read vetoedLive = false here, and
+// a still-tradable cell with score <= 0 can read true. The X is labelled
+// by that rule, in the legend below.
+void DashboardWindow::renderBrainGrid(const std::optional<LiveSnapshot>& snap) {
     ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Brain grid -- 81 cells"); });
+    if (!snap || !snap->brainCellsValid) {
+        ImGui::TextDisabled("Brain grid: no trained brain loaded -- connect the bot with a trained brain_v2.txt.");
+        return;
+    }
+    const int liveCell = snap->brainCurrentCell >= 0 ? snap->brainCurrentCell : snap->brainLastCell;
+    ImGui::RadioButton("Mean PnL##gridmode", &brainGridMode_, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Score##gridmode", &brainGridMode_, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Lock rate##gridmode", &brainGridMode_, 2);
+    ImGui::SameLine();
+    ImGui::RadioButton("Samples##gridmode", &brainGridMode_, 3);
+    ImGui::SameLine();
+    ImGui::Checkbox("Tradable only##gridmode", &brainTradableOnly_);
+
+    auto cellColor = [this](const muuk::ctrader_fix::BrainCellView& cell) {
+        ImVec4 c(0.23f, 0.23f, 0.23f, 1.0f);  // no-trade grey (#3A3A3A)
+        if (cell.gapChoice >= 0) {
+            switch (brainGridMode_) {
+                case 1:  // Score: > 0 green, <= 0 red (a tradable cell at <= 0 is near a live veto)
+                    c = cell.score > 0.0 ? ImVec4(0.35f, 0.75f, 0.40f, 1.0f) : ImVec4(0.80f, 0.40f, 0.35f, 1.0f);
+                    break;
+                case 2:  // Lock rate: 0 green -> 0.015 (trainer limit) yellow -> above red
+                    c = cell.lockRate <= 0.0   ? ImVec4(0.35f, 0.75f, 0.40f, 1.0f)
+                      : cell.lockRate <= 0.015 ? ImVec4(0.85f, 0.75f, 0.20f, 1.0f)
+                                               : ImVec4(0.80f, 0.25f, 0.20f, 1.0f);
+                    break;
+                case 3:  // Samples: more samples, deeper blue
+                    c = cell.samples <= 0    ? ImVec4(0.23f, 0.23f, 0.23f, 1.0f)
+                      : cell.samples >= 1000 ? ImVec4(0.10f, 0.30f, 0.65f, 1.0f)
+                      : cell.samples >= 100  ? ImVec4(0.25f, 0.50f, 0.85f, 1.0f)
+                                             : ImVec4(0.55f, 0.70f, 0.95f, 1.0f);
+                    break;
+                case 0:
+                default:  // Mean PnL (replay units, per 0.01 lot start)
+                    c = cell.meanPnl > 50.0   ? ImVec4(0.05f, 0.45f, 0.15f, 1.0f)
+                      : cell.meanPnl > 0.0    ? ImVec4(0.35f, 0.75f, 0.40f, 1.0f)
+                      : cell.meanPnl >= -50.0 ? ImVec4(0.80f, 0.40f, 0.35f, 1.0f)
+                                              : ImVec4(0.55f, 0.10f, 0.10f, 1.0f);
+                    break;
+            }
+        }
+        // Few samples (< 100): fade the colour to half -- "little data
+        // here". 100 is display-only; the trainer's policy minSamples is
+        // 20 (BrainConfig::base), so this fades nothing the trainer uses.
+        if (cell.samples < 100) c.w *= 0.5f;
+        return c;
+    };
+
+    // Legend (one line, always visible; changes with the mode).
+    {
+        auto swatch = [](ImVec4 c, const char* label) {
+            ImGui::TextColored(c, "%s", "\xE2\x96\xA0");
+            ImGui::SameLine(0.0f, 2.0f);
+            ImGui::TextDisabled("%s", label);
+            ImGui::SameLine(0.0f, 10.0f);
+        };
+        if (brainGridMode_ == 0) {
+            swatch(ImVec4(0.05f, 0.45f, 0.15f, 1.0f), "> +50");
+            swatch(ImVec4(0.35f, 0.75f, 0.40f, 1.0f), "0..+50");
+            swatch(ImVec4(0.80f, 0.40f, 0.35f, 1.0f), "-50..0");
+            swatch(ImVec4(0.55f, 0.10f, 0.10f, 1.0f), "< -50");
+            swatch(ImVec4(0.23f, 0.23f, 0.23f, 1.0f), "no-trade");
+        } else if (brainGridMode_ == 1) {
+            swatch(ImVec4(0.35f, 0.75f, 0.40f, 1.0f), "score > 0");
+            swatch(ImVec4(0.80f, 0.40f, 0.35f, 1.0f), "score <= 0");
+            swatch(ImVec4(0.23f, 0.23f, 0.23f, 1.0f), "no-trade");
+        } else if (brainGridMode_ == 2) {
+            swatch(ImVec4(0.35f, 0.75f, 0.40f, 1.0f), "lock 0");
+            swatch(ImVec4(0.85f, 0.75f, 0.20f, 1.0f), "0.015 = trainer limit");
+            swatch(ImVec4(0.80f, 0.25f, 0.20f, 1.0f), "> 0.015");
+            swatch(ImVec4(0.23f, 0.23f, 0.23f, 1.0f), "no-trade");
+        } else {
+            swatch(ImVec4(0.23f, 0.23f, 0.23f, 1.0f), "0 samples");
+            swatch(ImVec4(0.55f, 0.70f, 0.95f, 1.0f), "< 100");
+            swatch(ImVec4(0.25f, 0.50f, 0.85f, 1.0f), "100+");
+            swatch(ImVec4(0.10f, 0.30f, 0.65f, 1.0f), "1000+");
+        }
+        ImGui::TextDisabled("amber border = live cell \xC2\xB7 X = live vetoed (vetoed by score / lock-rate rule)");
+    }
+
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float s = std::clamp((availW - 48.0f) / 15.0f, 10.0f, 16.0f);
+    const float h = s * 0.5f;
+    const float cubeW = 4.0f * s;  // sx spans (t - c) in [-2, 2]
+    const float gap = 24.0f;
+    ImGui::BeginChild("brain_grid", ImVec2(0, 260), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImVec2 cellPos[81];  // top vertex of each cube, for the hit-test
+    for (int se = 0; se < 3; ++se) {
+        const float ox = origin.x + 2.0f * s + se * (cubeW + gap);
+        const float oy = origin.y + 24.0f + 2.0f * s;  // label above, room for v = 2 rising
+        const char* sessionName = se == 0 ? "Asia" : se == 1 ? "London" : "New York";
+        dl->AddText(ImVec2(ox - s, origin.y + 4.0f), ImGui::GetColorU32(ImGuiCol_Text), sessionName);
+        for (int c = 2; c >= 0; --c) {
+            for (int t = 0; t < 3; ++t) {
+                for (int v = 0; v < 3; ++v) {
+                    const int idx = v * 27 + t * 9 + c * 3 + se;
+                    const auto& cell = snap->brainCells[static_cast<std::size_t>(idx)];
+                    const float sx = ox + (t - c) * s;
+                    const float sy = oy + (t + c) * h - v * s;
+                    cellPos[idx] = ImVec2(sx, sy);
+                    const ImVec4 base = cellColor(cell);
+                    const bool ghost = brainTradableOnly_ && cell.gapChoice < 0;
+                    const ImVec4 top = ghost ? ImVec4(base.x, base.y, base.z, 0.0f) : base;
+                    const ImVec4 left = ImVec4(top.x * 0.7f, top.y * 0.7f, top.z * 0.7f, top.w);
+                    const ImVec4 right = ImVec4(top.x * 0.55f, top.y * 0.55f, top.z * 0.55f, top.w);
+                    // Top face (rhombus), left face, right face.
+                    dl->AddQuadFilled(ImVec2(sx, sy), ImVec2(sx + s, sy + h), ImVec2(sx, sy + 2.0f * h),
+                                      ImVec2(sx - s, sy + h), ImGui::GetColorU32(top));
+                    dl->AddQuadFilled(ImVec2(sx - s, sy + h), ImVec2(sx, sy + 2.0f * h),
+                                      ImVec2(sx, sy + 2.0f * h + s), ImVec2(sx - s, sy + h + s),
+                                      ImGui::GetColorU32(left));
+                    dl->AddQuadFilled(ImVec2(sx + s, sy + h), ImVec2(sx, sy + 2.0f * h),
+                                      ImVec2(sx, sy + 2.0f * h + s), ImVec2(sx + s, sy + h + s),
+                                      ImGui::GetColorU32(right));
+                    if (ghost) {
+                        const ImVec2 outline[5] = {ImVec2(sx, sy), ImVec2(sx + s, sy + h), ImVec2(sx, sy + 2.0f * h),
+                                                   ImVec2(sx - s, sy + h), ImVec2(sx, sy)};
+                        dl->AddPolyline(outline, 5, ImGui::GetColorU32(ImVec4(0.5f, 0.5f, 0.5f, 1.0f)),
+                                        ImDrawFlags_Closed, 1.0f);
+                    }
+                }
+            }
+        }
+    }
+    dl->AddText(ImVec2(origin.x, origin.y + 24.0f + 6.0f * s + 6.0f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                "X \xE2\x86\x92 trend (ADX) \xC2\xB7 Y \xE2\x86\x92 chop \xC2\xB7 Z \xE2\x86\x91 vol (ATR)");
+
+    // Overlays, drawn on top of every cube.
+    if (liveCell >= 0 && liveCell < 81) {
+        const ImVec2 p = cellPos[liveCell];
+        const ImU32 amber = ImGui::GetColorU32(kAmber);
+        const ImVec2 border[5] = {ImVec2(p.x, p.y), ImVec2(p.x + s, p.y + h), ImVec2(p.x, p.y + 2.0f * h),
+                                  ImVec2(p.x - s, p.y + h), ImVec2(p.x, p.y)};
+        dl->AddPolyline(border, 5, amber, ImDrawFlags_Closed, 3.0f);
+        dl->AddTriangleFilled(ImVec2(p.x - 5.0f, p.y - 6.0f), ImVec2(p.x + 5.0f, p.y - 6.0f), ImVec2(p.x, p.y - 13.0f),
+                              amber);
+    }
+    for (int i = 0; i < 81; ++i) {
+        if (!snap->brainCells[static_cast<std::size_t>(i)].vetoedLive) continue;
+        const ImVec2 p = cellPos[i];
+        const ImU32 black = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        dl->AddLine(ImVec2(p.x - s * 0.6f, p.y + h * 0.6f), ImVec2(p.x + s * 0.6f, p.y + h * 1.6f), black, 2.0f);
+        dl->AddLine(ImVec2(p.x + s * 0.6f, p.y + h * 0.6f), ImVec2(p.x - s * 0.6f, p.y + h * 1.6f), black, 2.0f);
+    }
+    if (brainPinnedCell_ >= 0 && brainPinnedCell_ < 81) {
+        const ImVec2 p = cellPos[brainPinnedCell_];
+        const ImVec2 border[5] = {ImVec2(p.x, p.y), ImVec2(p.x + s, p.y + h), ImVec2(p.x, p.y + 2.0f * h),
+                                  ImVec2(p.x - s, p.y + h), ImVec2(p.x, p.y)};
+        dl->AddPolyline(border, 5, ImGui::GetColorU32(kBlue), ImDrawFlags_Closed, 2.0f);
+    }
+
+    // Hover / click: the same draw order, keeping the LAST hit, so the
+    // frontmost cube wins where their rects overlap.
+    int hovered = -1;
+    if (ImGui::IsWindowHovered()) {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        for (int c = 2; c >= 0; --c) {
+            for (int t = 0; t < 3; ++t) {
+                for (int v = 0; v < 3; ++v) {
+                    for (int se = 0; se < 3; ++se) {
+                        const int idx = v * 27 + t * 9 + c * 3 + se;
+                        const ImVec2 p = cellPos[idx];
+                        if (mouse.x >= p.x - s && mouse.x < p.x + s && mouse.y >= p.y &&
+                            mouse.y < p.y + 2.0f * h + s) {
+                            hovered = idx;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (hovered >= 0) {
+        if (ImGui::IsMouseClicked(0)) brainPinnedCell_ = (brainPinnedCell_ == hovered) ? -1 : hovered;
+        ImGui::SetTooltip("%s", brainCellSummary(*snap, hovered, liveCell).c_str());
+    }
+    ImGui::EndChild();
+
+    // Pinned detail card: stays visible after the hover ends (Section 2.3).
+    if (brainPinnedCell_ >= 0 && brainPinnedCell_ < 81) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted(brainCellSummary(*snap, brainPinnedCell_, liveCell).c_str());
+        if (ImGui::SmallButton("Unpin##cellpin")) brainPinnedCell_ = -1;
+    }
+}
+
+// v0.4.0 Section 2.4: trainer progress (bars / 2,000, auto-retrain at
+// 1,440 new bars) and the last run, structured -- the failed gates are
+// named from brainLastTrain, never parsed out of the summary string.
+// "Full report" (training_report_v2.txt) is NOT built here: the dashboard
+// has no accessor for the brain folder path, so there is no button yet.
+void DashboardWindow::renderTrainerCard(const std::optional<LiveSnapshot>& snap) {
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Trainer"); });
+    if (!snap) {
+        ImGui::TextDisabled("Trainer: not connected.");
+        return;
+    }
+    const auto& lt = snap->brainLastTrain;
+    const int need = static_cast<int>(muuk::ctrader_fix::kMinTrainingBars);
+    const float frac = std::clamp(static_cast<float>(snap->brainTotalBars) / static_cast<float>(need), 0.0f, 1.0f);
+    char progress[128];
+    if (snap->brainTotalBars >= need) {
+        std::snprintf(progress, sizeof(progress), "%d / %d bars -- ready", snap->brainTotalBars, need);
+    } else {
+        std::snprintf(progress, sizeof(progress), "%d / %d bars", snap->brainTotalBars, need);
+    }
+    ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, 0.0f), progress);
+    ImGui::TextDisabled("Auto-retrain after %d new bars since the last run (%d new so far).",
+                        static_cast<int>(muuk::ctrader_fix::kNewBarsToLearn), snap->brainNewBars);
+    if (snap->brainTrainedBars > 0) ImGui::TextDisabled("Learned from %d bars.", snap->brainTrainedBars);
+    if (!snap->brainTraining.empty()) ImGui::TextDisabled("%s", snap->brainTraining.c_str());
+    if (!lt.ran) {
+        if (snap->brainTotalBars < need) {
+            ImGui::TextDisabled("Too few bars to train on: %d (need at least %d). Bars accumulate ~%d/day while the bot runs.",
+                                snap->brainTotalBars, need, static_cast<int>(muuk::ctrader_fix::kNewBarsToLearn));
+        } else {
+            ImGui::TextDisabled("Last training: no run yet.");
+        }
+        return;
+    }
+    if (lt.gatesPassed) {
+        ImGui::TextColored(kGreen, "Last training: gates PASSED -- %s", lt.adopted ? "adopted" : "not adopted");
+    } else {
+        std::string failed;
+        if (!lt.better) failed += "not better than fixed/v1; ";
+        if (!lt.ddGate) failed += "drawdown over half of v1's; ";
+        if (!lt.lockGate) failed += "locks over half of v1's; ";
+        if (lt.brainPeriodsUp < 5) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "only %d/%d periods up (need 5); ", lt.brainPeriodsUp, lt.periods);
+            failed += buf;
+        }
+        if (lt.heldOutPnl <= 0.0) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "held-out %+.2f (must be > 0); ", lt.heldOutPnl);
+            failed += buf;
+        }
+        if (failed.size() >= 2) failed.resize(failed.size() - 2);
+        ImGui::TextColored(kRed, "Last training: gates FAILED: %s", failed.empty() ? "unknown gate" : failed.c_str());
+    }
+    ImGui::TextDisabled("v2 total %+.2f on %llu bars, %d locks, DD %.2f, %d/%d periods up, held-out %+.2f (%d locks)",
+                        lt.totalPnl, static_cast<unsigned long long>(lt.bars), lt.locks, lt.maxDrawdown,
+                        lt.brainPeriodsUp, lt.periods, lt.heldOutPnl, lt.heldOutLocks);
+}
+
+// v0.4.0 Section 3.1: the brain as layers, read-only. Ownership lives
+// in the design doc's table; this card only explains it.
+void DashboardWindow::renderBrainLayers() {
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Brain layers -- kaun kya kar sakta hai"); });
+    ImGui::TextWrapped("L0 Policy table (81 cells) -- trainer likhta hai; live mein kabhi nahi badalti. Badalta hai: sirf trainer, gates pass hon to.");
+    ImGui::TextWrapped("L1 Gates (ER gate, ATR breaker, strong-trend block, recent-loss, volume, spread) -- cycle rok sakte hain; policy nahi badalte, caps nahi chheente.");
+    ImGui::TextWrapped("L2 Hard caps ($150 lock cap, 6 levels, 1.00 lot, daily loss %, demo-only gate) -- kabhi nahi toot-te. Brain, switch aur assistant mein se koi inhein override nahi kar sakta.");
+    ImGui::TextWrapped("L3 Memory + journal -- har basket / veto likhta hai; aik cell ko no-trade (veto) kar sakta hai, policy kabhi nahi badalta.");
+    ImGui::TextDisabled("Har cycle: L0 policy -> L1 gates -> L2 caps -> trade / veto. Har veto: wajah + cell -> L3 journal.");
+}
+
+// v0.4.0 Section 3.2/3.3: the smart switch, display-only. It names the
+// mode the bot is already in (Shipped, or Fallback when there is no
+// trained brain) and explains the last veto -- it never changes a cap, an
+// erMode, a breaker or a cell policy live.
+//
+// LIMIT (snapshot): LiveSnapshot carries no live ER number and no ATR
+// percentile (SituationV2 is not in the snapshot), so the regime lines
+// below are read from the last veto reason (brainBlockedBy /
+// brainBlockedWhy), never from invented ER/ATR numbers. The doc's exact
+// regime strings carry ER values (e.g. "ER 0.62") that this tab cannot
+// show until the snapshot grows those fields.
+void DashboardWindow::renderSmartSwitch(const std::optional<LiveSnapshot>& snap) {
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Smart switch -- regime ke hisaab se mode"); });
+    if (!snap || !snap->brainCellsValid) {
+        ImGui::TextWrapped("Mode: Fallback -- no trained brain. Panel fallback (erMode panel value, fixed strategy). Brain milte hi Shipped par wapas aata hai.");
+    } else {
+        ImGui::TextWrapped("Mode: Shipped -- erMode 2, ATR breaker 2.0x. Ye wohi mode hai jis par brain ne apna test pass kiya tha. Switch isay tab tak nahi badlega jab tak aik naya brain 5 strict gates pass na kar le.");
+    }
+    if (snap && !snap->brainBlockedWhy.empty()) {
+        const int blockedBy = snap->brainBlockedBy;
+        const BrainBlockReason blocked =
+            (blockedBy >= 0 && blockedBy <= 10) ? static_cast<BrainBlockReason>(blockedBy) : BrainBlockReason::None;
+        switch (blocked) {
+            case BrainBlockReason::ErChop:
+                ImGui::TextWrapped("Regime: Choppy -- brain is cycle ko rok raha hai. Whipsaw mein range dono taraf khati hai; yehi ER gate ka kaam hai. (%s)",
+                                   snap->brainBlockedWhy.c_str());
+                break;
+            case BrainBlockReason::AtrBreaker:
+                ImGui::TextWrapped("Regime: High volatility -- ATR breaker ne cycle roka hai (crash protection). (%s)",
+                                   snap->brainBlockedWhy.c_str());
+                break;
+            case BrainBlockReason::StrongTrend:
+                ImGui::TextWrapped("Regime: Strong trend -- strong-trend block ne cycle roka hai. Clean trend hone par erMode 2 is block ko override karta hai; ye veto us waqt ka hai jab trend saaf nahi tha. (%s)",
+                                   snap->brainBlockedWhy.c_str());
+                break;
+            case BrainBlockReason::CellNotTradable:
+                ImGui::TextWrapped("Regime: brain decides by cell -- is state mein brain trade nahi karta. (%s)",
+                                   snap->brainBlockedWhy.c_str());
+                break;
+            default:
+                ImGui::TextWrapped("Last veto: %s", snap->brainBlockedWhy.c_str());
+                break;
+        }
+        if (!snap->brainBlockedAt.empty()) ImGui::TextDisabled("Last veto at %s.", snap->brainBlockedAt.c_str());
+    } else if (snap && snap->brainCurrentCell >= 0) {
+        ImGui::TextDisabled("Cycle chal raha hai (cell %d) -- cell policy + gates ne faisla kiya.",
+                            snap->brainCurrentCell);
+    } else if (snap && snap->brainCellsValid) {
+        ImGui::TextDisabled("Regime: unclear -- ER gate kuch nahi kehta, cell policy + baaki gates faisla karte hain.");
+    }
+    ImGui::TextWrapped("Smart switch never touches: maxLockCost $150 \xC2\xB7 maxLevelsHard 6 \xC2\xB7 maxSingleLot 1.00 \xC2\xB7 daily loss % \xC2\xB7 basket stop loss \xC2\xB7 margin guards \xC2\xB7 allowRealAccount \xC2\xB7 cell policies (gap / lot / levels / exit). Switch sirf mode batata hai -- veto ko override nahi karta.");
+    ImGui::TextDisabled("Design-only (abhi selectable nahi): erMode 3 -- ATR percentile breaker. Sirf tab milega jab trainer experiment 5 strict gates pass kare. Breaker 2.25x pehle test ho kar fail ho chuka hai -- dobara propose nahi kiya jata.");
+}
+
+AssistantRole DashboardWindow::assistantRole(const std::optional<LiveSnapshot>& snap) const {
+    if (settingsLoaded_) return editSettings_.assistantRole;
+    if (snap) return snap->settings.assistantRole;
+    return AssistantRole::Owner;
+}
+
+// v0.4.0 Section 4.4: the allowlist. ONLY these fields go into a Gemini
+// prompt -- never keys, account numbers, balances, equity, margin,
+// passwords, or file dumps, even if the user asks for them.
+std::string DashboardWindow::buildAssistantContext(const std::optional<LiveSnapshot>& snap) const {
+    if (!snap) return "Bot connected nahi hai.";
+    std::string c;
+    c += "Brain: " + snap->brainStatus + "\n";
+    if (!snap->brainDetail.empty()) c += "Brain detail: " + snap->brainDetail + "\n";
+    if (!snap->brainBlockedWhy.empty()) {
+        c += "Brain blocked (" + std::string(brainBlockedReasonName(snap->brainBlockedBy)) +
+             "): " + snap->brainBlockedWhy + "\n";
+    }
+    if (!snap->brainBlockedAt.empty()) c += "Last veto at: " + snap->brainBlockedAt + "\n";
+    c += "Market: " + snap->marketRead + " (score " + std::to_string(snap->marketScore) + ")\n";
+    c += "Market status: " + snap->market.label + " -- " + snap->market.detail + "\n";
+    if (!snap->market.holidayName.empty()) c += "Holiday: " + snap->market.holidayName + "\n";
+    if (!snap->brainTrainingResult.empty()) c += "Last training: " + snap->brainTrainingResult + "\n";
+    const auto& lt = snap->brainLastTrain;
+    if (lt.ran) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "Last training structured: gates %s, adopted %s, v2 total %+.2f, locks %d, DD %.2f, %d/%d periods up, held-out %+.2f (%d locks), bars %llu\n",
+                      lt.gatesPassed ? "PASSED" : "FAILED", lt.adopted ? "yes" : "no", lt.totalPnl, lt.locks,
+                      lt.maxDrawdown, lt.brainPeriodsUp, lt.periods, lt.heldOutPnl, lt.heldOutLocks,
+                      static_cast<unsigned long long>(lt.bars));
+        c += buf;
+    }
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "Brain today: %d cycles, %d wins, %d locks\n", snap->brainCyclesToday,
+                      snap->brainWinsToday, snap->brainLocksToday);
+        c += buf;
+    }
+    int shown = 0;  // last 5 audit lines that are errors/warnings (text only)
+    for (auto it = snap->auditLog.rbegin(); it != snap->auditLog.rend() && shown < 5; ++it) {
+        if (it->level < 1) continue;
+        c += "Audit: " + it->text + "\n";
+        ++shown;
+    }
+    const muuk::ctrader_fix::RiskPreset preset = muuk::ctrader_fix::riskPresetFor(snap->settings.riskAppetite);
+    {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Risk appetite: %s (worst lock $%.0f, at most %d levels, daily loss %.0f%%)\n",
+                      muuk::ctrader_fix::riskAppetiteName(snap->settings.riskAppetite), preset.maxLockCost,
+                      preset.maxLevels, preset.dailyLossPercent);
+        c += buf;
+    }
+    c += std::string("App version: ") + kMuukVersion + "\n";
+    c += "Brain file: " + snap->settings.brainFile + "\n";
+    return c;
+}
+
+void DashboardWindow::sendAssistantMessage(const std::optional<LiveSnapshot>& snap) {
+    const auto trim = [](std::string s) {
+        const std::size_t first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const std::size_t last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    };
+    std::string question = trim(std::string(assistantInput_.data()));
+    if (question.empty() || assistantWaiting_) return;
+    const double now = ImGui::GetTime();
+    if (now - assistantSentAt_ < 5.0) {
+        assistantStatus_ = "Thodi der ruken -- sawalon ke beech 5 second ka gap hai.";
+        return;
+    }
+    // The key is read-only here: it goes to the client constructor only --
+    // never into a prompt, never into a log, never displayed.
+    const std::string key = editSettings_.keys.gemini;
+    if (key.empty()) {
+        assistantStatus_ = "Gemini key nahi hai -- Keys popup mein key daalein.";
+        return;
+    }
+    const std::string context = buildAssistantContext(snap);
+    const std::string prompt = question + "\n\n--- Bot context ---\n" + context;
+    // Safety net (design Section 5.3, risk 4): the prompt must never carry
+    // the key. The key is never put in it, but refuse rather than send if
+    // it ever appears (e.g. pasted by the user into the question).
+    if (prompt.find(key) != std::string::npos) {
+        assistantStatus_ = "Sawal mein key jaisi cheez hai -- key kabhi assistant ko nahi bheji jati.";
+        return;
+    }
+    // 5-minute cache: same question + same context -> the old reply.
+    const std::string cacheKey = question + "\n" + context;
+    if (cacheKey == assistantCacheKey_ && now - assistantCacheAt_ < 300.0 && !assistantCachedReply_.empty()) {
+        assistantMessages_.push_back(AssistantMessage{true, question});
+        assistantMessages_.push_back(AssistantMessage{false, assistantCachedReply_});
+        assistantInput_[0] = '\0';
+        return;
+    }
+    assistantMessages_.push_back(AssistantMessage{true, question});
+    assistantInput_[0] = '\0';
+    assistantSentAt_ = now;
+    assistantWaiting_ = true;
+    assistantStatus_.clear();
+    assistantPendingCacheKey_ = cacheKey;
+    // Background thread (std::async): the render thread never blocks on the
+    // network. ask() uses GeminiClient::kDefaultSystemPrompt -- the exact
+    // Section 4.5 wording -- and the client's own retries/backoff (4.3).
+    assistantFuture_ = std::async(std::launch::async, [key, prompt] {
+        muuk::ctrader_fix::GeminiClient client(key);
+        return client.ask(prompt);
+    });
+}
+
+void DashboardWindow::pollAssistantReply() {
+    if (!assistantWaiting_ || !assistantFuture_.valid()) return;
+    if (assistantFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    muuk::ctrader_fix::GeminiResponse resp = assistantFuture_.get();
+    assistantWaiting_ = false;
+    if (resp.ok) {
+        assistantMessages_.push_back(AssistantMessage{false, resp.text});
+        assistantCacheKey_ = assistantPendingCacheKey_;
+        assistantCachedReply_ = resp.text;
+        assistantCacheAt_ = ImGui::GetTime();
+        assistantStatus_.clear();
+    } else {
+        // resp.error is the Section 4.3 one-liner from the client
+        // (InvalidKey / RateLimited / Blocked / model-not-found / network).
+        assistantMessages_.push_back(AssistantMessage{false, resp.error});
+        assistantStatus_ = resp.error;
+    }
+}
+
+// v0.4.0 Section 4.6: every confirmed assistant write lands here, one
+// JSON line per write, best-effort (never throws). Same folder pattern as
+// the brain journal: muuk_history/<config>.assistant_log.jsonl beside the
+// account config (brainJournalFileFor, filename swapped). Keys/passwords
+// never appear in this log -- the assistant cannot change them at all.
+void DashboardWindow::appendAssistantLog(const std::string& field, double oldValue, double newValue) {
+    try {
+        if (configPathBuffer_[0] == '\0') return;
+        std::filesystem::path path = muuk::ctrader_fix::brainJournalFileFor(configPathBuffer_.data());
+        std::string name = path.filename().string();
+        const std::string suffix = ".brain_journal.jsonl";
+        if (name.size() <= suffix.size() || !name.ends_with(suffix)) return;
+        name.replace(name.size() - suffix.size(), suffix.size(), ".assistant_log.jsonl");
+        path.replace_filename(name);
+        std::error_code ec;
+        if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+        std::ofstream out(path, std::ios::app);
+        if (!out) return;
+        const std::time_t now = std::time(nullptr);
+        const std::tm* tmUtc = std::gmtime(&now);  // render thread only
+        char ts[32] = "";
+        if (tmUtc != nullptr) std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tmUtc);
+        char line[512];
+        std::snprintf(line, sizeof(line),
+                      "{\"ts\":\"%s\",\"event\":\"setting_change\",\"field\":\"%s\",\"old\":%.10g,\"new\":%.10g,"
+                      "\"by\":\"assistant\",\"confirmed\":true}\n",
+                      ts, field.c_str(), oldValue, newValue);
+        out << line;
+    } catch (...) {
+        // Logging must never break the UI.
+    }
+}
+
+// v0.4.0 Section 4.5-4.7: the Assistant tab. Chat is this session only
+// (never persisted). Calls happen only on user Send (or a suggested
+// question) -- never per cycle -- and on a background thread (see
+// sendAssistantMessage/pollAssistantReply). On non-Windows the client
+// reports NotSupported; the dashboard itself is Windows-only anyway.
+void DashboardWindow::renderAssistantTab(LiveController& controller, const std::optional<LiveSnapshot>& snap,
+                                         bool connected) {
+    beginPage("assistant_scroll");
+    pollAssistantReply();
+    withFont(boldFont_, [] {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Assistant");
+    });
+    ImGui::TextDisabled("Gemini (free tier) -- jawab context par mabni hai, trading advice nahi.");
+    const AssistantRole role = assistantRole(snap);
+    if (role == AssistantRole::Owner) {
+        ImGui::TextDisabled("Role: Owner -- full access (har write ke liye confirmation lazmi hai).");
+    } else {
+        ImGui::TextDisabled("Role: User (restricted) -- sirf samajh sakte hain, settings nahi badal sakte.");
+    }
+    if (editSettings_.keys.gemini.empty()) {
+        ImGui::TextDisabled("Gemini: no key -- Keys popup mein key daalein");
+    } else {
+        ImGui::TextDisabled("Gemini: ready (model %s, key %s)", muuk::ctrader_fix::GeminiClient::kDefaultModel,
+                            muuk::ctrader_fix::maskApiKey(editSettings_.keys.gemini).c_str());
+    }
+
+    ImGui::BeginChild("assistant_chat", ImVec2(0, 300), ImGuiChildFlags_Border, ImGuiWindowFlags_None);
+    for (const auto& m : assistantMessages_) {
+        if (m.fromUser) {
+            ImGui::TextColored(kBlue, "You:");
+            ImGui::TextWrapped("%s", m.text.c_str());
+        } else {
+            ImGui::TextColored(kViolet, "Assistant:");
+            ImGui::TextWrapped("%s", m.text.c_str());
+            ImGui::TextDisabled("Gemini (free tier) -- jawab context par mabni hai, trading advice nahi.");
+        }
+        ImGui::Spacing();
+    }
+    if (assistantWaiting_) ImGui::TextDisabled("Assistant likh raha hai...");
+    if (!assistantStatus_.empty()) ImGui::TextColored(kAmber, "%s", assistantStatus_.c_str());
+    if (assistantMessages_.size() != assistantShown_) {
+        ImGui::SetScrollHereY(1.0f);
+        assistantShown_ = assistantMessages_.size();
+    }
+    ImGui::EndChild();
+
+    const bool hasKey = !editSettings_.keys.gemini.empty();
+    ImGui::BeginDisabled(!hasKey || assistantWaiting_);
+    ImGui::SetNextItemWidth(-90.0f);
+    const bool sendPressed =
+        ImGui::InputTextWithHint("##assistantinput", "Sawal likhein...", assistantInput_.data(),
+                                 assistantInput_.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (glass::button("Send", kBlue, ImVec2(80.0f, 0)) || sendPressed) sendAssistantMessage(snap);
+    ImGui::EndDisabled();
+    if (!hasKey) ImGui::TextDisabled("Gemini key nahi hai -- Keys popup mein key daalein.");
+
+    auto askSuggested = [this, &snap](const char* q) {
+        std::snprintf(assistantInput_.data(), assistantInput_.size(), "%s", q);
+        sendAssistantMessage(snap);
+    };
+    ImGui::TextDisabled("Suggested:");
+    ImGui::SameLine();
+    if (glass::button("Aaj cycle kyun nahi khula?", glass::palette().neutral)) askSuggested("Aaj cycle kyun nahi khula?");
+    ImGui::SameLine();
+    if (glass::button("Last training kyun fail hui?", glass::palette().neutral)) askSuggested("Last training kyun fail hui?");
+    if (snap && snap->brainLocksToday > 0) {
+        ImGui::SameLine();
+        if (glass::button("Aaj basket lock kyun hua?", glass::palette().neutral)) askSuggested("Aaj basket lock kyun hua?");
+    }
+
+    // Brain actions through the assistant (Section 4.6): RefreshBrain is
+    // allowed for both roles; TrainBrain is a core change (a run can adopt
+    // a new brain), so a non-owner is refused here, not just hidden.
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Brain actions"); });
+    ImGui::BeginDisabled(!connected || !snap);
+    if (glass::button("Refresh brain", glass::palette().neutral)) {
+        if (assistantActionAllowed(role, AssistantAction::RefreshBrain)) {
+            controller.refreshBrain();
+            assistantStatus_ = "Brain refresh kar diya.";
+        } else {
+            assistantStatus_ = "Aap ke role mein ye setting nahi badli ja sakti -- owner se poochhein.";
+        }
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(snap && !snap->brainTraining.empty());
+    if (glass::button("Train brain", kAmber)) {
+        if (assistantActionAllowed(role, AssistantAction::TrainBrain)) {
+            controller.trainBrain(editSettings_.trainerHistoryPath);
+            assistantStatus_ = "Training shuru ho gayi -- bot apna current brain chalata rahega.";
+        } else {
+            assistantStatus_ = "Aap ke role mein ye setting nahi badli ja sakti -- owner se poochhein.";
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
+    // Change proposal (Section 4.6): the assistant's reply can suggest a
+    // change, but free text is never parsed into a write -- the operator
+    // picks the field and the new value here, sees old -> new on a
+    // confirmation card, and only Confirm applies it (via quickApply, the
+    // same path the SaveBar uses) and logs it. ChangeRiskAppetite has no
+    // proposer here yet (it moves the cap preset); it is still enforced in
+    // assistantActionAllowed().
+    ImGui::Spacing();
+    withFont(boldFont_, [] { ImGui::TextUnformatted("Setting change (confirmation ke saath)"); });
+    ImGui::TextDisabled("Assistant se poochhein ke kya badalna chahiye -- phir yahan field aur nayi value chun kar propose karein. Apply sirf Confirm par hoga, aur har change assistant_log.jsonl mein likha jayega.");
+    const char* changeFields[] = {"Daily loss limit (% of balance)", "Basket stop loss ($)", "Max single lot",
+                                  "ER mode (fallback)"};
+    ImGui::Combo("##assistantchangefield", &assistantChangeField_, changeFields, 4);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputDouble("##assistantchangevalue", &assistantChangeValue_, 0.1, 1.0, "%.2f");
+    ImGui::SameLine();
+    if (glass::button("Propose change", glass::palette().neutral)) {
+        const LiveSettings& base = connected && snap ? snap->settings : editSettings_;
+        AssistantAction action = AssistantAction::Explain;
+        double oldValue = 0.0;
+        double newValue = assistantChangeValue_;
+        switch (assistantChangeField_) {
+            case 0:
+                action = AssistantAction::ChangeDailyLossPercent;
+                oldValue = base.dailyLossPercent;
+                newValue = std::clamp(newValue, 0.0, 100.0);
+                break;
+            case 1:
+                action = AssistantAction::ChangeStopLoss;
+                oldValue = base.stopLoss;
+                newValue = std::max(0.0, newValue);
+                break;
+            case 2:
+                action = AssistantAction::ChangeMaxLot;
+                oldValue = base.maxLot;
+                newValue = std::clamp(newValue, 0.01, muuk::ctrader_fix::kHardMaxLot);
+                break;
+            case 3:
+            default:
+                action = AssistantAction::ChangeErMode;
+                oldValue = static_cast<double>(base.erMode);
+                newValue = static_cast<double>(std::clamp(static_cast<int>(std::lround(newValue)), 0, 3));
+                break;
+        }
+        if (!assistantActionAllowed(role, action)) {
+            assistantStatus_ = "Aap ke role mein ye setting nahi badli ja sakti -- owner se poochhein.";
+            assistantChangePending_ = false;
+        } else {
+            assistantChangeAction_ = action;
+            assistantChangeFieldName_ = changeFields[assistantChangeField_];
+            assistantChangeOld_ = oldValue;
+            assistantChangeNew_ = newValue;
+            assistantChangePending_ = true;
+            assistantStatus_.clear();
+        }
+    }
+    if (assistantChangePending_) {
+        ImGui::Spacing();
+        withFont(boldFont_, [] { ImGui::TextUnformatted("Change karna hai?"); });
+        ImGui::Text("Field: %s", assistantChangeFieldName_.c_str());
+        if (assistantChangeAction_ == AssistantAction::ChangeErMode) {
+            ImGui::Text("Old: %.0f  \xE2\x86\x92  New: %.0f", assistantChangeOld_, assistantChangeNew_);
+        } else {
+            ImGui::Text("Old: %.2f  \xE2\x86\x92  New: %.2f", assistantChangeOld_, assistantChangeNew_);
+        }
+        if (glass::button("Confirm", kGreen)) {
+            const AssistantAction action = assistantChangeAction_;
+            const double newValue = assistantChangeNew_;
+            const double oldValue = assistantChangeOld_;
+            const std::string fieldName = assistantChangeFieldName_;
+            assistantChangePending_ = false;
+            // Re-checked at dispatch (never rely on the button being hidden).
+            if (!assistantActionAllowed(role, action)) {
+                assistantStatus_ = "Aap ke role mein ye setting nahi badli ja sakti -- owner se poochhein.";
+            } else {
+                const char* logField = action == AssistantAction::ChangeDailyLossPercent ? "dailyLossPercent"
+                                     : action == AssistantAction::ChangeStopLoss         ? "stopLoss"
+                                     : action == AssistantAction::ChangeMaxLot           ? "maxLot"
+                                                                                         : "erMode";
+                quickApply(controller, snap, connected, [action, newValue](LiveSettings& s) {
+                    switch (action) {
+                        case AssistantAction::ChangeDailyLossPercent: s.dailyLossPercent = newValue; break;
+                        case AssistantAction::ChangeStopLoss: s.stopLoss = newValue; break;
+                        case AssistantAction::ChangeMaxLot: s.maxLot = newValue; break;
+                        case AssistantAction::ChangeErMode: s.erMode = static_cast<int>(std::lround(newValue)); break;
+                        default: break;
+                    }
+                });
+                appendAssistantLog(logField, oldValue, newValue);
+                assistantStatus_ = "Change apply ho gaya: " + fieldName;
+            }
+        }
+        ImGui::SameLine();
+        if (glass::button("Cancel", glass::palette().neutral)) assistantChangePending_ = false;
+    }
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Free tier par prompts Google ki products behtar banane ke liye istemal ho sakte hain -- is liye assistant ko kabhi keys, account numbers ya balances nahi bheje jate.");
+    endPage();
+}
+
+// API keys (Gemini / FRED / Finnhub): stored only in this config file
+// (my_account.local.json) -- never in the repo, never logged -- and
+// shown masked. The Gemini key is what the brain's news/event
+// understanding (Phase 5) will call with.
+void DashboardWindow::renderKeysPopup(LiveController& controller, const std::optional<LiveSnapshot>& snap,
+                                      bool connected) {
+    if (!ImGui::BeginPopupModal("API keys", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    LiveSettings& s = editSettings_;
     ImGui::TextUnformatted("Keys");
     ImGui::TextDisabled("API keys for the brain and data feeds. Stored only in this config file -- never in the "
                         "repo, never logged. Leave empty if unused.");
@@ -1945,6 +2733,34 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
     keyRow("Finnhub API key",
            "Finnhub (free tier): news and the economic calendar for the news guard.",
            "finnhub", finnhubKeyBuffer_, &s.keys.finnhub);
+    renderSaveBar(controller, snap, connected);
+    if (glass::button("Close", glass::palette().neutral)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+// Market hours & news settings, as a popup (opened from the News tab and
+// from Settings). The form itself is renderMarketSettings(), unchanged.
+void DashboardWindow::renderMarketHoursPopup(LiveController& controller, const std::optional<LiveSnapshot>& snap,
+                                             bool connected) {
+    if (!ImGui::BeginPopupModal("Market hours & news", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    ImGui::BeginDisabled(!settingsLoaded_);
+    renderMarketSettings();
+    ImGui::EndDisabled();
+    renderSaveBar(controller, snap, connected);
+    if (glass::button("Close", glass::palette().neutral)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void DashboardWindow::renderSettingsPanel(LiveController& controller, const std::optional<LiveSnapshot>& snap,
+                                          bool connected) {
+    beginPage("settings_scroll");
+    // Step 4: one Brain panel (the Brain tab) holds all of the bot's core settings. `s` lives
+    // at function scope so the Fallback table below edits the same settings.
+    LiveSettings& s = editSettings_;
+    renderAccountSection(controller.isRunning());
+    ImGui::Spacing();
+    renderThisPcSection();
+    ImGui::Spacing();
 
     // Removed in Step 4 -- what replaced each option:
     ImGui::Spacing();
@@ -1953,10 +2769,11 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
     ImGui::TextDisabled("  First order with the trend: Both stays -- Step 3 showed a forced first side loses.");
     ImGui::TextDisabled("  Target move = half the range: the brain's exit decides; fallback uses Profit target.");
     ImGui::TextDisabled("  Auto profit target: fixed Profit target / Last-lot target only.");
-    ImGui::TextDisabled("  Max basket loss: merged into the stop loss above -- a basket closes at the stop loss.");
-    ImGui::TextDisabled("  Lot growth presets: replaced by the Risk appetite knob above.");
+    ImGui::TextDisabled("  Max basket loss: merged into the stop loss in the Brain tab -- a basket closes at the stop loss.");
+    ImGui::TextDisabled("  Lot growth presets: replaced by the Risk appetite knob in the Brain tab.");
     ImGui::TextDisabled("  Range from ATR: still here, in Fallback below -- it only ever set the fallback width.");
 
+    ImGui::BeginDisabled(!settingsLoaded_);
     // --- Fallback: only when the brain is off or has no trained file.
     ImGui::Spacing();
     withFont(boldFont_, [] {
@@ -2107,8 +2924,11 @@ void DashboardWindow::renderSettingsPanel(LiveController& controller, const std:
     }
     ImGui::EndDisabled();
     ImGui::Spacing();
-    ImGui::TextDisabled("Lot sizes, loss limits, lock, margin guards and escape: the Risk & capital page. Market "
-                        "hours and the news guard: the News & hours page.");
+    ImGui::TextDisabled("Lot sizes, loss limits, lock, margin guards and escape: the Risk & capital page. "
+                        "Brain settings: the Brain tab.");
+    if (glass::button("Risk & capital...", kBlue)) selectTab_ = Tab::Risk;
+    ImGui::SameLine();
+    if (glass::button("Market hours & news settings...", kBlue)) ImGui::OpenPopup("Market hours & news");
     renderSaveBar(controller, snap, connected);
     endPage();
 }
@@ -2882,7 +3702,8 @@ void DashboardWindow::selectTabByName(const std::string& name) {
                                                 {"history", Tab::History},     {"news", Tab::News},
                                                 {"risk", Tab::Risk},
                                                 {"audit", Tab::Audit},         {"volume", Tab::Volume},
-                                                {"performance", Tab::Performance}, {"settings", Tab::Settings},
+                                                {"performance", Tab::Performance}, {"brain", Tab::Brain},
+                                                {"assistant", Tab::Assistant}, {"settings", Tab::Settings},
                                                 {"log", Tab::Log}};
     for (const auto& [n, t] : tabs) {
         if (name == n) selectTab_ = t;
@@ -4063,15 +4884,10 @@ void DashboardWindow::renderNewsTab(LiveController& controller, const std::optio
     const MarketHoursConfig& mc = s.market;
     const int64_t now = muuk::ctrader_fix::utcNowMs();
 
-    // Every market-hours and news setting lives here (and only here).
-    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-    if (ImGui::CollapsingHeader("Market hours & news settings")) {
-        ImGui::BeginDisabled(!settingsLoaded_);
-        renderMarketSettings();
-        ImGui::EndDisabled();
-        renderSaveBar(controller, snap, connected);
-        ImGui::Spacing();
-    }
+    // Market-hours and news settings live in a popup (one SaveBar per surface).
+    if (glass::button("Market hours & news settings...", kBlue)) ImGui::OpenPopup("Market hours & news");
+    ImGui::SetItemTooltip("When new ranges may open, and the news guard.");
+    ImGui::Spacing();
 
     const bool guard = mc.newsGuard;
     ImGui::AlignTextToFramePadding();
@@ -4767,18 +5583,16 @@ void DashboardWindow::renderRiskCalculator(const std::optional<LiveSnapshot>& sn
                    &s.maxOrders, &settingsDirty_);
         s.maxOrders = std::clamp(s.maxOrders, 1,
                                  muuk::ctrader_fix::riskPresetFor(s.riskAppetite).maxLevels);
-        settingDouble("Max lot",
-                      "No single order bigger than this; the level that would need more is not placed. Hard cap "
-                      "1.00 (the broker's largest lot still applies).",
-                      &s.maxLot, 0.10, "%.2f", &settingsDirty_);
         s.maxLot = std::clamp(s.maxLot, 0.01, muuk::ctrader_fix::kHardMaxLot);
 
         // --- Loss limits.
         section("Loss limits", "0 = off; they apply at once");
-        settingDouble("Stop loss",
-                      "When the basket's net falls to minus this: every position is closed and every pending order "
-                      "cancelled -- the loss is taken instead of growing.",
-                      &s.stopLoss, 5.0, "%.2f", &settingsDirty_);
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Stop loss is set in the Brain tab (Hard caps).");
+        }
         settingDouble("Lock & pause at loss",
                       "When the basket's net reaches minus this: pending orders are cancelled and one opposite order "
                       "freezes the loss (a hedge). The bot then waits for you -- the loss doesn't go away, and swap "
@@ -4815,7 +5629,7 @@ void DashboardWindow::renderRiskCalculator(const std::optional<LiveSnapshot>& sn
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("Max basket loss is merged into the stop loss above (Step 4): a basket closes at "
+            ImGui::TextDisabled("Max basket loss is merged into the stop loss in the Brain tab (Step 4): a basket closes at "
                                 "the stop loss instead of only blocking new levels.");
         }
         {

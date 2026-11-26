@@ -271,6 +271,15 @@ struct RiskPreset {
 [[nodiscard]] const char* riskAppetiteName(RiskAppetite appetite);  // "cautious" / "balanced" / "aggressive"
 [[nodiscard]] RiskAppetite riskAppetiteFromString(const std::string& name);  // unknown -> Balanced
 
+// Assistant role (v0.4.0 design Section 4.6): who may change settings
+// through the in-app AI assistant. Owner = full access (every write still
+// needs an explicit in-app confirmation); User = explain-only, no core
+// brain/settings writes. Default Owner: the current single-user install
+// is the owner, and a config file without the flag loads as Owner.
+enum class AssistantRole { Owner = 0, User = 1 };
+[[nodiscard]] const char* assistantRoleName(AssistantRole role);  // "owner" / "user"
+[[nodiscard]] AssistantRole assistantRoleFromString(const std::string& name);  // unknown -> Owner
+
 // The largest single order, ever, in lots (research doc D9). The brain can
 // never place above it; the engine refuses any order that would need more.
 inline constexpr double kHardMaxLot = 1.0;
@@ -325,6 +334,7 @@ struct LiveConfig {
     BrainConfig brain;         // "brain" in the file
     RiskConfig risk;           // "risk" in the file: the appetite knob + daily-loss %
     ApiKeys keys;              // "keys" in the file: gemini / fred / finnhub, all optional
+    AssistantRole assistantRole = AssistantRole::Owner;  // "assistantRole" in the file: "owner" | "user"
 };
 
 // The operator-tunable subset of LiveConfig, in plain human units (lots,
@@ -383,6 +393,7 @@ struct LiveSettings {
     bool regimeRanges = false;  // smart ranges (chart): place each new range on the market's own high/low.
     // Defaults OFF: both chart placements lost in backtest (see replayCycleV2), so the live bot stays centered.
     ApiKeys keys;  // API keys: Gemini / FRED / Finnhub (local config only, shown masked)
+    AssistantRole assistantRole = AssistantRole::Owner;  // mirrored from LiveConfig: the dashboard enforces owner vs user
     MarketHoursConfig market;
 };
 

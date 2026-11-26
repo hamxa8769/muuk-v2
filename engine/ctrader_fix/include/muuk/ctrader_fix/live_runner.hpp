@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -154,6 +155,51 @@ struct BrokerAccountInfo {
 // account); only the figures themselves may be zero.
 BrokerAccountInfo parseBrokerAccountInfo(const FixMessage& msg);
 
+// One brain cell, as the dashboard draws it. A plain copy of BrainV2Cell
+// (market_brain_v2.hpp) plus the live veto flag: the dashboard must never
+// read the keeper's brain_ directly.
+struct BrainCellView {
+    int index = 0;              // 0..80 (vol*27 + trend*9 + chop*3 + session)
+    int samples = 0;
+    int gapChoice = -1;         // -1 = no trade in this state
+    double lotMultiplier = 1.0;
+    int maxLevels = 3;
+    double exitFactor = 1.0;
+    double meanPnl = 0.0;       // replay units, per 0.01 lot start
+    int locks = 0;
+    double lockRate = 0.0;
+    double meanLockLoss = 0.0;
+    double score = 0.0;
+    int firstSide = 0;          // -1 Sell, 0 Both, 1 Buy, 2 TrendFirst (resolved per cycle)
+    bool vetoedLive = false;    // online learning vetoed this cell (score <= 0 or lockRate > maxLockRate)
+};
+
+// One cell's live tally, from the journal (dashboard) / the runner's own count.
+struct BrainCellTally {
+    int cycles = 0;
+    int wins = 0;
+    int locks = 0;
+    double netReplay = 0.0;     // replay units, per 0.01 lot start
+};
+
+// The last finished training run, structured (no string parsing).
+struct BrainTrainView {
+    bool ran = false;
+    bool adopted = false;
+    bool gatesPassed = false;
+    bool better = false;        // walk-forward better than fixed and v1
+    bool ddGate = false;        // drawdown <= 50% of v1's
+    bool lockGate = false;      // locks <= 50% of v1's
+    int periods = 0;
+    int brainPeriodsUp = 0;
+    double totalPnl = 0.0;      // walk-forward v2 total
+    int locks = 0;
+    double maxDrawdown = 0.0;
+    double heldOutPnl = 0.0;
+    int heldOutLocks = 0;
+    std::size_t bars = 0;       // bars the run trained on
+};
+
 // A point-in-time read of LiveRunner's state, for a UI (or anything else)
 // to poll without needing its own hooks into the engine internals. Built
 // from the same data onQuoteMessage/onTradeMessage already maintain, so
@@ -274,6 +320,18 @@ struct LiveSnapshot {
     int brainCyclesToday = 0;             // brain-driven baskets closed today (wins/locks below)
     int brainWinsToday = 0;               // of those, closed with net > 0
     int brainLocksToday = 0;              // of those, locked
+    std::array<BrainCellView, 81> brainCells;   // Gap 1: the whole policy table
+    bool brainCellsValid = false;               // false = no trained brain (grid shows the fallback text)
+    int brainTrainedBars = 0;                   // Gap 4: keeper trainedBars(), as a number
+    int brainTotalBars = 0;                     // Gap 2 (total): rows in bars_live.csv (keeper counts)
+    int brainNewBars = 0;                       // Gap 2 (progress): bars since the last training run
+    BrainTrainView brainLastTrain;              // Gap 3: structured last-train result
+    int brainCurrentCell = -1;                  // Gap 5: cell of the running cycle, -1 when idle
+    int brainLastCell = -1;                     // Gap 5: cell of the last decided cycle (trade or veto)
+    int brainBlockedBy = 0;                     // Gap 5: BrainBlockReason as int (0 None, 1 NotTrained, ...)
+    std::string brainBlockedWhy;                // Gap 5: decision.why, e.g. "ATR 2.67 is 2.3x the training high-vol threshold 1.15"
+    std::string brainBlockedAt;                 // Gap 5: local time of the last veto ("14:32:05"), "" if none
+    std::array<BrainCellTally, 81> brainCellTally;  // Gap 6: per-cell live outcomes this session
     std::string regimeStatus;             // Smart ranges: the chart read behind the current range, "" while centered
     // MT5 through the bridge: the account as MT5 reports it (exact balance,
     // equity, margin and swap). brokerAccountFresh: heard from in the last 15 s.
@@ -988,6 +1046,17 @@ private:
     bool closedForPause_ = false;    // closeRangeAt already acted on this pause
     void updateMarket();             // takes engineMutex_ itself
     bool marketBlocksLocked();       // true (and logs once) while no new range may open
+    // Holiday reopen hold (engineMutex_): the last mid before a holiday
+    // halt, and the wait after the reopen until the gap/spread settles.
+    // Only new ranges wait -- a running basket is never touched.
+    double preHaltClose_ = 0.0;
+    bool preHaltCloseKnown_ = false;
+    std::string preHaltHoliday_;     // the holiday just halted / about to halt
+    bool holidayArmed_ = false;      // a holiday halt/pause was seen; the reopen not yet
+    bool reopenHoldActive_ = false;  // reopened after a holiday: new ranges wait
+    std::chrono::steady_clock::time_point reopenHoldSince_{};
+    std::string reopenHoldReason_;   // the current wait reason (also entryWait_)
+    [[nodiscard]] bool reopenHoldLocked();  // true while the reopen hold blocks a new range
     void closeRangeLocked(bool reopen, const std::string& reason);
     int reopenCooldownSeconds_ = 0;
     bool spreadWaitLogged_ = false;
@@ -1033,6 +1102,14 @@ private:
     bool brainCycleActive_ = false;   // the running cycle uses the brain's policy
     muuk::core::BrainV2Decision brainDecision_;  // the policy this cycle runs on
     muuk::core::SituationV2 brainSituation_;    // the situation it was decided in
+    // v0.4.0: the last cycle decision, trade or veto, so the Brain tab can
+    // show the current cell and the veto reason while idle (gap 5).
+    // decideBrainCycleLocked() sets both on every decision; only the time
+    // is veto-only (first veto log, so it does not change every tick).
+    muuk::core::SituationV2 brainLastSituation_;
+    muuk::core::BrainV2Decision brainLastDecision_;
+    bool brainHasLastDecision_ = false;
+    std::string brainLastDecisionAt_;  // local "HH:MM:SS" of the last veto, "" = none yet
     bool hasLastBasket_ = false;      // a basket has closed since this runner started
     double lastBasketNet_ = 0.0;      // its net, for the brain's recent-outcome gate
     bool lastBasketLocked_ = false;   // it locked
@@ -1043,6 +1120,7 @@ private:
     int brainWinsToday_ = 0;         // of those, closed with net > 0
     int brainLocksToday_ = 0;        // of those, locked
     std::string brainTallyDay_;      // local date the tally above counts for; "" = none yet
+    std::array<BrainCellTally, 81> brainCellTally_{};  // v0.4.0: per-cell live outcomes today (gap 6)
 };
 
 }  // namespace muuk::ctrader_fix

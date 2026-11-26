@@ -6,13 +6,13 @@
       "fixPort": 5301,
       "autoStart": true,
       "terminal": "",
-      "login": "YOUR_MT5_ACCOUNT_NUMBER",
-      "server": "YOUR_BROKER-Demo",
+      "login": "",
+      "server": "",
       "chartSymbol": "XAUUSD",
-      "password": "YOUR_MT5_PASSWORD_OR_LEAVE_EMPTY_TO_USE_THE_ACCOUNT_MT5_LAST_USED"
+      "password": ""
     },
     "environment": "demo",
-    "traderLogin": "YOUR_MT5_ACCOUNT_NUMBER",
+    "traderLogin": "",
     "symbolName": "XAUUSD",
     "autoRangeWidthPoints": 2.0,
     "accountKind": "cent",

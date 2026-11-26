@@ -18,10 +18,26 @@ void requireNonEmpty(const std::string& value, const std::string& fieldPath) {
     }
 }
 
+// A shipped template (or a hand edit) can still carry a placeholder
+// string -- "REPLACE_WITH_...", "OPTIONAL_..." or "YOUR_..." -- which is
+// an instruction to the user, never a credential or an address. Treat it
+// as empty everywhere, so it is never stored, displayed, or dialled.
+bool isPlaceholderValue(const std::string& value) {
+    return value.find("REPLACE_WITH") != std::string::npos || value.rfind("OPTIONAL_", 0) == 0 ||
+           value.rfind("YOUR_", 0) == 0;
+}
+
+std::string sanitized(const std::string& value) {
+    return isPlaceholderValue(value) ? std::string{} : value;
+}
+
 FixEndpoint parseEndpoint(const nlohmann::json& j, const std::string& fieldPath) {
     FixEndpoint endpoint;
-    endpoint.host = j.value("host", "");
-    endpoint.port = j.value("port", "");
+    // A placeholder host/port is an unfilled template, not an address:
+    // sanitise first so requireNonEmpty below refuses it with a clear
+    // error instead of dialling a bogus host.
+    endpoint.host = sanitized(j.value("host", ""));
+    endpoint.port = sanitized(j.value("port", ""));
     requireNonEmpty(endpoint.host, fieldPath + ".host");
     requireNonEmpty(endpoint.port, fieldPath + ".port");
     return endpoint;
@@ -113,6 +129,15 @@ RiskAppetite riskAppetiteFromString(const std::string& name) {
     return RiskAppetite::Balanced;  // "balanced" and anything unknown
 }
 
+const char* assistantRoleName(AssistantRole role) {
+    return role == AssistantRole::User ? "user" : "owner";
+}
+
+AssistantRole assistantRoleFromString(const std::string& name) {
+    if (name == "user") return AssistantRole::User;
+    return AssistantRole::Owner;  // "owner" and anything unknown (incl. old files: missing = Owner)
+}
+
 double effectiveDailyLossLimitMoney(double dailyLossPercent, double dailyLossLimitMoney, double balance) {
     if (dailyLossPercent > 0.0 && balance > 0.0) return balance * dailyLossPercent / 100.0;
     return dailyLossLimitMoney > 0.0 ? dailyLossLimitMoney : 0.0;
@@ -135,11 +160,11 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
         cfg.connection.mt5EaPort = m.value("eaPort", instance::kDefaultEaPort);
         cfg.connection.mt5FixPort = m.value("fixPort", instance::kDefaultFixPort);
         cfg.connection.mt5AutoStart = m.value("autoStart", true);
-        cfg.connection.mt5Terminal = m.value("terminal", std::string());
-        cfg.connection.mt5Login = jsonStr(m, "login");
-        cfg.connection.mt5Password = m.value("password", std::string());
-        cfg.connection.mt5Server = m.value("server", std::string());
-        cfg.connection.mt5ChartSymbol = m.value("chartSymbol", std::string("XAUUSD"));
+        cfg.connection.mt5Terminal = sanitized(m.value("terminal", std::string()));
+        cfg.connection.mt5Login = sanitized(jsonStr(m, "login"));
+        cfg.connection.mt5Password = sanitized(m.value("password", std::string()));
+        cfg.connection.mt5Server = sanitized(m.value("server", std::string()));
+        cfg.connection.mt5ChartSymbol = sanitized(m.value("chartSymbol", std::string("XAUUSD")));
     }
     const bool mt5 = cfg.connection.isMt5();
     if (mt5) {
@@ -159,14 +184,14 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
         throw std::runtime_error("this config uses the local ports of the production Muuk (5200 / 5201) -- this copy "
                                  "must stay off them: use 5300 / 5301 (connection.mt5.eaPort / fixPort).");
     }
-    cfg.connection.environment = conn.value("environment", std::string("demo"));
-    cfg.connection.brokerUid = conn.value("brokerUid", "");
-    cfg.connection.traderLogin = conn.value("traderLogin", "");
-    cfg.connection.password = conn.value("password", "");
-    cfg.connection.targetCompId = conn.value("targetCompId", std::string("CSERVER"));
+    cfg.connection.environment = sanitized(conn.value("environment", std::string("demo")));
+    cfg.connection.brokerUid = sanitized(conn.value("brokerUid", ""));
+    cfg.connection.traderLogin = sanitized(conn.value("traderLogin", ""));
+    cfg.connection.password = sanitized(conn.value("password", ""));
+    cfg.connection.targetCompId = sanitized(conn.value("targetCompId", std::string("CSERVER")));
     cfg.connection.heartBtIntSeconds = conn.value("heartBtIntSeconds", 30);
-    cfg.connection.symbolName = conn.value("symbolName", std::string("XAUUSD"));
-    cfg.connection.symbolId = conn.value("symbolId", "");
+    cfg.connection.symbolName = sanitized(conn.value("symbolName", std::string("XAUUSD")));
+    cfg.connection.symbolId = sanitized(conn.value("symbolId", ""));
     cfg.connection.autoRangeWidthPoints = conn.value("autoRangeWidthPoints", 0.0);
     cfg.connection.basketCooldownSeconds = conn.value("basketCooldownSeconds", 0);
     cfg.connection.manualCloseCooldownSeconds = conn.value("manualCloseCooldownSeconds", 15);
@@ -182,7 +207,7 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
     cfg.connection.lockAtLevel = std::clamp(conn.value("lockAtLevel", 0), 0, 100);
     cfg.connection.accountBalance = conn.value("accountBalance", 0.0);
     cfg.connection.leverage = conn.value("leverage", 500.0);
-    cfg.connection.accountKind = conn.value("accountKind", std::string("standard"));
+    cfg.connection.accountKind = sanitized(conn.value("accountKind", std::string("standard")));
     if (conn.contains("recovery")) cfg.connection.recovery = recoveryFromJson(conn.at("recovery"));
     if (conn.contains("entry")) cfg.connection.entry = entryFromJson(conn.at("entry"));
     cfg.connection.regimeRanges = conn.value("regimeRanges", false);
@@ -248,9 +273,14 @@ LiveConfig loadLiveConfig(const std::filesystem::path& path) {
     cfg.strategy.autoProfitTarget = false;             // D4: removed (fixed $ or last-lot target only)
     if (j.contains("keys") && j.at("keys").is_object()) {
         const auto& k = j.at("keys");
-        cfg.keys.gemini = k.value("gemini", std::string());
-        cfg.keys.fred = k.value("fred", std::string());
-        cfg.keys.finnhub = k.value("finnhub", std::string());
+        cfg.keys.gemini = sanitized(k.value("gemini", std::string()));
+        cfg.keys.fred = sanitized(k.value("fred", std::string()));
+        cfg.keys.finnhub = sanitized(k.value("finnhub", std::string()));
+    }
+    // v0.4.0 design Section 4.6: missing = Owner (never User) -- an old
+    // config file belongs to the single user who owns this install.
+    if (j.contains("assistantRole") && j.at("assistantRole").is_string()) {
+        cfg.assistantRole = assistantRoleFromString(j.at("assistantRole").get<std::string>());
     }
     // Auto-target levels 20..100 are 200..360 % of the cost.
     cfg.strategy.autoTargetPercent = std::clamp(cfg.strategy.autoTargetPercent, 200.0, 360.0);
@@ -304,6 +334,7 @@ LiveSettings settingsFromConfig(const LiveConfig& config) {
     s.entry = config.connection.entry;
     s.regimeRanges = config.connection.regimeRanges;
     s.keys = config.keys;
+    s.assistantRole = config.assistantRole;
     s.commissionPerLot = config.strategy.costs.commissionPerLotRoundTurn;
     s.commissionPerMillion = config.strategy.costs.commissionPerMillionPerSide;
     s.autoContinue = config.connection.autoContinue;
@@ -417,30 +448,30 @@ AccountSettings accountFromConfigFile(const std::filesystem::path& path) {
     if (!j.contains("connection")) throw std::runtime_error("no \"connection\" section in " + path.string());
     const auto& c = j.at("connection");
     AccountSettings a;
-    a.environment = c.value("environment", std::string("demo"));
-    a.brokerUid = jsonString(c, "brokerUid");
-    a.traderLogin = jsonString(c, "traderLogin");
-    a.targetCompId = c.value("targetCompId", std::string("CSERVER"));
+    a.environment = sanitized(c.value("environment", std::string("demo")));
+    a.brokerUid = sanitized(jsonString(c, "brokerUid"));
+    a.traderLogin = sanitized(jsonString(c, "traderLogin"));
+    a.targetCompId = sanitized(c.value("targetCompId", std::string("CSERVER")));
     if (c.contains("quote")) {
-        a.quoteHost = jsonString(c.at("quote"), "host");
-        a.quotePort = jsonString(c.at("quote"), "port");
+        a.quoteHost = sanitized(jsonString(c.at("quote"), "host"));
+        a.quotePort = sanitized(jsonString(c.at("quote"), "port"));
     }
     if (c.contains("trade")) {
-        a.tradeHost = jsonString(c.at("trade"), "host");
-        a.tradePort = jsonString(c.at("trade"), "port");
+        a.tradeHost = sanitized(jsonString(c.at("trade"), "host"));
+        a.tradePort = sanitized(jsonString(c.at("trade"), "port"));
     }
-    a.symbolName = c.value("symbolName", std::string("XAUUSD"));
-    a.symbolId = jsonString(c, "symbolId");
-    a.platform = c.value("platform", std::string("ctrader"));
+    a.symbolName = sanitized(c.value("symbolName", std::string("XAUUSD")));
+    a.symbolId = sanitized(jsonString(c, "symbolId"));
+    a.platform = sanitized(c.value("platform", std::string("ctrader")));
     if (c.contains("mt5")) {
         const auto& m = c.at("mt5");
         a.mt5EaPort = m.value("eaPort", instance::kDefaultEaPort);
         a.mt5FixPort = m.value("fixPort", instance::kDefaultFixPort);
         a.mt5AutoStart = m.value("autoStart", true);
-        a.mt5Terminal = m.value("terminal", std::string());
-        a.mt5Login = jsonString(m, "login");
-        a.mt5Server = m.value("server", std::string());
-        a.mt5ChartSymbol = m.value("chartSymbol", std::string("XAUUSD"));
+        a.mt5Terminal = sanitized(m.value("terminal", std::string()));
+        a.mt5Login = sanitized(jsonString(m, "login"));
+        a.mt5Server = sanitized(m.value("server", std::string()));
+        a.mt5ChartSymbol = sanitized(m.value("chartSymbol", std::string("XAUUSD")));
     }
     return a;  // password deliberately left empty
 }
@@ -565,6 +596,7 @@ void saveLiveSettings(const std::filesystem::path& path, const LiveSettings& s) 
     // API keys live at the top level, next to "connection": only in this
     // local config file, never in the repo, never logged.
     j["keys"] = {{"gemini", s.keys.gemini}, {"fred", s.keys.fred}, {"finnhub", s.keys.finnhub}};
+    j["assistantRole"] = assistantRoleName(s.assistantRole);
     j["strategy"]["breakEvenEscape"] = {{"fromLevel", s.escapeFromLevel}, {"profit", s.escapeProfit}};
 
     auto& st = j["strategy"];

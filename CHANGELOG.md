@@ -5,6 +5,60 @@ Every Muuk update gets a patch version bump, a new tag and a new release
 below. The in-app updater offers every new release, so nobody has to
 download a zip by hand.
 
+## 0.4.0 — 2026-11-27 — Brain tab visuals, layered brain + smart switch, in-app AI assistant (in staging, not yet released)
+
+- Brain tab visuals: the 81-cell brain is now drawn as an isometric grid
+  (3 session cubes, mean PnL / score / lock rate / samples colour modes,
+  hover tooltip + click to pin a cell, live cell highlighted, vetoed cells
+  marked), plus a Trainer card (bars collected / 2,000 needed, auto-retrain
+  at 1,440, last training result with the failed gates named) and a
+  per-cell "Brain today" tally.
+- Layered brain view (L0 policy table, L1 gates, L2 hard caps, L3
+  memory + journal) and a smart switch that names the operating mode by
+  regime (Shipped: erMode 2 + ATR breaker 2.0x, the mode the brain passed
+  its test in; Fallback when no brain is loaded). The switch only explains
+  the mode — it never moves the hard caps, and erMode 3 stays design-only
+  until a trainer experiment passes the 5 strict gates.
+- In-app AI assistant (Gemini free tier): a chat tab that answers about
+  the bot from live state only (brain status, veto reason, market, last
+  training, recent errors) — never keys, account numbers or balances.
+  Owner role: full access, but every settings write needs an explicit
+  in-app confirmation (old → new shown) and is logged to
+  `assistant_log.jsonl` beside the account config. A later non-owner user
+  gets restricted access only (no core brain/settings writes). The Gemini
+  key stays local-only, is sent only as the `x-goog-api-key` header, and
+  is never logged.
+- Fix: "Brain today" counters now reset on day rollover — the first basket
+  of a new day no longer shows yesterday's counts.
+- The desktop UI is Windows-only, so its compile is proven only by the
+  Release workflow; the Linux build and tests below cover the engine,
+  runner, keeper, market hours and the Gemini client.
+
+## 0.3.0 — 2026-11-27 — Smart market features + Brain tab cleanup (in staging, not yet released)
+
+- Holiday calendar (CME metals 2026–2027): Thanksgiving halt, Black Friday
+  early close, Christmas / New Year's / Good Friday closures and the Monday
+  holidays are now known to the bot — a new Holiday phase pauses new ranges
+  around halts and early closes, and the dashboard names the holiday and its
+  reopen time instead of the bot thinking the price feed died. `closeRangeAt`
+  "weekend" also closes before a holiday halt now, not only before Friday.
+- Feed-stale vs holiday: when the calendar says the market is halted for a
+  holiday, the runner logs "Market halted (holiday)" and does not spam
+  reconnects.
+- "Holiday" impact news events are guarded by the news guard now (USD
+  holidays pause new ranges like any other guarded release).
+- Gap check at reopen + adaptive post-reopen pause: after a halt, if the
+  reopen price jumped more than 2x ATR from the pre-halt close, no new range
+  opens until the price settles and the spread is back under 1.5x its median
+  (not just the old 1-minute pause).
+- Packaged config is clean: `my_account.local.json` in the release zip no
+  longer ships REPLACE_WITH placeholders — real defaults / empty values
+  instead — and any placeholder value left in a config file is treated as
+  empty and never displayed.
+- Brain tab: the brain status text moves out of the Range section into a
+  dedicated Brain tab; duplicate settings are removed; Keys, Market hours
+  and Risk open as proper popup windows.
+
 ## 0.2.7 — 2026-11-25 — Brain upgrade: new trained brain, one Brain panel, in-app trainer
 
 - The update button is smart now: it checks GitHub on startup in the

@@ -348,6 +348,103 @@ TEST_CASE("Account settings: read without the password, saved in place or as a n
     fs::remove_all(dir);
 }
 
+TEST_CASE("Clean packaged example configs carry no placeholder strings") {
+    namespace fs = std::filesystem;
+    // The test source lives in engine/ctrader_fix/tests, so the shipped
+    // templates sit two levels up -- no build-system path needed.
+    const fs::path dir = fs::path(__FILE__).parent_path().parent_path();
+    const fs::path example = dir / "config.example.json";
+    const fs::path mt5Example = dir / "config.mt5.example.json";
+    REQUIRE(fs::exists(example));
+    REQUIRE(fs::exists(mt5Example));
+
+    // cTrader template: every connection field the UI shows is empty, so
+    // the packaged my_account.local.json never ships an instruction as a
+    // credential. The engine loader refuses the unfilled template
+    // (missing host) instead of dialling a bogus address.
+    const AccountSettings a = accountFromConfigFile(example);
+    REQUIRE(a.platform == "ctrader");
+    REQUIRE(a.environment == "demo");
+    REQUIRE(a.quoteHost.empty());
+    REQUIRE(a.quotePort.empty());
+    REQUIRE(a.tradeHost.empty());
+    REQUIRE(a.tradePort.empty());
+    REQUIRE(a.brokerUid.empty());
+    REQUIRE(a.traderLogin.empty());
+    REQUIRE(a.targetCompId.empty());
+    REQUIRE(a.symbolId.empty());
+    REQUIRE(a.symbolName == "XAUUSD");
+    REQUIRE(a.senderCompId().find("REPLACE_WITH") == std::string::npos);
+    REQUIRE(a.senderCompId().find("OPTIONAL_") == std::string::npos);
+    REQUIRE_THROWS(loadLiveConfig(example));
+
+    // MT5 template: the same, for the bridge login/server. This one loads
+    // (the bridge is the broker), with the login fields empty.
+    const AccountSettings m = accountFromConfigFile(mt5Example);
+    REQUIRE(m.platform == "mt5");
+    REQUIRE(m.mt5Login.empty());
+    REQUIRE(m.mt5Server.empty());
+    REQUIRE(m.traderLogin.empty());
+    REQUIRE(m.symbolId.empty());
+    REQUIRE(m.symbolName == "XAUUSD");
+    const LiveConfig mt5Cfg = loadLiveConfig(mt5Example);
+    REQUIRE(mt5Cfg.connection.mt5Login.empty());
+    REQUIRE(mt5Cfg.connection.mt5Server.empty());
+    REQUIRE(mt5Cfg.connection.mt5Password.empty());
+    REQUIRE(mt5Cfg.connection.symbolId.empty());
+}
+
+TEST_CASE("A config that still carries placeholder strings loads them as empty") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "muuk_placeholder_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path file = dir / "placeholder.local.json";
+    {
+        std::ofstream out(file);
+        out << R"({"connection":{"quote":{"host":"REPLACE_WITH_HOST_FROM_PRICE_CONNECTION_IN_CTRADER_FIX_API_SETTINGS","port":"REPLACE_WITH_THE_PLAIN_TEXT_PORT_FROM_PRICE_CONNECTION_NOT_THE_SSL_ONE"},"trade":{"host":"REPLACE_WITH_HOST_FROM_TRADE_CONNECTION_IN_CTRADER_FIX_API_SETTINGS","port":"REPLACE_WITH_THE_PLAIN_TEXT_PORT_FROM_TRADE_CONNECTION_NOT_THE_SSL_ONE"},
+                  "environment":"demo","brokerUid":"REPLACE_WITH_YOUR_BROKER_UID","traderLogin":"REPLACE_WITH_YOUR_NUMERIC_TRADER_LOGIN","password":"REPLACE_WITH_YOUR_FIX_API_PASSWORD","targetCompId":"REPLACE_WITH_TARGETCOMPID_FROM_SETTINGS_e.g._CSERVER_or_cServer",
+                  "symbolName":"XAUUSD","symbolId":"OPTIONAL_LEAVE_EMPTY_TO_AUTO_RESOLVE_OR_SET_THE_NUMERIC_ID_FROM_SETTINGS"},
+                  "strategy":{"symbol":{"name":"XAUUSD","digits":2,"tickSize":0.01,"tickValue":1.0,"contractSize":100.0,
+                  "volumeStep":0.01,"volumeMin":0.01,"volumeMax":100.0},"range":{"lower":4336.0,"upper":4337.0},
+                  "lotProgression":{"initialLot":0.01,"lotIncrement":0.01},"riskLimits":{"maxOrders":20,"maxLot":1.0},
+                  "costs":{"commissionPerLotRoundTurn":0.0},"basketProfitTargetMoney":3.5}})";
+    }
+    const AccountSettings a = accountFromConfigFile(file);
+    REQUIRE(a.quoteHost.empty());
+    REQUIRE(a.quotePort.empty());
+    REQUIRE(a.tradeHost.empty());
+    REQUIRE(a.tradePort.empty());
+    REQUIRE(a.brokerUid.empty());
+    REQUIRE(a.traderLogin.empty());
+    REQUIRE(a.targetCompId.empty());
+    REQUIRE(a.symbolId.empty());
+    REQUIRE(a.password.empty());  // never read back out of the file
+    // The engine loader refuses the unfilled file instead of dialling a placeholder host.
+    REQUIRE_THROWS(loadLiveConfig(file));
+
+    // MT5 placeholders (YOUR_...) are sanitised the same way.
+    const fs::path mt5File = dir / "mt5placeholder.local.json";
+    {
+        std::ofstream out(mt5File);
+        out << R"({"connection":{"platform":"mt5","environment":"demo","traderLogin":"YOUR_MT5_ACCOUNT_NUMBER",
+                  "mt5":{"login":"YOUR_MT5_ACCOUNT_NUMBER","password":"YOUR_MT5_PASSWORD_OR_LEAVE_EMPTY_TO_USE_THE_ACCOUNT_MT5_LAST_USED","server":"YOUR_BROKER-Demo"}},
+                  "strategy":{"symbol":{"name":"XAUUSD","digits":2,"tickSize":0.01,"tickValue":1.0,"contractSize":100.0,
+                  "volumeStep":0.01,"volumeMin":0.01,"volumeMax":100.0},"range":{"lower":4336.0,"upper":4337.0},
+                  "lotProgression":{"initialLot":0.01,"lotIncrement":0.01},"riskLimits":{"maxOrders":20,"maxLot":1.0},
+                  "costs":{"commissionPerLotRoundTurn":0.0},"basketProfitTargetMoney":3.5}})";
+    }
+    const AccountSettings m = accountFromConfigFile(mt5File);
+    REQUIRE(m.mt5Login.empty());
+    REQUIRE(m.mt5Server.empty());
+    REQUIRE(m.traderLogin.empty());
+    const LiveConfig mt5Cfg = loadLiveConfig(mt5File);
+    REQUIRE(mt5Cfg.connection.mt5Login.empty());
+    REQUIRE(mt5Cfg.connection.mt5Server.empty());
+    REQUIRE(mt5Cfg.connection.mt5Password.empty());
+    fs::remove_all(dir);
+}
+
 TEST_CASE("History is kept per account file; the old shared file moves to the first account that opens it") {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "muuk_history_test";

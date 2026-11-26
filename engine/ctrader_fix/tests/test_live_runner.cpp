@@ -2026,6 +2026,71 @@ TEST_CASE("LiveRunner with Brain v2 opens the first range at the brain's gap and
     std::filesystem::remove_all(brainFile.parent_path(), ec);
 }
 
+TEST_CASE("LiveRunner snapshot carries the v0.4.0 Brain tab fields: cells, trained bars, last cell and veto state") {
+    const std::filesystem::path brainFile = writeTestBrainV2(true);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;  // wait for a live quote to center on
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    const FixMessage order1 = server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 3s);
+    REQUIRE(order1.getInt(tag::Side) == 1);
+
+    const LiveSnapshot snap = runner.snapshot();
+    REQUIRE(snap.brainCellsValid);
+    REQUIRE(snap.brainCells.size() == 81);
+    REQUIRE(snap.brainCells[0].index == 0);
+    REQUIRE(snap.brainCells[0].gapChoice == 2);
+    REQUIRE(snap.brainCells[0].lotMultiplier == Catch::Approx(1.5));
+    REQUIRE(snap.brainCells[0].maxLevels == 4);
+    REQUIRE(snap.brainCells[0].exitFactor == Catch::Approx(0.5));
+    REQUIRE(snap.brainCells[0].meanPnl == Catch::Approx(5.0));
+    REQUIRE(snap.brainCells[0].samples == 100);
+    REQUIRE(snap.brainCells[0].score == Catch::Approx(5.0));
+    REQUIRE_FALSE(snap.brainCells[0].vetoedLive);
+    REQUIRE(snap.brainCells[80].index == 80);
+    REQUIRE(snap.brainTrainedBars == 1500);
+    REQUIRE(snap.brainTotalBars >= 0);
+    REQUIRE(snap.brainNewBars >= 0);
+    // The cycle the brain just opened: current and last cell agree, and
+    // the decision was a trade (blockedBy None, trade explanation in why).
+    REQUIRE(snap.brainCurrentCell >= 0);
+    REQUIRE(snap.brainCurrentCell < 81);
+    REQUIRE(snap.brainLastCell == snap.brainCurrentCell);
+    REQUIRE(snap.brainBlockedBy == 0);
+    REQUIRE_FALSE(snap.brainBlockedWhy.empty());
+    REQUIRE(snap.brainBlockedAt.empty());
+    // No training has run and no basket has closed yet.
+    REQUIRE_FALSE(snap.brainLastTrain.ran);
+    for (const BrainCellTally& tally : snap.brainCellTally) {
+        REQUIRE(tally.cycles == 0);
+        REQUIRE(tally.wins == 0);
+        REQUIRE(tally.locks == 0);
+    }
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
 // Drives one brain cycle to its third order: quote, both boundary orders,
 // both fills, then the re-armed buy. The config shift is off unless the
 // caller sets it; the expected third-order price proves which shift ran.
@@ -2167,6 +2232,53 @@ TEST_CASE("LiveRunner with Brain v2 opens no range when the brain says no-trade"
         });
         REQUIRE(sawVeto);
     }
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
+TEST_CASE("LiveRunner snapshot carries the v0.4.0 veto fields while idle: last cell, reason and time") {
+    const std::filesystem::path brainFile = writeTestBrainV2(false);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    runner.addHistoryBars(flatBars());
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    // The brain vetoes the first cycle, and keeps vetoing it: no boundary
+    // order ever goes out (waitForMessage throws on timeout).
+    REQUIRE_THROWS(server.waitForMessage(msgtype::NewOrderSingle, kTradeConn, 2s));
+    REQUIRE(runner.snapshot().status == EngineStatus::Idle);
+
+    const LiveSnapshot snap = runner.snapshot();
+    REQUIRE(snap.brainCellsValid);
+    REQUIRE(snap.brainTrainedBars == 1500);
+    REQUIRE(snap.brainCurrentCell == -1);
+    REQUIRE(snap.brainLastCell >= 0);
+    REQUIRE(snap.brainLastCell < 81);
+    REQUIRE(snap.brainBlockedBy == static_cast<int>(muuk::core::BrainBlockReason::CellNotTradable));
+    REQUIRE(snap.brainBlockedWhy.find("no policy worth trading") != std::string::npos);
+    REQUIRE(snap.brainBlockedAt.size() == 8);
+    REQUIRE(snap.brainBlockedAt[2] == ':');
+    REQUIRE(snap.brainBlockedAt[5] == ':');
 
     runner.stop();
     runnerThread.join();

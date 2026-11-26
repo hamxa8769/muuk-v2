@@ -300,6 +300,61 @@ LiveSnapshot LiveRunner::snapshot() const {
         snap.brainWinsToday = brainWinsToday_;
         snap.brainLocksToday = brainLocksToday_;
     }
+    // v0.4.0: structured brain state for the Brain tab grid + Trainer card.
+    // Cheap copies only (81 cells, a few numbers); the keeper does the
+    // locking, so the snapshot never blocks the runner on a long read.
+    if (brain_) {
+        snap.brainTrainedBars = static_cast<int>(brain_->trainedBars());
+        snap.brainTotalBars = static_cast<int>(brain_->totalBars());
+        snap.brainNewBars = brain_->newBars();
+        const BrainTrainingResult last = brain_->lastTraining();
+        snap.brainLastTrain.ran = last.ran;
+        snap.brainLastTrain.adopted = last.adopted;
+        snap.brainLastTrain.gatesPassed = last.gatesPassed;
+        snap.brainLastTrain.better = last.better;
+        snap.brainLastTrain.ddGate = last.ddGate;
+        snap.brainLastTrain.lockGate = last.lockGate;
+        snap.brainLastTrain.periods = last.periods;
+        snap.brainLastTrain.brainPeriodsUp = last.brainPeriodsUp;
+        snap.brainLastTrain.totalPnl = last.totalPnl;
+        snap.brainLastTrain.locks = last.locks;
+        snap.brainLastTrain.maxDrawdown = last.maxDrawdown;
+        snap.brainLastTrain.heldOutPnl = last.heldOutPnl;
+        snap.brainLastTrain.heldOutLocks = last.heldOutLocks;
+        snap.brainLastTrain.bars = last.bars;
+        if (brain_->trained()) {
+            const std::vector<muuk::core::BrainV2Cell> cells = brain_->cells();
+            const std::vector<bool> vetoed = brain_->vetoedCells();
+            if (cells.size() == 81 && vetoed.size() == 81) {
+                snap.brainCellsValid = true;
+                for (std::size_t i = 0; i < cells.size(); ++i) {
+                    const muuk::core::BrainV2Cell& cell = cells[i];
+                    BrainCellView& view = snap.brainCells[i];
+                    view.index = static_cast<int>(i);
+                    view.samples = cell.samples;
+                    view.gapChoice = cell.best.gapChoice;
+                    view.lotMultiplier = cell.best.lotMultiplier;
+                    view.maxLevels = cell.best.maxLevels;
+                    view.exitFactor = cell.best.exitFactor;
+                    view.meanPnl = cell.meanPnl;
+                    view.locks = cell.locks;
+                    view.lockRate = cell.lockRate;
+                    view.meanLockLoss = cell.meanLockLoss;
+                    view.score = cell.score;
+                    view.firstSide = cell.firstSide;
+                    view.vetoedLive = vetoed[i];
+                }
+            }
+        }
+    }
+    snap.brainCurrentCell = brainCycleActive_ ? BrainJournal::cellIndex(brainSituation_.base) : -1;
+    if (brainHasLastDecision_) {
+        snap.brainLastCell = BrainJournal::cellIndex(brainLastSituation_.base);
+        snap.brainBlockedBy = static_cast<int>(brainLastDecision_.blockedBy);
+        snap.brainBlockedWhy = brainLastDecision_.why;
+    }
+    snap.brainBlockedAt = brainLastDecisionAt_;
+    if (brainTallyDay_ == dayKey_) snap.brainCellTally = brainCellTally_;
     snap.regimeStatus = regimeStatus_;
     snap.platform = config_.connection.platform;
     snap.brokerAccount = brokerAccount_;
@@ -2710,12 +2765,19 @@ bool LiveRunner::decideBrainCycleLocked() {
                       toReplay;
     const BrainV2Cycle cycle =
         brain_->decideForCycle(bars_.closed(), recentOutcome, spread, medianSpreadLocked(), account);
+    // v0.4.0: remember the decision, trade or veto, so the snapshot can
+    // show the last cell and the veto reason while idle (gap 5). The time
+    // below is veto-only (see the first-veto log).
+    brainLastSituation_ = cycle.situation;
+    brainLastDecision_ = cycle.decision;
+    brainHasLastDecision_ = true;
     if (!cycle.decision.trade) {
         entryWait_ = "brain: " + cycle.decision.why;
         if (!brainWaitLogged_) {
             log("[brain v2] no new cycle: " + cycle.decision.why);
             brainJournal_.appendSkip(cycle.situation, cycle.decision);
             brainWaitLogged_ = true;
+            brainLastDecisionAt_ = localTimestamp().substr(11);
         }
         return false;
     }
@@ -3509,10 +3571,27 @@ void LiveRunner::maybeFinalizeBasket() {
             // never throws, so it cannot break basket finalization.
             brainJournal_.appendCycle(brainSituation_, brainDecision_, b.net * brainMoneyScaleLocked(), locked,
                                       static_cast<int>(b.legs.size()), b.closeReason);
+            // v0.4.0: a new day starts the per-cell tally over (the day
+            // totals above are gated the same way in the snapshot).
+            if (brainTallyDay_ != dayKey_) {
+                brainCellTally_.fill(BrainCellTally{});
+                brainCyclesToday_ = 0;
+                brainWinsToday_ = 0;
+                brainLocksToday_ = 0;
+            }
             brainTallyDay_ = dayKey_;
             ++brainCyclesToday_;
             if (b.net > 0.0) ++brainWinsToday_;
             if (locked) ++brainLocksToday_;
+            const int cell = BrainJournal::cellIndex(brainSituation_.base);
+            if (cell >= 0 && cell < 81) {
+                BrainCellTally& tally = brainCellTally_[static_cast<std::size_t>(cell)];
+                const double netReplay = b.net * brainMoneyScaleLocked();
+                ++tally.cycles;
+                tally.netReplay += netReplay;
+                if (netReplay > 0.0) ++tally.wins;
+                if (locked) ++tally.locks;
+            }
         } catch (const std::exception& ex) {
             log(std::string("[brain v2] could not learn from the basket: ") + ex.what());
         }
@@ -3579,20 +3658,53 @@ void LiveRunner::updateMarket() {
         if (full) marketFullEvalMs_ = now;
         marketStatus_ = st;
         marketKnown_ = true;
+        // Holiday reopen hold: remember the last price before the halt,
+        // and arm the hold when the market comes back after one. A halt
+        // is a fresh closure, not the pause before it: a daily-break
+        // pause (which already set closedForPause_ without closing
+        // anything) must not swallow the holiday close below.
+        const bool holidayPauseNow = st.phase == MarketPhase::Holiday || st.pauseIsHoliday;
+        const bool holidayPauseBefore = previous.phase == MarketPhase::Holiday || previous.pauseIsHoliday;
+        if (holidayPauseNow) {
+            if (latestBid_ && latestAsk_) {
+                preHaltClose_ = (*latestBid_ + *latestAsk_) / 2.0;
+                preHaltCloseKnown_ = true;
+            }
+            if (const auto hol = holidayAt(now)) preHaltHoliday_ = hol->name;
+            holidayArmed_ = true;
+        } else if (holidayArmed_ && st.marketOpen) {
+            // The halt is over -- directly, or via the weekend after an
+            // early close: new ranges wait for the gap/spread to settle.
+            holidayArmed_ = false;
+            reopenHoldActive_ = true;
+            reopenHoldSince_ = std::chrono::steady_clock::now();
+            reopenHoldReason_.clear();
+            const int boundMinutes = std::max(1, cfg.pauseMinutesBefore);
+            log("[market] reopened after " +
+                (preHaltHoliday_.empty() ? std::string("a holiday") : preHaltHoliday_) +
+                " -- new ranges wait until the reopen gap/spread settles (up to " +
+                std::to_string(boundMinutes) + " min)");
+        }
         if (known && previous.canOpenRange && !st.canOpenRange) {
             log("[market] " + st.label + " -- " + st.detail +
                 (st.nextChangeUtcMs > 0 ? " New ranges wait until " + formatLocalDateTime(st.nextChangeUtcMs) + "." : ""));
         } else if (known && !previous.canOpenRange && st.canOpenRange) {
-            log("[market] open again (" + st.sessionLabel + ") -- new ranges may start");
+            log("[market] open again (" + st.sessionLabel + ")" +
+                (reopenHoldActive_ ? " -- new ranges still wait for the reopen gap/spread to settle"
+                                   : " -- new ranges may start"));
         } else if (known && previous.label != st.label && !st.canOpenRange) {
             log("[market] " + st.label + " -- " + st.detail);
         }
+        if (holidayPauseNow && !holidayPauseBefore) closedForPause_ = false;
         if (st.canOpenRange) {
             closedForPause_ = false;
         } else if (!closedForPause_ && engine_ && tradeSession_) {
             // closeRangeAt: close a running range as the pause starts.
+            // A holiday halt is a weekend-like closure, not just Friday:
+            // "weekend" closes before the halt (or the pause before it),
+            // and "every" already covers any pause, holiday ones included.
             const bool weekendAhead =
-                st.phase == MarketPhase::Weekend ||
+                st.phase == MarketPhase::Weekend || st.phase == MarketPhase::Holiday || st.pauseIsHoliday ||
                 (st.phase == MarketPhase::SessionPause && st.label.find("closing") != std::string::npos &&
                  newYorkWeekday(now) == 5);  // the pause before Friday's close
             const bool wanted = cfg.closeRangeAt == "every" || (cfg.closeRangeAt == "weekend" && weekendAhead);
@@ -3619,6 +3731,72 @@ void LiveRunner::flagAnotherTraderLocked(const std::string& why) {
                                "bots cancel and close each other's orders. No new range opens until you press Open range.");
 }
 
+// After a holiday reopen, new ranges wait until the reopen gap has
+// settled back within 2x ATR of the pre-halt close AND the spread is
+// back near its median -- or a bounded wait has passed, after which the
+// new price/spread simply is the market and opening resumes. Only new
+// ranges wait: every new open goes through marketBlocksLocked, and a
+// running basket is never touched here. True while a new range must wait.
+bool LiveRunner::reopenHoldLocked() {
+    if (!reopenHoldActive_) return false;
+    // The bound is the pause machinery's own longest window
+    // (pauseMinutesBefore, 15 min by default): long enough for the
+    // reopen spread to settle, short enough that a genuine repricing
+    // never idles the bot forever.
+    const int boundMinutes = std::max(1, config_.market.pauseMinutesBefore);
+    const auto now = std::chrono::steady_clock::now();
+    const bool expired = now - reopenHoldSince_ >= std::chrono::minutes(boundMinutes);
+    const std::string holiday = preHaltHoliday_.empty() ? std::string("the holiday") : preHaltHoliday_;
+    // No price since the reopen yet: the last quote is still the
+    // pre-halt one, so it cannot judge the gap or the spread.
+    const bool haveFreshQuote = latestBid_ && latestAsk_ &&
+                                lastQuoteAt_.time_since_epoch().count() != 0 && lastQuoteAt_ >= reopenHoldSince_;
+    std::string reason;
+    bool settled = false;
+    if (!haveFreshQuote) {
+        reason = "waiting for the first price after the " + holiday + " reopen";
+    } else {
+        const double mid = (*latestBid_ + *latestAsk_) / 2.0;
+        readMarketLocked();  // the pre-halt ATR: no bars close during the halt
+        const double atr = marketRead_.atr;
+        const double spread = *latestAsk_ - *latestBid_;
+        const double medianSpread = medianSpreadLocked();
+        const bool gapTooBig = preHaltCloseKnown_ && reopenGapTooBig(preHaltClose_, mid, atr);
+        const bool spreadOk = spreadSettled(spread, medianSpread);
+        if (!gapTooBig && spreadOk) {
+            settled = true;
+        } else if (gapTooBig) {
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "reopen gap too big after %s: price %.2f vs pre-halt close %.2f (a %.2f move, over 2x ATR %.2f) -- new ranges wait until the price settles",
+                          holiday.c_str(), mid, preHaltClose_, std::fabs(mid - preHaltClose_), atr);
+            reason = buf;
+        } else {
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "waiting for the spread to settle after the %s reopen (spread %.2f vs median %.2f)",
+                          holiday.c_str(), spread, medianSpread);
+            reason = buf;
+        }
+    }
+    if (settled || expired) {
+        reopenHoldActive_ = false;
+        if (entryWait_ == reopenHoldReason_) entryWait_.clear();
+        reopenHoldReason_.clear();
+        log(std::string("[market] reopen hold over after ") + holiday + " (" +
+            (settled ? "gap and spread settled"
+                     : "waited " + std::to_string(boundMinutes) + " min; opening resumes at the new price/spread") +
+            ") -- new ranges may open");
+        return false;
+    }
+    if (reason != reopenHoldReason_) {
+        reopenHoldReason_ = reason;
+        log("[market] no new range now: " + reason);
+    }
+    entryWait_ = reason;
+    return true;
+}
+
 bool LiveRunner::marketBlocksLocked() {
     if (!anotherTrader_.empty()) {
         if (!marketWaitLogged_) {
@@ -3643,6 +3821,9 @@ bool LiveRunner::marketBlocksLocked() {
         return true;
     }
     if (!marketKnown_ || marketStatus_.canOpenRange) {
+        // A holiday reopen still holds new ranges (gap/spread settling)
+        // even though the market itself allows opens again.
+        if (marketStatus_.canOpenRange && reopenHoldLocked()) return true;
         marketWaitLogged_ = false;
         maybeInitBrainLocked();
         return false;
@@ -4443,17 +4624,29 @@ void LiveRunner::auditLocked() {
     // 1. Prices: a feed that stopped while the market is open is reconnected.
     {
         const bool marketOpen = !marketKnown_ || marketStatus_.marketOpen;
+        // A holiday halt is not a dead feed: no prices are expected, and
+        // reconnecting through it would spam reconnects for hours. The
+        // halt is at most pauseMinutesBefore away once pauseIsHoliday
+        // is set, so it counts as halted too.
+        const bool holidayHalt = marketKnown_ && (marketStatus_.phase == MarketPhase::Holiday ||
+                                                  marketStatus_.pauseIsHoliday || !marketStatus_.holidayName.empty());
+        const std::string holidayHaltText =
+            "Market halted (holiday" +
+            (marketStatus_.holidayName.empty() ? std::string(")") : ": " + marketStatus_.holidayName + ")") +
+            " -- no prices expected";
         if (marketOpen && !wasMarketOpen_) marketOpenSince_ = now;
         wasMarketOpen_ = marketOpen;
         const int stale = config_.connection.quoteStaleSeconds;
         const bool anyQuote = lastQuoteAt_.time_since_epoch().count() != 0;
         const auto age = anyQuote ? std::chrono::duration_cast<std::chrono::seconds>(now - lastQuoteAt_).count() : -1;
         if (!marketOpen) {
-            set(kAuditPrices, 0, "market closed -- no prices expected", false);
+            set(kAuditPrices, 0, holidayHalt ? holidayHaltText : "market closed -- no prices expected", false);
         } else if (!anyQuote) {
             set(kAuditPrices, 1, "no price received yet", false);
         } else if (stale > 0 && age > stale && now - marketOpenSince_ > std::chrono::seconds(stale)) {
-            if (now - lastStaleReconnect_ > std::chrono::minutes(10) || lastStaleReconnect_.time_since_epoch().count() == 0) {
+            if (holidayHalt) {
+                set(kAuditPrices, 0, holidayHaltText, false);
+            } else if (now - lastStaleReconnect_ > std::chrono::minutes(10) || lastStaleReconnect_.time_since_epoch().count() == 0) {
                 lastStaleReconnect_ = now;
                 set(kAuditPrices, 2,
                     "no price for " + std::to_string(age) + " s while the market is open -- the price feed looks dead, "

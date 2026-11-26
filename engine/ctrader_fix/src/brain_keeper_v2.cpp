@@ -24,8 +24,6 @@ using muuk::core::Bar;
 
 namespace {
 
-constexpr int kNewBarsToLearn = 1440;  // a day of minutes
-
 // True when the folder holds any history CSV at all: a fresh install has
 // none, and starting a training thread on nothing would only race the
 // manual refresh for a "too few bars" result nobody asked for. Bars that
@@ -41,7 +39,6 @@ bool folderHasHistory(const fs::path& folder) {
 // Step 5: below this a training run refuses with "too few bars" instead of
 // training on almost nothing (trainBrainV2 itself needs ~5,800 bars to
 // learn at all: first-learn share 0.3 x 480 bars, then 100 ATR samples).
-constexpr std::size_t kMinTrainingBars = 2000;
 constexpr const char* kLiveBars = "bars_live.csv";
 
 double headerValue(const std::string& line, const std::string& key, double fallback) {
@@ -52,6 +49,21 @@ double headerValue(const std::string& line, const std::string& key, double fallb
     } catch (const std::exception&) {
         return fallback;
     }
+}
+
+// Rows the bot has already collected in bars_live.csv (comment and blank
+// lines excluded), counted once at construction so totalBars() is right
+// from the first snapshot even before addBars() sees a new bar.
+std::size_t countLiveBars(const fs::path& file) {
+    std::ifstream in(file);
+    if (!in) return 0;
+    std::size_t rows = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        ++rows;
+    }
+    return rows;
 }
 
 }  // namespace
@@ -116,6 +128,9 @@ void saveBrainV2File(const fs::path& file, const muuk::core::BrainV2& brain) {
 
 BrainKeeperV2::BrainKeeperV2(fs::path brainFile, muuk::core::BrainV2Config config, Log log)
     : file_(std::move(brainFile)), config_(std::move(config)), log_(std::move(log)) {
+    // v0.4.0: count the rows already collected, so totalBars() is right
+    // from the first snapshot (addBars() only sees new bars).
+    totalBars_ = countLiveBars(file_.parent_path() / kLiveBars);
     if (auto loaded = loadBrainV2File(file_)) {
         brain_ = std::move(*loaded);
         lastSavedBarMs_ = brain_.trainedUntilMs;
@@ -173,6 +188,32 @@ int64_t BrainKeeperV2::trainedUntilMs() const {
     return brain_.trainedUntilMs;
 }
 
+std::vector<muuk::core::BrainV2Cell> BrainKeeperV2::cells() const {
+    std::scoped_lock lock(mutex_);
+    return brain_.cells;
+}
+
+std::size_t BrainKeeperV2::totalBars() const {
+    std::scoped_lock lock(mutex_);
+    return totalBars_.load();
+}
+
+int BrainKeeperV2::newBars() const {
+    std::scoped_lock lock(mutex_);
+    return newBars_;
+}
+
+std::vector<bool> BrainKeeperV2::vetoedCells() const {
+    std::scoped_lock lock(mutex_);
+    std::vector<bool> out(81, false);
+    if (!brain_.trained || brain_.cells.size() != 81) return out;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const muuk::core::BrainV2Cell& cell = brain_.cells[i];
+        out[i] = cell.best.gapChoice >= 0 && (cell.score <= 0.0 || cell.lockRate > config_.maxLockRate);
+    }
+    return out;
+}
+
 std::optional<std::pair<int, double>> BrainKeeperV2::trainedShift() const {
     std::scoped_lock lock(mutex_);
     if (!brain_.trained || brain_.shiftAfterFills <= 0 || brain_.stepAtr <= 0.0) return std::nullopt;
@@ -218,6 +259,7 @@ void BrainKeeperV2::addBars(const std::deque<Bar>& oneMinuteBars, double spread)
         ++added;
     }
     newBars_ += added;
+    totalBars_.fetch_add(static_cast<std::size_t>(added));  // v0.4.0: keep the total row count
     if (newBars_ >= kNewBarsToLearn) {
         newBars_ = 0;
         startTraining(std::nullopt);
@@ -343,6 +385,18 @@ void BrainKeeperV2::startTraining(std::optional<fs::path> history) {
                               t.heldOutV2.totalPnl, t.heldOutV2.locks);
                 result.summary = summary;
                 result.summary += result.gatesPassed ? ", gates PASSED" : ", " + muuk::core::gatesFailureSummary(t);
+                // v0.4.0: the same numbers, structured, so the Brain tab can
+                // name the failed gates without parsing `summary`.
+                result.better = t.better;
+                result.ddGate = t.ddGate;
+                result.lockGate = t.lockGate;
+                result.periods = t.periods;
+                result.brainPeriodsUp = t.brainPeriodsUp;
+                result.totalPnl = t.brainTest.totalPnl;
+                result.locks = t.brainTest.locks;
+                result.maxDrawdown = t.brainTest.maxDrawdown;
+                result.heldOutPnl = t.heldOutV2.totalPnl;
+                result.heldOutLocks = t.heldOutV2.locks;
             }
             finish(result, "[brain v2] trained on " + std::to_string(barCount) + " bars: " + result.summary);
         } catch (const std::exception& ex) {

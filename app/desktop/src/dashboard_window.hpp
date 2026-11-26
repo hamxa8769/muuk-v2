@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <optional>
 #include <string>
 #include <vector>
@@ -12,6 +13,8 @@
 
 #include "app_prefs.hpp"
 #include "live_controller.hpp"
+#include "muuk/ctrader_fix/gemini_client.hpp"
+#include "muuk/ctrader_fix/live_config.hpp"
 #include "updater.hpp"
 #include "version.hpp"
 #include "system_monitor.hpp"
@@ -28,6 +31,30 @@ namespace muuk::desktop {
 // its own Close/Cancel button. Drawn in a frosted-glass style (glass_ui.hpp).
 // Holds only UI-local state (text buffers, the settings being edited,
 // theme); all live state comes from LiveController every frame.
+// Assistant actions (v0.4.0 design Section 4.6) and the single enforcement
+// point: every assistant-initiated write goes through
+// assistantActionAllowed() before it is dispatched, so hiding a button is
+// never the only protection. Owner may do everything except change keys or
+// its own role (the assistant can never change keys, and it can never
+// change its own role); User may only Explain and RefreshBrain. (The doc's
+// Section 4.6 also carries a note saying a non-owner cannot run
+// RefreshBrain either; the explicit allowed-list -- User: Explain +
+// RefreshBrain -- is what is implemented, and the contradiction is flagged
+// in the v0.4.0 report.)
+enum class AssistantAction {
+    Explain,
+    ChangeDailyLossPercent,
+    ChangeStopLoss,
+    ChangeErMode,
+    ChangeRiskAppetite,
+    ChangeMaxLot,
+    TrainBrain,
+    RefreshBrain,
+    ChangeKeys,
+    ChangeRole
+};
+[[nodiscard]] bool assistantActionAllowed(muuk::ctrader_fix::AssistantRole role, AssistantAction action);
+
 class DashboardWindow {
 public:
     // Opens the way it was left (app_prefs.hpp): the last config file and
@@ -76,7 +103,7 @@ public:
 private:
     enum class Confirm { None, CloseRange, CloseAllPositions, CancelAllPending, ResetData, PlaceNow, RestartMt5 };
     // The tabs on the right; a KPI card click selects one.
-    enum class Tab { None, Positions, Orders, History, Risk, News, Audit, Volume, Performance, Settings, Log };
+    enum class Tab { None, Positions, Orders, History, Risk, News, Audit, Volume, Performance, Brain, Assistant, Settings, Log };
     // Risk & capital page: account cards, lots, loss limits, guards, lock/escape, the risk table and the
     // reverse-trade calculator.
     void renderRiskPage(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
@@ -98,6 +125,32 @@ private:
                           bool connected);
     void renderSettingsPanel(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
                              bool connected);
+    // The Brain tab: live status, risk appetite, hard caps, the ER gate,
+    // trainer history, smart ranges -- the bot's core settings.
+    void renderBrainTab(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
+                        bool connected);
+    // v0.4.0 Section 2: the 81-cell brain grid, trainer card, layers and
+    // smart switch (all display-only -- no brain decision, gate or cap
+    // changes). v0.4.0 Section 4: the Assistant tab (Gemini chat).
+    void renderBrainGrid(const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap);
+    void renderTrainerCard(const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap);
+    void renderBrainLayers();
+    void renderSmartSwitch(const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap);
+    void renderAssistantTab(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
+                            bool connected);
+    // Assistant context (Section 4.4 allowlist only -- never keys, account
+    // numbers, balances or credentials) and the background Gemini call:
+    // sendAssistantMessage starts it on a worker thread, pollAssistantReply
+    // collects the result without ever blocking the render thread.
+    [[nodiscard]] std::string buildAssistantContext(
+        const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap) const;
+    void sendAssistantMessage(const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap);
+    void pollAssistantReply();
+    // One confirmed assistant write, logged to <config>.assistant_log.jsonl
+    // beside the account config (same folder pattern as the brain journal).
+    void appendAssistantLog(const std::string& field, double oldValue, double newValue);
+    [[nodiscard]] muuk::ctrader_fix::AssistantRole assistantRole(
+        const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap) const;
     void renderPositionsTab(LiveController& controller, const muuk::ctrader_fix::LiveSnapshot& snap, bool connected);
     void renderOrdersTab(LiveController& controller, const muuk::ctrader_fix::LiveSnapshot& snap, bool connected);
     void renderLogTab(LiveController& controller);
@@ -136,6 +189,12 @@ private:
     void renderNewsTab(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
                        bool connected);
     void renderMarketSettings();
+    // Popups opened from the Brain tab (API keys) and from the News tab /
+    // Settings (market hours & news). Each carries its own SaveBar.
+    void renderKeysPopup(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
+                         bool connected);
+    void renderMarketHoursPopup(LiveController& controller, const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap,
+                                bool connected);
     // Risk & capital: the account cards, lot sizing, loss limits, break-even,
     // margin guards, escape, and the level-by-level worst case (muuk::core::riskTable).
     void renderRiskCalculator(const std::optional<muuk::ctrader_fix::LiveSnapshot>& snap);
@@ -170,6 +229,38 @@ private:
     std::array<char, 256> fredKeyBuffer_{};
     std::array<char, 256> finnhubKeyBuffer_{};
     std::array<char, 512> trainerHistoryBuffer_{};  // Step 5: history CSV/folder for Train (paths run long)
+
+    // Brain grid display state (v0.4.0 Section 2): 0 mean PnL, 1 score,
+    // 2 lock rate, 3 samples; -1 = no cell pinned.
+    int brainGridMode_ = 0;
+    bool brainTradableOnly_ = false;
+    int brainPinnedCell_ = -1;
+    // Assistant tab (v0.4.0 Section 4): chat history lives only for this
+    // session (never persisted, so stale context is never re-sent).
+    struct AssistantMessage {
+        bool fromUser = false;
+        std::string text;
+    };
+    std::vector<AssistantMessage> assistantMessages_;
+    std::array<char, 512> assistantInput_{};
+    std::future<muuk::ctrader_fix::GeminiResponse> assistantFuture_;
+    bool assistantWaiting_ = false;
+    double assistantSentAt_ = -1000.0;  // ImGui::GetTime() of the last send (5 s cooldown)
+    std::string assistantStatus_;       // last error / refusal line shown in the tab
+    std::string assistantCacheKey_;     // question + context of the cached reply
+    std::string assistantCachedReply_;
+    double assistantCacheAt_ = -1000.0;  // 5-minute cache (Section 4.4)
+    std::string assistantPendingCacheKey_;  // cache key of the in-flight question
+    std::size_t assistantShown_ = 0;        // messages rendered (drives chat auto-scroll)
+    // A change proposed in the Assistant tab: shown in a confirmation card
+    // (old -> new) and applied only on Confirm.
+    int assistantChangeField_ = 0;  // 0 daily loss %, 1 stop loss, 2 max lot, 3 ER mode
+    double assistantChangeValue_ = 2.0;
+    bool assistantChangePending_ = false;
+    AssistantAction assistantChangeAction_ = AssistantAction::Explain;
+    std::string assistantChangeFieldName_;
+    double assistantChangeOld_ = 0.0;
+    double assistantChangeNew_ = 0.0;
     AppPrefs prefs_;
     bool darkMode_ = true;
     std::string dismissedResumeNote_;

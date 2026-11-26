@@ -175,6 +175,14 @@ TEST_CASE("in-app trainer: a run that fails the gates adopts nothing") {
     REQUIRE_FALSE(last.gatesPassed);
     REQUIRE_FALSE(last.adopted);
     REQUIRE(last.summary.find("NOT PASSED") != std::string::npos);
+    // v0.4.0: the structured last-train result carries the same numbers
+    // without parsing `summary` (walk-forward v2 total +$209 per the
+    // fixture comment above).
+    REQUIRE(last.bars == 12000);
+    REQUIRE(last.periods > 0);
+    REQUIRE(last.brainPeriodsUp >= 0);
+    REQUIRE(last.brainPeriodsUp <= last.periods);
+    REQUIRE(last.totalPnl == Catch::Approx(209.0).margin(5.0));
     REQUIRE_FALSE(std::filesystem::exists(tmp.dir / "brain_v2.txt"));
     REQUIRE_FALSE(keeper.trained());
 }
@@ -217,4 +225,103 @@ TEST_CASE("in-app trainer: a run that passes the gates adopts the new brain, and
     REQUIRE(loaded.has_value());
     REQUIRE(loaded->trained);
     REQUIRE(loaded->trainedBars > 0);
+    // v0.4.0: the structured last-train result, and the keeper accessors
+    // the Brain tab reads (fixture: v2 +$1,153 walk-forward, no locks,
+    // +$314 held-out, gates PASSED -- see the fixture comment above).
+    REQUIRE(last.better);
+    REQUIRE(last.ddGate);
+    REQUIRE(last.lockGate);
+    REQUIRE(last.periods > 0);
+    REQUIRE(last.brainPeriodsUp >= 5);
+    REQUIRE(last.brainPeriodsUp <= last.periods);
+    REQUIRE(last.totalPnl > 1000.0);
+    REQUIRE(last.locks == 0);
+    REQUIRE(last.maxDrawdown >= 0.0);
+    REQUIRE(last.heldOutPnl > 0.0);
+    REQUIRE(last.heldOutLocks == 0);
+    const std::vector<BrainV2Cell> cells = keeper.cells();
+    REQUIRE(cells.size() == 81);
+    REQUIRE(loaded->cells.size() == 81);
+    const std::vector<bool> vetoed = keeper.vetoedCells();
+    REQUIRE(vetoed.size() == 81);
+    for (std::size_t i = 0; i < cells.size(); ++i) {
+        REQUIRE(cells[i].samples == loaded->cells[i].samples);
+        REQUIRE(cells[i].best.gapChoice == loaded->cells[i].best.gapChoice);
+        REQUIRE(cells[i].best.lotMultiplier == Catch::Approx(loaded->cells[i].best.lotMultiplier).epsilon(0.001));
+        REQUIRE(cells[i].best.maxLevels == loaded->cells[i].best.maxLevels);
+        REQUIRE(cells[i].best.exitFactor == Catch::Approx(loaded->cells[i].best.exitFactor).epsilon(0.001));
+        REQUIRE(cells[i].meanPnl == Catch::Approx(loaded->cells[i].meanPnl).epsilon(0.001));
+        REQUIRE(cells[i].locks == loaded->cells[i].locks);
+        REQUIRE(cells[i].lockRate == Catch::Approx(loaded->cells[i].lockRate).epsilon(0.001));
+        REQUIRE(cells[i].score == Catch::Approx(loaded->cells[i].score).epsilon(0.001));
+        REQUIRE(cells[i].firstSide == loaded->cells[i].firstSide);
+        const bool expectVetoed = cells[i].best.gapChoice >= 0 &&
+                                  (cells[i].score <= 0.0 || cells[i].lockRate > 0.015);
+        REQUIRE(vetoed[i] == expectVetoed);
+    }
+}
+
+TEST_CASE("BrainKeeperV2 accessors: cells() copies the trained brain and vetoedCells() flags score/lock failures") {
+    TempDir tmp("muuk-keeper-cells-test");
+    BrainV2 brain;
+    brain.trained = true;
+    brain.volLow = 0.5;
+    brain.volHigh = 1.5;
+    brain.gapAtrChoices = {2.0, 3.0, 4.0, 6.0, 8.0};
+    brain.trainedBars = 1500;
+    brain.cells.assign(81, BrainV2Cell{});
+    // Cell 59: tradable, but its score is no longer positive -- the veto
+    // rule's first leg.
+    brain.cells[59].samples = 100;
+    brain.cells[59].best.gapChoice = 2;
+    brain.cells[59].best.lotMultiplier = 2.0;
+    brain.cells[59].best.maxLevels = 4;
+    brain.cells[59].best.exitFactor = 1.0;
+    brain.cells[59].meanPnl = -5.0;
+    brain.cells[59].score = -1.0;
+    // Cell 62: tradable and healthy -- no veto.
+    brain.cells[62].samples = 200;
+    brain.cells[62].best.gapChoice = 1;
+    brain.cells[62].meanPnl = 12.0;
+    brain.cells[62].score = 8.0;
+    // Cell 54: no-trade from training -- never flagged, whatever its score.
+    brain.cells[54].samples = 50;
+    brain.cells[54].best.gapChoice = -1;
+    brain.cells[54].score = -2.0;
+    saveBrainV2File(tmp.dir / "brain_v2.txt", brain);
+    BrainKeeperV2 keeper(tmp.dir / "brain_v2.txt", trainerConfig(), nullptr);
+    REQUIRE(keeper.trained());
+    const std::vector<BrainV2Cell> cells = keeper.cells();
+    REQUIRE(cells.size() == 81);
+    REQUIRE(cells[59].best.gapChoice == 2);
+    REQUIRE(cells[59].meanPnl == Catch::Approx(-5.0));
+    REQUIRE(cells[62].score == Catch::Approx(8.0));
+    REQUIRE(cells[54].best.gapChoice == -1);
+    const std::vector<bool> vetoed = keeper.vetoedCells();
+    REQUIRE(vetoed.size() == 81);
+    REQUIRE(vetoed[59]);
+    REQUIRE_FALSE(vetoed[62]);
+    REQUIRE_FALSE(vetoed[54]);
+    // The accessor returns a copy: mutating it leaves the keeper alone.
+    std::vector<BrainV2Cell> copy = keeper.cells();
+    copy[62].best.gapChoice = -1;
+    REQUIRE(keeper.cells()[62].best.gapChoice == 1);
+}
+
+TEST_CASE("BrainKeeperV2 accessors: totalBars() counts bars_live.csv rows and newBars() counts bars added since load") {
+    TempDir tmp("muuk-keeper-bars-test");
+    writeBarsCsv(tmp.dir / "bars_live.csv", rangingBars(5));
+    BrainKeeperV2 keeper(tmp.dir / "brain_v2.txt", trainerConfig(), nullptr);
+    // The constructor auto-starts a run on the folder's bars (too few to
+    // learn from): wait it out before counting.
+    REQUIRE(waitUntilNotLearning(keeper));
+    REQUIRE(keeper.totalBars() == 5);
+    REQUIRE(keeper.newBars() == 0);
+    std::deque<Bar> fresh;
+    fresh.push_back(fixtureBar(10, 4000.0, 4001.0));
+    fresh.push_back(fixtureBar(11, 4001.0, 4002.0));
+    fresh.push_back(fixtureBar(12, 4002.0, 4001.0));
+    keeper.addBars(fresh, 0.01);
+    REQUIRE(keeper.totalBars() == 8);
+    REQUIRE(keeper.newBars() == 3);
 }

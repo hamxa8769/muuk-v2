@@ -34,6 +34,12 @@
 
 namespace muuk::ctrader_fix {
 
+// v0.4.0: in the header (not only the .cpp) so the dashboard can quote the
+// same numbers ("need at least 2,000", "auto-retrain at 1,440") instead of
+// hard-coding them.
+inline constexpr int kNewBarsToLearn = 1440;  // a day of minutes
+inline constexpr std::size_t kMinTrainingBars = 2000;
+
 // One-minute bars with their spreads, from MT5's history export format:
 // optional "# ...,point=..,gmtOffset=.." line, then time,open,high,low,close,ticks,spreadPoints.
 struct HistoryBarsV2 {
@@ -69,6 +75,18 @@ struct BrainTrainingResult {
     bool gatesPassed = false;  // the strict gates (see trainBrainV2)
     std::size_t bars = 0;      // bars the run trained on
     std::string summary;       // one line with the numbers + gates verdict, for the panel
+    // v0.4.0 (gap 3): the gate fields, so the panel names the failed gates
+    // without parsing `summary`. Defaults when no gates ran (too few bars).
+    bool better = false;
+    bool ddGate = false;
+    bool lockGate = false;
+    int periods = 0;
+    int brainPeriodsUp = 0;
+    double totalPnl = 0.0;
+    int locks = 0;
+    double maxDrawdown = 0.0;
+    double heldOutPnl = 0.0;
+    int heldOutLocks = 0;
 };
 
 class BrainKeeperV2 {
@@ -115,6 +133,18 @@ public:
     // brain file from the same one written again.
     [[nodiscard]] int64_t trainedBars() const;
     [[nodiscard]] int64_t trainedUntilMs() const;
+    // v0.4.0: copies for the Brain tab grid + Trainer card. All const, all
+    // under mutex_; the dashboard never touches brain_ itself.
+    // A copy of the loaded brain's 81 cells (empty when untrained).
+    [[nodiscard]] std::vector<muuk::core::BrainV2Cell> cells() const;
+    // Bars the bot has collected in total (rows in bars_live.csv).
+    [[nodiscard]] std::size_t totalBars() const;
+    // Bars collected since the last training run started (0 after a run starts).
+    [[nodiscard]] int newBars() const;
+    // The live veto state per cell: true where online learning turned the
+    // cell to no-trade. (Computed from the brain copy: score <= 0 or
+    // lockRate > maxLockRate on a cell whose best.gapChoice >= 0.)
+    [[nodiscard]] std::vector<bool> vetoedCells() const;  // size 81, false when untrained
     // The shift the loaded brain was trained with (Step 2, decision D12):
     // {fills per step, step in ATR multiples}. Nothing when the brain is
     // not trained or its file predates Step 2 (no shift fields) -- the
@@ -144,6 +174,7 @@ private:
     muuk::core::BrainV2 brain_;
     int64_t lastSavedBarMs_ = 0;
     int newBars_ = 0;
+    std::atomic<std::size_t> totalBars_{0};  // v0.4.0: rows in bars_live.csv (counted at construction, then added to)
     std::string lastTry_;
     BrainTrainingProgress progress_;
     BrainTrainingResult lastTraining_;
