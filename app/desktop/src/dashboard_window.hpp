@@ -53,7 +53,12 @@ enum class AssistantAction {
     ChangeKeys,
     ChangeRole
 };
-[[nodiscard]] bool assistantActionAllowed(muuk::ctrader_fix::AssistantRole role, AssistantAction action);
+
+// NOTE (v0.4.0 fix): assistantActionAllowed() is defined in the anonymous
+// namespace in dashboard_window.cpp and used only there. Do NOT redeclare it
+// here -- the header declaration plus the anonymous-namespace definition are
+// two overloads with the same signature, and MSVC rejects the calls as
+// ambiguous (error C2668).
 
 class DashboardWindow {
 public:

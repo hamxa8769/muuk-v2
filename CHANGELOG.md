@@ -1,7 +1,7 @@
 # Muuk changelog
 
 Every Muuk update gets a patch version bump, a new tag and a new release
-(app version 0.2.x ↔ release tag v2.0.x), and each release adds an entry
+(app version 0.x.y ↔ release tag v2.x.y), and each release adds an entry
 below. The in-app updater offers every new release, so nobody has to
 download a zip by hand.
 
@@ -28,6 +28,11 @@ download a zip by hand.
   gets restricted access only (no core brain/settings writes). The Gemini
   key stays local-only, is sent only as the `x-goog-api-key` header, and
   is never logged.
+- Fix: the first Release build failed with MSVC error C2668 (ambiguous
+  `assistantActionAllowed` — the header declared it while dashboard_window.cpp
+  also defined it in an anonymous namespace). The header declaration is
+  removed; the helper stays defined in dashboard_window.cpp only, where all
+  its call sites live.
 - Fix: "Brain today" counters now reset on day rollover — the first basket
   of a new day no longer shows yesterday's counts.
 - The desktop UI is Windows-only, so its compile is proven only by the
