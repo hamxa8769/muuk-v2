@@ -65,14 +65,15 @@ TEST_CASE("compareVersions compares numerically, not as text") {
 }
 
 TEST_CASE("isNewerRelease maps the release tag onto the app version") {
-    // Tags are v2.0.x, the app reports 0.2.x: v2.0.3 IS app 0.2.3, so
-    // the same release is not an update (v0.2.3 kept offering v2.0.3
-    // because 2.0.3 > 0.2.3 numerically).
-    REQUIRE_FALSE(isNewerRelease("v2.0.3", "0.2.3"));  // same release: no update
-    REQUIRE(isNewerRelease("v2.0.4", "0.2.3"));        // the next release is newer
-    REQUIRE(isNewerRelease("v2.0.3", "0.2.2"));        // newer than the previous app
-    REQUIRE_FALSE(isNewerRelease("v2.0.2", "0.2.3"));  // older tag
-    REQUIRE(isNewerRelease("v2.0.10", "0.2.9"));       // numeric, not text, comparison
+    // Tags are v2.x.y, the app reports 0.x.y: v2.4.0 IS app 0.4.0, so
+    // the same release is not an update (v0.4.0 kept offering v2.4.0
+    // because the old swap read the tag as app 4.2.0).
+    REQUIRE_FALSE(isNewerRelease("v2.4.0", "0.4.0"));  // same release: no update
+    REQUIRE(isNewerRelease("v2.4.1", "0.4.0"));        // the next release is newer
+    REQUIRE(isNewerRelease("v2.5.0", "0.4.0"));        // the next minor is newer
+    REQUIRE(isNewerRelease("v2.4.0", "0.3.9"));        // newer than the previous app
+    REQUIRE_FALSE(isNewerRelease("v2.0.7", "0.4.0"));  // an old-scheme tag is older
+    REQUIRE(isNewerRelease("v2.4.10", "0.4.9"));       // numeric, not text, comparison
     REQUIRE_FALSE(isNewerRelease("v2.0.1", "2.0.0"));  // an app at 2.0.0 is ahead of the v2.0.1 release
     REQUIRE_FALSE(isNewerRelease("v2.0", "0.2.1"));    // malformed tag
     REQUIRE_FALSE(isNewerRelease("v2.0.1", "banana"));  // malformed current

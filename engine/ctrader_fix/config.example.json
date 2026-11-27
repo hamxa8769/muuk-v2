@@ -48,7 +48,7 @@
     "riskLimits": {
       "maxOrders": 20,
       "maxLot": 1.0,
-      "maxBasketLossMoney": 500.0,
+      "maxBasketLossMoney": 0.0,
       "maxDrawdownMoney": 1000.0,
       "maxMarginUsageFraction": 0.0,
       "maxSpreadTicks": 50,

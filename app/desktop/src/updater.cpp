@@ -90,12 +90,15 @@ bool isNewerRelease(std::string_view latestTag, std::string_view currentVersion)
     Version latest{};
     Version current{};
     if (!parseVersion(latestTag, latest) || !parseVersion(currentVersion, current)) return false;
-    // Release tags are v2.0.x while the app reports 0.2.x: the tag is
-    // the app version with its first two components swapped (v2.0.3 IS
-    // app 0.2.3). Convert the tag back before comparing, or every
-    // release looks newer than the app that ships it (2.0.3 > 0.2.3
-    // numerically) and the button never stops offering the same version.
-    const Version latestAsApp{latest.minor, latest.major, latest.patch};
+    // Release tags are v2.x.y while the app reports 0.x.y: the tag IS
+    // the app version with a fixed 2 in front (v2.4.0 IS app 0.4.0).
+    // Convert the tag back before comparing, or every release looks
+    // newer than the app that ships it (2.4.0 > 0.4.0 numerically) and
+    // the button never stops offering the same version. (The old v2.0.x
+    // scheme needed the first two components swapped instead; that
+    // mapping died with the 0.4.0 tag-scheme change -- v0.4.0 kept
+    // offering v2.4.0 to itself.)
+    const Version latestAsApp{0, latest.minor, latest.patch};
     return compareVersions(latestAsApp, current) > 0;
 }
 

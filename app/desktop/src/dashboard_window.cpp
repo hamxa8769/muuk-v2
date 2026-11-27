@@ -955,7 +955,7 @@ void DashboardWindow::renderUpdateButton() {
     const Updater::State state = updater_.state();
     const float updateWidth = 230.0f;
     // A newer release is known: gold, with the release tag exactly as
-    // GitHub names it (v2.0.x). The tag comes from the updater's check,
+    // GitHub names it (v2.x.y). The tag comes from the updater's check,
     // never from a hard-coded string.
     if (state == Updater::State::Available) {
         ImGui::SameLine();

@@ -5,7 +5,25 @@ Every Muuk update gets a patch version bump, a new tag and a new release
 below. The in-app updater offers every new release, so nobody has to
 download a zip by hand.
 
-## 0.4.0 — 2026-11-27 — Brain tab visuals, layered brain + smart switch, in-app AI assistant (in staging, not yet released)
+## 0.4.1 — 2026-11-27 — Updater fix: v0.4.0 kept offering itself + fresh installs got a $500 stop
+
+- Fix: the update button kept saying "Update available: v2.4.0" on v0.4.0
+  itself. `isNewerRelease` still used the old v2.0.x tag mapping (swap the
+  first two components), which reads tag v2.4.0 as app 4.2.0 — always newer
+  than 0.4.0. The tag scheme changed with 0.4.0 (app 0.x.y ↔ tag v2.x.y),
+  so the tag is now mapped as app {0, minor, patch}: v2.4.0 IS 0.4.0, and
+  the button shows "Up to date" again. Tests updated to the new scheme.
+- Fix: a fresh install (new folder, template config) silently got a $500
+  basket stop loss — the NET bar showed "-500.00¢ stop" even though the
+  stop was removed by decision ("Stop hata do"). Cause: the template
+  `config.example.json` still carried the old cTrader-era
+  `maxBasketLossMoney: 500.0`, and the D5 migration copies it into the
+  stop loss when the file sets no stop. The template now ships 0.0 (off),
+  like `config.mt5.example.json` already did. Existing configs are
+  untouched — if your install already shows the $500 stop, set Stop loss
+  to 0 in the Brain panel (or ask the assistant).
+
+## 0.4.0 — 2026-11-27 — Brain tab visuals, layered brain + smart switch, in-app AI assistant
 
 - Brain tab visuals: the 81-cell brain is now drawn as an isometric grid
   (3 session cubes, mean PnL / score / lock rate / samples colour modes,
