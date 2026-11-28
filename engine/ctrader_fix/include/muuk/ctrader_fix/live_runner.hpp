@@ -1099,13 +1099,21 @@ private:
     std::string brainRefreshNote_;       // last manual/auto refresh outcome, shown in the snapshot
     bool brainRealRefusedLogged_ = false;  // the real-account refusal, logged once
     bool brainWaitLogged_ = false;    // the current veto, logged once
+    // v0.4.2: which veto the log last reported, as
+    // "blockedBy|volatility,trend,chop,session,atrTrend,trendDir". The veto
+    // is re-logged when its gate or its cell changes, so the log always
+    // shows the current reason. The once-per-streak log hid every later
+    // veto, and the first (stale "too few bars") line was all a pasted log
+    // ever showed. The raw reason text is NOT the key: it embeds live
+    // numbers (ATR, ER, score) that move every tick.
+    std::string brainLastVetoKey_;
     bool brainCycleActive_ = false;   // the running cycle uses the brain's policy
     muuk::core::BrainV2Decision brainDecision_;  // the policy this cycle runs on
     muuk::core::SituationV2 brainSituation_;    // the situation it was decided in
     // v0.4.0: the last cycle decision, trade or veto, so the Brain tab can
     // show the current cell and the veto reason while idle (gap 5).
     // decideBrainCycleLocked() sets both on every decision; only the time
-    // is veto-only (first veto log, so it does not change every tick).
+    // is veto-only (it updates only when the veto changes, so it does not change every tick).
     muuk::core::SituationV2 brainLastSituation_;
     muuk::core::BrainV2Decision brainLastDecision_;
     bool brainHasLastDecision_ = false;

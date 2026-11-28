@@ -2773,15 +2773,28 @@ bool LiveRunner::decideBrainCycleLocked() {
     brainHasLastDecision_ = true;
     if (!cycle.decision.trade) {
         entryWait_ = "brain: " + cycle.decision.why;
-        if (!brainWaitLogged_) {
+        // v0.4.2: re-log when the veto itself changes (gate or cell), not
+        // just once per streak. The first decision runs at connect, before
+        // MT5's history bars arrive, so it logs the stale "too few bars"
+        // line -- and the real veto after it was never logged at all.
+        const std::string vetoKey =
+            std::to_string(static_cast<int>(cycle.decision.blockedBy)) + "|" +
+            std::to_string(cycle.situation.base.volatility) + "," +
+            std::to_string(cycle.situation.base.trend) + "," +
+            std::to_string(cycle.situation.base.chop) + "," +
+            std::to_string(cycle.situation.base.session) + "," +
+            std::to_string(cycle.situation.atrTrend) + "," + std::to_string(cycle.situation.trendDir);
+        if (!brainWaitLogged_ || vetoKey != brainLastVetoKey_) {
             log("[brain v2] no new cycle: " + cycle.decision.why);
             brainJournal_.appendSkip(cycle.situation, cycle.decision);
             brainWaitLogged_ = true;
+            brainLastVetoKey_ = vetoKey;
             brainLastDecisionAt_ = localTimestamp().substr(11);
         }
         return false;
     }
     brainWaitLogged_ = false;
+    brainLastVetoKey_.clear();
     brainDecision_ = cycle.decision;
     brainSituation_ = cycle.situation;
     brainCycleActive_ = true;

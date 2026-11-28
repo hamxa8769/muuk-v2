@@ -5,6 +5,19 @@ Every Muuk update gets a patch version bump, a new tag and a new release
 below. The in-app updater offers every new release, so nobody has to
 download a zip by hand.
 
+## 0.4.2 — 2026-11-28 — The brain veto reason is now in the log, not only on the dashboard
+
+- Fix: a brain veto was logged only once per streak (`brainWaitLogged_`),
+  so a pasted log showed just the stale "too few bars to read this
+  market" line from connect time -- the first decision runs before MT5's
+  history bars arrive -- and never the real veto after it. The veto is
+  now re-logged whenever its gate or its cell changes, keyed on the block
+  reason + the cell coordinates (not the raw text, which embeds live ATR /
+  ER / score numbers that move every tick). The Brain tab's amber line
+  still shows the same reason live; the log now agrees with it. No
+  strategy, gate or cap changed -- this is diagnostics only, so the
+  shipped brain is untouched.
+
 ## 0.4.1 — 2026-11-27 — Updater fix: v0.4.0 kept offering itself + fresh installs got a $500 stop
 
 - Fix: the update button kept saying "Update available: v2.4.0" on v0.4.0

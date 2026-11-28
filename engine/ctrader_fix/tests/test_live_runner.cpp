@@ -2240,6 +2240,94 @@ TEST_CASE("LiveRunner with Brain v2 opens no range when the brain says no-trade"
     std::filesystem::remove_all(brainFile.parent_path(), ec);
 }
 
+TEST_CASE("LiveRunner re-logs a brain veto when the reason changes: stale 'too few bars' gives way to the real veto") {
+    // Last night's log (2026-11-27): the only brain line was the stale
+    // "too few bars" veto from connect time -- the real veto after the
+    // history bars arrived was never logged, so a pasted log could not say
+    // why no trade opened. The veto is now re-logged when its gate or its
+    // cell changes (v0.4.2).
+    const std::filesystem::path brainFile = writeTestBrainV2(false);
+    MockFixServer server;
+    LiveConfig cfg = testConfig(server);
+    cfg.connection.autoRangeWidthPoints = 1.0;
+    cfg.brain.enabled = true;
+    cfg.brain.brainFile = brainFile.string();
+    LiveRunner runner(cfg);
+    // No history bars yet: the first decision vetoes on too few bars.
+
+    std::mutex logMutex;
+    std::vector<std::string> logLines;
+    runner.setLogHandler([&](const std::string& line) {
+        std::scoped_lock lock(logMutex);
+        logLines.push_back(line);
+    });
+
+    std::exception_ptr runnerException;
+    std::thread runnerThread([&] {
+        try {
+            runner.run();
+        } catch (...) {
+            runnerException = std::current_exception();
+        }
+    });
+    const JoinOnExit joinOnExit{runner, runnerThread};
+
+    connectRunner(server);
+    sendTestQuote(server, "4336.50", "4336.52");
+
+    // The first veto: too few bars (no history yet). Wait for it in the log.
+    for (int i = 0; i < 100; ++i) {
+        {
+            std::scoped_lock lock(logMutex);
+            if (std::any_of(logLines.begin(), logLines.end(), [](const std::string& l) {
+                    return l.find("too few bars to read this market") != std::string::npos;
+                }))
+                break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    {
+        std::scoped_lock lock(logMutex);
+        REQUIRE(std::any_of(logLines.begin(), logLines.end(), [](const std::string& l) {
+            return l.find("too few bars to read this market") != std::string::npos;
+        }));
+    }
+
+    // The history bars land (as MT5 sends them after connect): the next
+    // decision vetoes for the real reason -- no policy worth trading --
+    // and that veto must now appear in the log too.
+    runner.addHistoryBars(flatBars());
+    sendTestQuote(server, "4336.50", "4336.52");
+    for (int i = 0; i < 100; ++i) {
+        {
+            std::scoped_lock lock(logMutex);
+            if (std::any_of(logLines.begin(), logLines.end(), [](const std::string& l) {
+                    return l.find("no policy worth trading") != std::string::npos;
+                }))
+                break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    {
+        std::scoped_lock lock(logMutex);
+        const int vetoLines = static_cast<int>(std::count_if(logLines.begin(), logLines.end(), [](const std::string& l) {
+            return l.find("[brain v2] no new cycle") != std::string::npos;
+        }));
+        REQUIRE(vetoLines == 2);
+        REQUIRE(std::any_of(logLines.begin(), logLines.end(), [](const std::string& l) {
+            return l.find("no policy worth trading") != std::string::npos;
+        }));
+    }
+    REQUIRE(runner.snapshot().status == EngineStatus::Idle);
+    REQUIRE(runner.snapshot().brainBlockedBy == static_cast<int>(muuk::core::BrainBlockReason::CellNotTradable));
+
+    runner.stop();
+    runnerThread.join();
+    if (runnerException) std::rethrow_exception(runnerException);
+    std::error_code ec;
+    std::filesystem::remove_all(brainFile.parent_path(), ec);
+}
+
 TEST_CASE("LiveRunner snapshot carries the v0.4.0 veto fields while idle: last cell, reason and time") {
     const std::filesystem::path brainFile = writeTestBrainV2(false);
     MockFixServer server;
